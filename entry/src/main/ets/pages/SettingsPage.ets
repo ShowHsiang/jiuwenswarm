@@ -1,8 +1,14 @@
-// Settings page - API key, model, base URL, MCP, RAG configuration
+// Settings page - JiuwenClaw 配置
 import { router } from '@kit.ArkUI'
+import { mediaquery } from '@kit.ArkUI'
 import { configService } from '../services/ConfigService'
 import { ApiClient } from '../services/ApiClient'
 import { ApiConfig, ApiMessage } from '../models/Types'
+
+class McpServerEntry {
+  name: string = ''
+  url: string = ''
+}
 
 @Entry
 @Component
@@ -10,20 +16,26 @@ struct SettingsPage {
   @State apiKey: string = ''
   @State baseUrl: string = 'https://api.deepseek.com/v1'
   @State model: string = 'deepseek-chat'
+  @State maxTokens: number = 4096
+  @State temperature: number = 0.7
   @State siliconFlowApiKey: string = ''
   @State mcpServerUrl: string = ''
   @State mcpServerName: string = ''
   @State statusMessage: string = ''
   @State isTesting: boolean = false
   @State isSaving: boolean = false
+  @State isConnected: boolean = false
+  private listener?: mediaquery.MediaQueryListener
 
   async aboutToAppear(): Promise<void> {
     this.apiKey = await configService.getApiKey()
     this.baseUrl = await configService.getBaseUrl()
     this.model = await configService.getModel()
+    this.maxTokens = await configService.getMaxTokens()
+    this.temperature = await configService.getTemperature()
     this.siliconFlowApiKey = await configService.getSiliconFlowApiKey()
+    this.isConnected = this.apiKey.length > 0
 
-    // Load first MCP server if exists
     const mcpJson = await configService.getMcpServers()
     try {
       const servers = JSON.parse(mcpJson) as McpServerEntry[]
@@ -36,37 +48,48 @@ struct SettingsPage {
     }
   }
 
+  aboutToDisappear(): void {
+    if (this.listener) {
+      this.listener.off('change')
+    }
+  }
+
   async saveSettings(): Promise<void> {
     this.isSaving = true
     await configService.saveApiKey(this.apiKey)
     await configService.setBaseUrl(this.baseUrl)
     await configService.setModel(this.model)
+    await configService.setMaxTokens(this.maxTokens)
+    await configService.setTemperature(this.temperature)
     await configService.setSiliconFlowApiKey(this.siliconFlowApiKey)
 
-    // Save MCP servers
     if (this.mcpServerUrl.length > 0) {
       const name = this.mcpServerName.length > 0 ? this.mcpServerName : 'MCP Server'
-      const servers: McpServerEntry[] = [{ name, url: this.mcpServerUrl }]
+      const entry = new McpServerEntry()
+      entry.name = name
+      entry.url = this.mcpServerUrl
+      const servers: McpServerEntry[] = [entry]
       await configService.setMcpServers(JSON.stringify(servers))
     } else {
       await configService.setMcpServers('[]')
     }
 
-    this.statusMessage = 'Settings saved! Restart app for MCP/RAG changes to take effect.'
+    this.statusMessage = '✅ 保存成功'
     this.isSaving = false
+    this.isConnected = this.apiKey.length > 0
     setTimeout(() => {
       router.back({ url: 'pages/Index' })
-    }, 800)
+    }, 600)
   }
 
   async testConnection(): Promise<void> {
     if (!this.apiKey) {
-      this.statusMessage = 'Please enter an API key first'
+      this.statusMessage = '❌ 请输入 API Key'
       return
     }
 
     this.isTesting = true
-    this.statusMessage = 'Testing connection...'
+    this.statusMessage = '测试中...'
 
     try {
       const config: ApiConfig = {
@@ -78,13 +101,14 @@ struct SettingsPage {
       }
 
       const client = new ApiClient(config)
-      const testMsg: ApiMessage = { role: 'user', content: 'Say "hello" in one word.' }
-      const messages: ApiMessage[] = [testMsg]
-      const response = await client.sendMessage(messages)
-      const reply = response.choices[0].message.content || '(empty)'
-      this.statusMessage = `Connection OK! Response: "${reply}" (${response.usage.totalTokens} tokens)`
+      const testMsg: ApiMessage = { role: 'user', content: '说"你好"' }
+      const response = await client.sendMessage([testMsg])
+      const reply = response.choices[0].message.content || '(空)'
+      this.statusMessage = `✅ 成功: ${reply.substring(0, 20)}`
+      this.isConnected = true
     } catch (e) {
-      this.statusMessage = `Connection failed: ${(e as Error).message}`
+      this.statusMessage = `❌ 失败: ${(e as Error).message}`
+      this.isConnected = false
     }
 
     this.isTesting = false
@@ -92,223 +116,291 @@ struct SettingsPage {
 
   build() {
     Column() {
-      // Title bar
+      // 标题栏
       Row() {
-        Button('< Back')
-          .fontSize(14)
-          .backgroundColor(Color.Transparent)
-          .fontColor('#FFFFFF')
-          .onClick(() => {
-            router.back({ url: 'pages/Index' })
-          })
-
-        Text('Settings')
+        Text('←')
           .fontSize(20)
+          .fontColor('#FFFFFF')
+          .onClick(() => router.back({ url: 'pages/Index' }))
+
+        Text('设置')
+          .fontSize(18)
           .fontWeight(FontWeight.Bold)
           .fontColor('#FFFFFF')
           .layoutWeight(1)
           .textAlign(TextAlign.Center)
 
-        Text('')
-          .width(60)
+        Row() {
+          Circle()
+            .width(8)
+            .height(8)
+            .fill(this.isConnected ? '#4ADE80' : '#F87171')
+        }
       }
       .width('100%')
-      .padding({ left: 8, right: 8, top: 12, bottom: 12 })
-      .backgroundColor('#1a1a2e')
+      .height(56)
+      .padding({ left: 16, right: 16 })
+      .linearGradient({ angle: 135, colors: [['#667EEA', 0], ['#764BA2', 1]] })
 
-      // Settings form
+      // 内容区
       Scroll() {
-        Column() {
-          // === LLM Section ===
-          Text('LLM Configuration')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#333333')
-            .margin({ top: 20, bottom: 4 })
+        Column({ space: 12 }) {
+          // API 配置卡片
+          Column({ space: 12 }) {
+            Row() {
+              Text('🔌 API 配置')
+                .fontSize(16)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#1F2937')
+            }
             .width('100%')
 
-          // API Key
-          Text('API Key')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
+            // API Key
+            Column({ space: 6 }) {
+              Text('API Key')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.apiKey, placeholder: 'sk-...' })
+                .type(InputType.Password)
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.apiKey = v)
+            }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
 
-          TextInput({ text: this.apiKey, placeholder: 'sk-...' })
-            .type(InputType.Password)
-            .height(44)
+            // API 地址
+            Column({ space: 6 }) {
+              Text('API 地址')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.baseUrl, placeholder: 'https://api.deepseek.com/v1' })
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.baseUrl = v)
+            }
             .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.apiKey = value
-            })
+            .alignItems(HorizontalAlign.Start)
 
-          // Base URL
-          Text('API Base URL')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
+            // 模型
+            Column({ space: 6 }) {
+              Text('模型')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.model, placeholder: 'deepseek-chat' })
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.model = v)
+            }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
 
-          TextInput({ text: this.baseUrl, placeholder: 'https://api.deepseek.com/v1' })
-            .height(44)
+            // Temperature
+            Column({ space: 6 }) {
+              Row() {
+                Text('Temperature: ')
+                  .fontSize(13)
+                  .fontColor('#6B7280')
+                Text(this.temperature.toFixed(1))
+                  .fontSize(13)
+                  .fontColor('#667EEA')
+                  .fontWeight(FontWeight.Bold)
+              }
+              Slider({ value: this.temperature, min: 0, max: 2, step: 0.1 })
+                .blockColor('#667EEA')
+                .trackColor('#E5E7EB')
+                .selectedColor('#667EEA')
+                .width('100%')
+                .onChange((v: number) => this.temperature = v)
+            }
             .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.baseUrl = value
-            })
+            .alignItems(HorizontalAlign.Start)
 
-          // Model
-          Text('Model')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
+            // Max Tokens
+            Column({ space: 6 }) {
+              Row() {
+                Text('Max Tokens: ')
+                  .fontSize(13)
+                  .fontColor('#6B7280')
+                Text(this.maxTokens.toString())
+                  .fontSize(13)
+                  .fontColor('#667EEA')
+                  .fontWeight(FontWeight.Bold)
+              }
+              Slider({ value: this.maxTokens, min: 1024, max: 32000, step: 1024 })
+                .blockColor('#667EEA')
+                .trackColor('#E5E7EB')
+                .selectedColor('#667EEA')
+                .width('100%')
+                .onChange((v: number) => this.maxTokens = Math.floor(v))
+            }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
 
-          TextInput({ text: this.model, placeholder: 'deepseek-chat' })
-            .height(44)
+            // 按钮
+            Row({ space: 10 }) {
+              Button('测试连接')
+                .height(42)
+                .fontSize(14)
+                .backgroundColor('#F3F4F6')
+                .fontColor('#374151')
+                .borderRadius(10)
+                .layoutWeight(1)
+                .enabled(!this.isTesting)
+                .onClick(() => this.testConnection())
+
+              Button('保存')
+                .height(42)
+                .fontSize(14)
+                .backgroundColor('#667EEA')
+                .fontColor('#FFFFFF')
+                .borderRadius(10)
+                .layoutWeight(1)
+                .enabled(!this.isSaving)
+                .onClick(() => this.saveSettings())
+            }
             .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.model = value
-            })
-
-          // Test + Save buttons
-          Row() {
-            Button('Test Connection')
-              .fontSize(14)
-              .backgroundColor('#666666')
-              .layoutWeight(1)
-              .margin({ right: 8 })
-              .enabled(!this.isTesting)
-              .onClick(() => {
-                this.testConnection()
-              })
-
-            Button('Save')
-              .fontSize(14)
-              .backgroundColor('#4A90D9')
-              .layoutWeight(1)
-              .margin({ left: 8 })
-              .enabled(!this.isSaving)
-              .onClick(() => {
-                this.saveSettings()
-              })
           }
           .width('100%')
-          .margin({ top: 16 })
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .padding(14)
+          .alignItems(HorizontalAlign.Start)
 
-          // === RAG Section ===
-          Text('RAG (Vector Retrieval)')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#333333')
-            .margin({ top: 28, bottom: 4 })
+          // RAG 配置
+          Column({ space: 12 }) {
+            Text('🧠 RAG 知识检索')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1F2937')
+              .width('100%')
+
+            Column({ space: 6 }) {
+              Text('SiliconFlow API Key')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.siliconFlowApiKey, placeholder: '可选，用于向量嵌入' })
+                .type(InputType.Password)
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.siliconFlowApiKey = v)
+            }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
 
-          Text('SiliconFlow API Key (free, for BGE-M3 embeddings)')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
+            Text('留空则使用关键词检索')
+              .fontSize(12)
+              .fontColor('#9CA3AF')
+              .width('100%')
+          }
+          .width('100%')
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .padding(14)
+          .alignItems(HorizontalAlign.Start)
+
+          // MCP 配置
+          Column({ space: 12 }) {
+            Text('🌐 MCP 服务器')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1F2937')
+              .width('100%')
+
+            Column({ space: 6 }) {
+              Text('服务器名称')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.mcpServerName, placeholder: '如: 高德地图' })
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.mcpServerName = v)
+            }
             .width('100%')
+            .alignItems(HorizontalAlign.Start)
 
-          TextInput({ text: this.siliconFlowApiKey, placeholder: 'sk-... (optional)' })
-            .type(InputType.Password)
-            .height(44)
+            Column({ space: 6 }) {
+              Text('服务器 URL')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .width('100%')
+              TextInput({ text: this.mcpServerUrl, placeholder: 'https://mcp.example.com/mcp' })
+                .height(44)
+                .width('100%')
+                .backgroundColor('#F3F4F6')
+                .borderRadius(10)
+                .padding({ left: 12, right: 12 })
+                .onChange((v: string) => this.mcpServerUrl = v)
+            }
             .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.siliconFlowApiKey = value
-            })
+            .alignItems(HorizontalAlign.Start)
 
-          Text('Leave empty to use keyword-based retrieval instead of vector search.')
-            .fontSize(12)
-            .fontColor('#999999')
-            .margin({ top: 4 })
-            .width('100%')
+            Text('支持 Streamable HTTP MCP')
+              .fontSize(12)
+              .fontColor('#9CA3AF')
+              .width('100%')
+          }
+          .width('100%')
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .padding(14)
+          .alignItems(HorizontalAlign.Start)
 
-          // === MCP Section ===
-          Text('MCP Server')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor('#333333')
-            .margin({ top: 28, bottom: 4 })
-            .width('100%')
-
-          Text('Server Name')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
-            .width('100%')
-
-          TextInput({ text: this.mcpServerName, placeholder: 'e.g. Amap Maps' })
-            .height(44)
-            .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.mcpServerName = value
-            })
-
-          Text('Server URL')
-            .fontSize(14)
-            .fontColor('#666666')
-            .margin({ top: 12, bottom: 8 })
-            .width('100%')
-
-          TextInput({ text: this.mcpServerUrl, placeholder: 'https://mcp.example.com/mcp?key=...' })
-            .height(44)
-            .width('100%')
-            .borderRadius(8)
-            .backgroundColor('#F0F0F0')
-            .onChange((value: string) => {
-              this.mcpServerUrl = value
-            })
-
-          Text('Streamable HTTP MCP servers only. Leave empty to disable.')
-            .fontSize(12)
-            .fontColor('#999999')
-            .margin({ top: 4 })
-            .width('100%')
-
-          // Status message
+          // 状态消息
           if (this.statusMessage) {
             Text(this.statusMessage)
               .fontSize(13)
-              .fontColor(this.statusMessage.includes('failed') || this.statusMessage.includes('Please') ? '#CC0000' : '#009900')
-              .margin({ top: 16 })
+              .fontColor(this.statusMessage.startsWith('✅') ? '#10B981' : '#EF4444')
+              .padding(12)
+              .backgroundColor(this.statusMessage.startsWith('✅') ? '#ECFDF5' : '#FEF2F2')
+              .borderRadius(10)
               .width('100%')
               .textAlign(TextAlign.Center)
           }
 
-          // Info
-          Text('OHClaw')
-            .fontSize(12)
-            .fontColor('#AAAAAA')
-            .margin({ top: 40 })
-
-          Text('AI Agent with ReAct loop, tool use, memory, task scheduling, MCP, and RAG.\nBased on NanoClaw, rewritten in pure ArkTS for HarmonyOS.')
-            .fontSize(12)
-            .fontColor('#CCCCCC')
-            .margin({ top: 8 })
-            .textAlign(TextAlign.Center)
+          // 底部
+          Column({ space: 4 }) {
+            Text('🐾 JiuwenClaw')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#667EEA')
+            Text('懂你所想，自主演进')
+              .fontSize(13)
+              .fontColor('#6B7280')
+          }
+          .width('100%')
+          .padding({ top: 16, bottom: 24 })
+          .alignItems(HorizontalAlign.Center)
         }
-        .padding({ left: 24, right: 24, bottom: 40 })
         .width('100%')
+        .padding(12)
       }
+      .width('100%')
       .layoutWeight(1)
+      .backgroundColor('#F9FAFB')
+      .scrollBar(BarState.Off)
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#FFFFFF')
   }
-}
-
-interface McpServerEntry {
-  name: string
-  url: string
 }

@@ -1,108 +1,148 @@
-<div align="center">
+# JiuwenClaw on OpenHarmony
 
-# JiuwenClaw
+> **懂你所想，自主演进**  
+> 在鸿蒙设备上运行的 AI Agent 助手
 
-> Your On-Call AI Butler — Bringing Intelligence to Your Fingertips
-
-[![Python Version](https://img.shields.io/badge/python-3.11%2C3.12%2C3.13-blue)](https://www.python.org/)
+[![HarmonyOS](https://img.shields.io/badge/HarmonyOS-NEXT%205.0-blue)](https://developer.huawei.com/consumer/cn/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
-[![Huawei Cloud MaaS](https://img.shields.io/badge/华为云-MaaS-red)](https://www.huaweicloud.com/)
 
-</div>
+## 🌟 项目简介
 
-## 🌟 Overview
+**JiuwenClaw** 是一款运行在鸿蒙设备上的 AI Agent 应用。名字取意"久闻爪"——随叫随到的智能管家，像一只精准的爪子，随时准备为你服务。
 
-**JiuwenClaw** is an intelligent AI Agent built in Python. True to its name — "Claw" symbolizes precise reach and connection — it extends the power of large language models directly to your fingertips through the communication apps you already use every day.
+### ✨ 核心特性
 
-### ✨ Key Features
+- **🧠 ReAct 推理循环** - 思考 + 行动，自主完成复杂任务
+- **🔧 工具调用** - 文件操作、网页搜索、记忆管理、定时任务
+- **💾 持久化记忆** - 跨会话记住你的偏好和重要信息
+- **⏰ 定时任务** - 支持 cron、间隔、一次性任务
+- **🌐 MCP 支持** - 可接入外部 MCP 服务器扩展能力
+- **📚 RAG 知识检索** - 向量检索 + 关键词匹配
 
-- **Ecosystem Compatible**: Full support for **Huawei Cloud MaaS** and other mainstream model platforms
-- **Seamless Integration**: Native integration with the **Xiaoyi Open Platform**, enabling Huawei phone users to invoke JiuwenClaw directly through the Xiaoyi assistant
-- **Flexible Deployment**: Self-hosted deployment with full data sovereignty
-- **Multi-Platform Access**: Interact via web interface, messaging apps, and more
+## 🚀 快速开始
 
-## 🎯 Design Philosophy
+### 1. 配置 API Key
 
-> **Understands You. Evolves With You.**
+首次使用需要在设置中配置 LLM API：
 
-### 🤝 Your Personal Task Butler
+- **API Key**: 你的 DeepSeek / 其他 OpenAI 兼容 API Key
+- **API 地址**: 默认 `https://api.deepseek.com/v1`
+- **模型**: 默认 `deepseek-chat`
 
-Whether dealing with task additions, mid-flow interruptions, or shifting requirements, JiuwenClaw understands your intent precisely — intelligently scheduling and executing tasks in an orderly, stress-free manner.
+### 2. 开始对话
 
-### 🔄 Autonomous Evolution
+在聊天界面输入消息，JiuwenClaw 会：
+1. 理解你的意图
+2. 决定是否需要使用工具
+3. 执行操作并返回结果
 
-When you express dissatisfaction or an error occurs, JiuwenClaw automatically refines the relevant skills based on your feedback — continuously improving, always working in your best interest.
+### 3. 快捷指令
 
+点击输入框左侧的 ⚡ 按钮打开快捷指令面板：
+- 🧹 清空对话
+- 🧠 查看记忆
+- 📁 文件列表
+- ⏰ 定时任务
+- 🔍 搜索新闻
+- 📝 创建笔记
 
-<p align="center">
-  <strong>⚡ Your always-on, data-sovereign personal AI assistant ⚡</strong>
-</p>
+## 📱 功能演示
 
-## 🚀 Getting Started
-
-### 📦 Installation
-
-```bash
-# Install JiuwenClaw
-pip install jiuwenclaw
-
-# Initialize JiuwenClaw (first-time setup)
-jiuwenclaw-init
-
-# Start JiuwenClaw
-jiuwenclaw-start
+### 基础对话
+```
+你：介绍一下你自己
+JiuwenClaw：我是 JiuwenClaw（久闻爪），一只运行在你鸿蒙设备上的 AI 助手...
 ```
 
-### 💬 How to Use
+### 文件操作
+```
+你：帮我创建一个 todo.md，写上今天要做的三件事
+JiuwenClaw：[🔧 Using: file_write]
+已创建 todo.md，内容包括...
+```
 
-#### 1️⃣ Conversation Mode
+### 记忆功能
+```
+你：记住我喜欢用中文回复
+JiuwenClaw：[🔧 Using: memory_write]
+已保存到记忆！以后我会默认用中文和你交流。
+```
 
-| Method             | Description                                                  |
-| ------------------ | ------------------------------------------------------------ |
-| **Web Frontend**   | After starting the service, visit `http://localhost:5173` to chat directly in your browser |
-| **Xiaoyi Channel** | Huawei phone users can invoke Xiaoyi to talk with JiuwenClaw directly |
-| **Feishu Channel** | Once configured, chat with JiuwenClaw seamlessly inside Feishu |
+### 定时任务
+```
+你：每天早上9点提醒我喝水
+JiuwenClaw：[🔧 Using: schedule_task]
+任务已创建！每天 9:00 会提醒你喝水。
+```
 
-#### 2️⃣ Scheduled Tasks
+## 🏗️ 技术架构
 
-Set up heartbeat tasks with your to-do items, and JiuwenClaw will wake up on schedule to execute them automatically — making your time management smarter and more effortless.
+```
+┌──────────────────────────────────────────────┐
+│  ArkUI 前端                                   │
+│  ┌────────────┐    ┌────────────────┐        │
+│  │ Index.ets  │    │ SettingsPage   │        │
+│  │ 聊天界面    │    │ API/助手配置    │        │
+│  └─────┬──────┘    └────────────────┘        │
+│        │                                      │
+│  ──────┼─────────── 服务层 ──────────────── │
+│        │                                      │
+│  ┌─────▼──────────────────────────────────┐  │
+│  │  AgentCore.ets — ReAct 循环引擎        │  │
+│  └────────────────────────────────────────┘  │
+│       │          │           │                │
+│  ┌────▼───┐ ┌───▼────┐ ┌───▼──────┐        │
+│  │Database│ │Tool    │ │Task     │         │
+│  │Service │ │Registry│ │Scheduler│         │
+│  └────────┘ └───┬────┘ └──────────┘        │
+│       ┌─────┬───┴───┬──────┐                 │
+│    FileTools Memory WebTools TaskTools        │
+└──────────────────────────────────────────────┘
+```
 
-## 📚 Documentation
+### 文件结构
 
-| Document                                             | Description                                              |
-| :--------------------------------------------------- | :------------------------------------------------------- |
-| [📖 Quick Start](docs/quickstart.md)                  | Get up and running with JiuwenClaw in 5 minutes          |
-| [⚙️ Configuration & Workspace](docs/配置信息.md) | Environment setup and workspace management               |
-| [📁 Workspace Structure](docs/智能体.md)               | workspace directory layout, presets, and dynamic content |
-| [🛠️ Skill System](docs/技能.md)                     | Guide to developing custom skills                        |
-| [📱 Channel Configuration](docs/频道.md)          | Integrating Feishu, Xiaoyi, and other channels           |
-| [⌨️ CLI Commands](docs/命令行指令.md)                         | Command-line tool usage guide                            |
-| [⏰ Scheduled Tasks](docs/定时任务.md)                 | Scheduled task management                                |
-| [🧠 Memory](docs/记忆.md)                           | Intelligent memory and learning capabilities             |
-| [🌐 Browser Automation](docs/浏览器.md)              | Web browsing and automation features                     |
-| [📋 Task Planning](docs/任务规划.md)                      | Chat behavior and task flow                              |
-| [🔄 Skill Self-Evolution](docs/Skill自演进.md)     | Mechanism for automatic skill evolution                  |
-| [📦 Context Compression](docs/上下文压缩卸载.md)  | Context compression and unloading                        |
-| [🚀 Development Practices](docs/开发实践/)          | Development practices and experience sharing             |
+```
+entry/src/main/ets/
+├── common/
+│   └── Types.ets          # 全局类型定义
+├── services/
+│   ├── AgentCore.ets      # ⭐ 核心：ReAct 循环引擎
+│   ├── ApiClient.ets      # HTTP 客户端
+│   ├── DatabaseService.ets# SQLite 数据库服务
+│   ├── ConfigService.ets  # Preferences 配置管理
+│   ├── ToolRegistry.ets   # 工具注册中心
+│   └── TaskScheduler.ets  # 定时任务调度器
+├── tools/
+│   ├── FileTools.ets      # 文件读写列表
+│   ├── MemoryTools.ets    # 持久化记忆
+│   ├── WebTools.ets       # 网页抓取 + 搜索
+│   └── TaskTools.ets      # 定时任务 CRUD
+├── pages/
+│   ├── Index.ets          # 聊天主界面
+│   └── SettingsPage.ets   # 设置页面
+└── entryability/
+    └── EntryAbility.ets   # 应用生命周期
+```
 
-## 🤝 Contributing
+## 🛠️ 开发环境
 
-We warmly welcome community contributions — whether it's filing bug reports, suggesting new features, or improving documentation, every bit of support means the world to us.
+- **DevEco Studio** 最新版本
+- **HarmonyOS NEXT** 5.0.5 (API 17)
+- **ArkTS** (TypeScript 严格子集)
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+## 📖 参考资料
 
-## 📄 License
+- [JiuwenClaw](https://openjiuwen.com/jiuwenclaw) - 原版 Python 实现
+- [NanoClaw](https://github.com/lmxxf/openclaw-on-openharmony) - 架构参考
+- [HarmonyOS 开发文档](https://developer.huawei.com/consumer/cn/)
 
-This project is licensed under the **Apache License 2.0**. See the [LICENSE](LICENSE) file for details.
+## 📄 开源协议
 
+本项目采用 **Apache License 2.0** 开源协议。
 
 ---
 
 <p align="center">
-  <strong>Making intelligence accessible. Making life simpler.</strong><br>
-  <sub>✨ JiuwenClaw — Your Personal AI Assistant ✨</sub>
+  <strong>🐾 JiuwenClaw —— 懂你所想，自主演进 🐾</strong>
 </p>

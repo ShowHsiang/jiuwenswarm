@@ -70,9 +70,19 @@ export class ConfigService {
     return val as number
   }
 
+  async setMaxTokens(tokens: number): Promise<void> {
+    await this.pref!.put(KEY_MAX_TOKENS, tokens)
+    await this.pref!.flush()
+  }
+
   async getTemperature(): Promise<number> {
     const val = await this.pref!.get(KEY_TEMPERATURE, DEFAULT_TEMPERATURE)
     return val as number
+  }
+
+  async setTemperature(temp: number): Promise<void> {
+    await this.pref!.put(KEY_TEMPERATURE, temp)
+    await this.pref!.flush()
   }
 
   async getAssistantName(): Promise<string> {

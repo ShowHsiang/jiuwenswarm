@@ -1,6 +1,7 @@
 // AgentCore - The ReAct loop with MCP + RAG
 // Replaces NanoClaw's container-runner + agent-runner
 // Direct HTTP API calls to DeepSeek with tool_use support
+// 集成：任务规划、记忆分层、上下文瘦身、技能自演进
 import { Logger } from '../utils/Logger'
 import { generateId } from '../utils/TextFormatter'
 import { ApiClient } from './ApiClient'
@@ -9,6 +10,10 @@ import { dbService } from './DatabaseService'
 import { configService } from './ConfigService'
 import { McpClient, McpServerConfig } from './McpClient'
 import { VectorRagService, VectorRagConfig, KbChunkInput } from './VectorRagService'
+import { TaskPlanner, taskPlanner } from './TaskPlanner'
+import { MemoryService, memoryService, MemoryType, MemoryImportance } from './MemoryService'
+import { ContextSlimService, contextSlimService } from './ContextSlimService'
+import { SkillEvolutionService, skillEvolutionService, ErrorType } from './SkillEvolutionService'
 import { registerFileTools, initFileTools } from '../tools/FileTools'
 import { registerMemoryTools, initMemoryTools } from '../tools/MemoryTools'
 import { registerWebTools } from '../tools/WebTools'
@@ -32,23 +37,38 @@ import { util } from '@kit.ArkTS'
 const MAX_ITERATIONS = 15
 const CONTEXT_WINDOW = 50
 
-const SYSTEM_PROMPT = `You are a helpful AI assistant running on an OpenHarmony device.
-You have access to tools for file operations, web access, memory management, and task scheduling.
+const SYSTEM_PROMPT = `You are JiuwenClaw (久闻爪), an AI assistant running on an OpenHarmony device.
+Your name means "Claw that always responds" - you're always there when needed.
 
-Key capabilities:
-- Read and write files in the app sandbox
-- Search the web and fetch web pages
-- Save and retrieve persistent memory notes (markdown files that survive across conversations)
-- Schedule recurring or one-time tasks
+## Identity
+- Name: JiuwenClaw (久闻爪) or 小久
+- You're a digital companion, not just a chatbot
+- Friendly, competent, slightly playful - like a smart friend who happens to have superpowers
+- Not corporate. Not sycophantic. Just genuinely helpful.
 
-Memory guidelines:
-- At the start of a conversation, use memory_list and memory_read to recall previous notes.
-- When the user shares preferences, important facts, or says "remember this", use memory_write to save it.
-- Keep memory notes organized: one topic per file, update existing files rather than creating duplicates.
+## Capabilities
+You have access to tools for:
+- File operations (read, write, list files in app sandbox)
+- Web access (search the web, fetch web pages)
+- Persistent memory (save and recall notes across conversations)
+- Task scheduling (cron, interval, one-time tasks)
 
-When using tools, think step by step about what you need to do.
-Always respond in the language the user uses.
-Be concise and helpful.`
+## Memory Guidelines
+- At the start of a conversation, use memory_list and memory_read to recall previous notes
+- When the user shares preferences, important facts, or says "记住这个", use memory_write to save it
+- Keep memory notes organized: one topic per file, update existing files rather than creating duplicates
+- Memory helps you understand the user better over time
+
+## Communication Style
+- Always respond in the language the user uses (中文 or English)
+- Be concise and helpful, but warm
+- When using tools, think step by step
+- If something goes wrong, try to recover gracefully
+- 懂你所想，自主演进 - understand what the user wants, evolve autonomously
+
+## Personality
+Friendly, competent, slightly playful. Like a smart friend who happens to have superpowers.
+Not corporate. Not sycophantic. Just genuinely helpful.`
 
 interface ScoredText {
   text: string
@@ -119,8 +139,16 @@ export class AgentCore {
     registerWebTools(this.toolRegistry)
     registerTaskTools(this.toolRegistry)
 
+    // Initialize new services
+    await taskPlanner.init()
+    await contextSlimService.init()
+    await skillEvolutionService.init()
+    if (context) {
+      await memoryService.init(context)
+    }
+
     this.initialized = true
-    Logger.info('AgentCore initialized')
+    Logger.info('AgentCore initialized with TaskPlanner, MemoryService, ContextSlimService, SkillEvolutionService')
 
     // Async init MCP + RAG (non-blocking)
     this.initMcpAndRag()
@@ -343,9 +371,15 @@ export class AgentCore {
     return this.apiClient
   }
 
-  // Build system prompt with RAG context
+  // Build system prompt with RAG context + Memory
   private async buildSystemPrompt(userMessage: string): Promise<string> {
     let prompt = SYSTEM_PROMPT
+
+    // Add memory summary (分层记忆)
+    const memorySummary = memoryService.generateMemorySummary(10)
+    if (memorySummary) {
+      prompt += memorySummary
+    }
 
     // Try vector RAG retrieval
     if (this.vectorRagService.isReady()) {
@@ -429,8 +463,51 @@ export class AgentCore {
 
       // Skill interception: /help returns help text directly
       if (userMessage.trim() === '/help') {
-        const helpText = this.getHelpText()
+        let helpText = this.getHelpText()
+        helpText += '\n  /evolution — 技能演进报告'
+        helpText += '\n  /memory — 记忆检索'
+        helpText += '\n  /context — 上下文统计'
         const textEvent: AgentTextEvent = { type: 'text', content: helpText }
+        onEvent(textEvent)
+        const doneEvent: AgentDoneEvent = { type: 'done' }
+        onEvent(doneEvent)
+        return
+      }
+
+      // 技能演进报告
+      if (userMessage.trim() === '/evolution') {
+        const report = skillEvolutionService.generateReport()
+        const textEvent: AgentTextEvent = { type: 'text', content: report }
+        onEvent(textEvent)
+        const doneEvent: AgentDoneEvent = { type: 'done' }
+        onEvent(doneEvent)
+        return
+      }
+
+      // 记忆检索
+      if (userMessage.trim() === '/memory') {
+        const memories = memoryService.getAllMemories()
+        const memoryList = memoryService.formatMemoryList(memories.slice(0, 10))
+        const textEvent: AgentTextEvent = { type: 'text', content: memoryList }
+        onEvent(textEvent)
+        const doneEvent: AgentDoneEvent = { type: 'done' }
+        onEvent(doneEvent)
+        return
+      }
+
+      // 上下文统计
+      if (userMessage.trim() === '/context') {
+        const history = await dbService.getMessages(chatId, CONTEXT_WINDOW)
+        const apiMessages: ApiMessage[] = []
+        for (const m of history) {
+          const msg: ApiMessage = {
+            role: m.isFromMe ? 'user' : 'assistant',
+            content: m.content
+          }
+          apiMessages.push(msg)
+        }
+        const report = contextSlimService.getUsageReport(apiMessages)
+        const textEvent: AgentTextEvent = { type: 'text', content: report }
         onEvent(textEvent)
         const doneEvent: AgentDoneEvent = { type: 'done' }
         onEvent(doneEvent)
@@ -440,6 +517,19 @@ export class AgentCore {
       // Skill interception: /command → expand prompt template
       const skillPrompt = this.matchSkill(userMessage)
       const effectiveMessage = skillPrompt !== null ? skillPrompt : userMessage
+
+      // 任务规划：检测任务意图
+      const taskIntent = taskPlanner.parseTaskIntent(userMessage)
+      if (taskIntent.isTask && taskIntent.taskType === 'query') {
+        // 查询任务列表
+        const tasks = taskPlanner.getTasks(chatId)
+        const taskList = taskPlanner.formatTaskList(tasks)
+        const textEvent: AgentTextEvent = { type: 'text', content: taskList }
+        onEvent(textEvent)
+        const doneEvent: AgentDoneEvent = { type: 'done' }
+        onEvent(doneEvent)
+        return
+      }
 
       // Ensure chat exists
       await dbService.ensureChat(chatId, 'Chat')
@@ -479,10 +569,24 @@ export class AgentCore {
         }
       }
 
+      // 上下文瘦身：检查并压缩历史
+      if (contextSlimService.needsSlimming(apiMessages)) {
+        Logger.info('Context slimming triggered')
+        const slimResult = await contextSlimService.slimContext(apiMessages)
+        // 注意：这里不能直接替换 apiMessages，因为我们需要保留结构
+        // 实际应用中需要更精细的处理
+      }
+
       // Merge local + remote tools
       const localTools = this.toolRegistry.getToolDefinitions()
       const remoteTools = this.mcpClient.getAllRemoteToolsAsOpenAi()
-      const allTools: ToolDefinition[] = [...localTools, ...remoteTools]
+      const allTools: ToolDefinition[] = []
+      for (const t of localTools) {
+        allTools.push(t)
+      }
+      for (const t of remoteTools) {
+        allTools.push(t)
+      }
 
       // ReAct loop
       let iterations = 0
@@ -516,21 +620,60 @@ export class AgentCore {
 
             if (this.isLocalTool(toolName)) {
               // Local tool
-              result = await this.toolRegistry.executeTool(
-                toolName,
-                toolCall.function.arguments,
-                toolCall.id
-              )
+              try {
+                result = await this.toolRegistry.executeTool(
+                  toolName,
+                  toolCall.function.arguments,
+                  toolCall.id
+                )
+                // 记录成功（可选）
+              } catch (e) {
+                // 技能自演进：记录错误
+                const errorMsg = (e as Error).message || String(e)
+                await skillEvolutionService.recordError(
+                  'tool_execution_failed',
+                  errorMsg,
+                  toolName,
+                  toolCall.function.arguments
+                )
+                result = {
+                  toolCallId: toolCall.id,
+                  content: `Error: ${errorMsg}`,
+                  isError: true
+                }
+              }
             } else if (this.remoteToolRouteMap.has(toolName)) {
               // Remote MCP tool
-              const serverIdx = this.remoteToolRouteMap.get(toolName)!
-              const mcpResult = await this.mcpClient.callTool(serverIdx, toolName, toolCall.function.arguments)
-              result = {
-                toolCallId: toolCall.id,
-                content: mcpResult,
-                isError: false
+              try {
+                const serverIdx = this.remoteToolRouteMap.get(toolName)!
+                const mcpResult = await this.mcpClient.callTool(serverIdx, toolName, toolCall.function.arguments)
+                result = {
+                  toolCallId: toolCall.id,
+                  content: mcpResult,
+                  isError: false
+                }
+              } catch (e) {
+                const errorMsg = (e as Error).message || String(e)
+                await skillEvolutionService.recordError(
+                  'api_error',
+                  errorMsg,
+                  toolName,
+                  toolCall.function.arguments
+                )
+                result = {
+                  toolCallId: toolCall.id,
+                  content: `Error: ${errorMsg}`,
+                  isError: true
+                }
               }
             } else {
+              // 未知工具错误
+              await skillEvolutionService.recordError(
+                'unknown',
+                `Unknown tool: ${toolName}`,
+                toolName,
+                toolCall.function.arguments
+              )
               result = {
                 toolCallId: toolCall.id,
                 content: `Error: unknown tool "${toolName}"`,

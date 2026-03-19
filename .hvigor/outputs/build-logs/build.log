@@ -1,0 +1,176 @@
+[2026-03-19T18:56:24.226] [DEBUG] debug-file - Compile arkts with external api path: E:\app\deveco6.0.2\DevEco Studio\sdk\default\hms\ets
+[2026-03-19T18:56:24.227] [DEBUG] debug-file - default@CompileArkTS work[21] is submitted.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - default@CompileArkTS work[21] is pushed to ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[15] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[14] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[13] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[12] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[11] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[10] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[9] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[8] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[7] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[6] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - A work dispatched to worker[5] failed because unable to get work from ready queue.
+[2026-03-19T18:56:24.228] [DEBUG] debug-file - default@CompileArkTS work[21] has been dispatched to worker[4].
+[2026-03-19T18:56:24.229] [DEBUG] debug-file - default@CompileArkTS work[21] is dispatched.
+[2026-03-19T18:56:24.229] [DEBUG] debug-file - entry : default@CompileArkTS cost memory 1.7328109741210938
+[2026-03-19T18:56:24.232] [DEBUG] debug-file - Executing task :entry:default@BuildJS
+[2026-03-19T18:56:24.232] [DEBUG] debug-file - Task 'entry:default@BuildJS' cost while wrapping incremental declarations: 1 ms 
+[2026-03-19T18:56:24.235] [DEBUG] debug-file - entry : default@BuildJS cost memory 0.1596221923828125
+[2026-03-19T18:56:24.235] [DEBUG] debug-file - runTaskFromQueue task cost before running: 242 ms 
+[2026-03-19T18:56:24.235] [INFO] debug-file - Finished :entry:default@BuildJS... after 3 ms 
+[2026-03-19T18:56:24.236] [DEBUG] debug-file - Executing task :entry:default@CacheNativeLibs
+[2026-03-19T18:56:24.236] [DEBUG] debug-file - Task 'entry:default@CacheNativeLibs' cost while wrapping incremental declarations: 1 ms 
+[2026-03-19T18:56:24.237] [DEBUG] debug-file - Incremental task entry:default@CacheNativeLibs pre-execution cost: 1 ms .
+[2026-03-19T18:56:24.237] [DEBUG] debug-file - entry : default@CacheNativeLibs cost memory 0.08565521240234375
+[2026-03-19T18:56:24.237] [INFO] debug-file - UP-TO-DATE :entry:default@CacheNativeLibs...  
+[2026-03-19T18:56:25.516] [DEBUG] debug-file - worker[4] has one work done.
+[2026-03-19T18:56:25.517] [DEBUG] debug-file - default@CompileArkTS work[21] done.
+[2026-03-19T18:56:25.525] [INFO] debug-file - Finished :entry:default@CompileArkTS... after 1 s 310 ms 
+[2026-03-19T18:56:25.525] [DEBUG] debug-file - Executing task :entry:default@GeneratePkgModuleJson
+[2026-03-19T18:56:25.526] [DEBUG] debug-file - File: 'C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\preload\default\preload.json' from 'preloadSoJsonPath' is not exists, just ignore.
+[2026-03-19T18:56:25.526] [DEBUG] debug-file - Error occurs while handling @Input 'shouldDeduplicateHar': The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined
+[2026-03-19T18:56:25.526] [DEBUG] debug-file - Task 'entry:default@GeneratePkgModuleJson' cost while wrapping incremental declarations: 1 ms 
+[2026-03-19T18:56:25.526] [DEBUG] debug-file - Incremental task entry:default@GeneratePkgModuleJson pre-execution cost: 1 ms .
+[2026-03-19T18:56:25.527] [DEBUG] debug-file - entry : default@GeneratePkgModuleJson cost memory 0.09658050537109375
+[2026-03-19T18:56:25.527] [INFO] debug-file - UP-TO-DATE :entry:default@GeneratePkgModuleJson...  
+[2026-03-19T18:56:25.527] [DEBUG] debug-file - Executing task :entry:default@ProcessCompiledResources
+[2026-03-19T18:56:25.527] [DEBUG] debug-file - File: 'C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\preload\default\preload.json' from 'preloadSoJsonPath' is not exists, just ignore.
+[2026-03-19T18:56:25.527] [DEBUG] debug-file - Task 'entry:default@ProcessCompiledResources' cost while wrapping incremental declarations: 1 ms 
+[2026-03-19T18:56:25.528] [DEBUG] debug-file - entry : default@ProcessCompiledResources cost memory 0.05706024169921875
+[2026-03-19T18:56:25.528] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 535 ms 
+[2026-03-19T18:56:25.528] [INFO] debug-file - Finished :entry:default@ProcessCompiledResources... after 1 ms 
+[2026-03-19T18:56:25.529] [DEBUG] debug-file - Executing task :entry:default@PackageHap
+[2026-03-19T18:56:25.534] [DEBUG] debug-file - entry:default@PackageHap is not up-to-date, since the input file 'C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\ets' has been changed.
+[2026-03-19T18:56:25.534] [DEBUG] debug-file - Incremental task entry:default@PackageHap pre-execution cost: 5 ms .
+[2026-03-19T18:56:25.536] [DEBUG] debug-file - Use tool [E:\app\deveco6.0.2\DevEco Studio\sdk\default\openharmony\toolchains\lib\app_packing_tool.jar]
+ [
+  'java',
+  '-Dfile.encoding=GBK',
+  '-jar',
+  'E:\\app\\deveco6.0.2\\DevEco Studio\\sdk\\default\\openharmony\\toolchains\\lib\\app_packing_tool.jar',
+  '--mode',
+  'hap',
+  '--force',
+  'true',
+  '--lib-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\stripped_native_libs\\default',
+  '--json-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\package\\default\\module.json',
+  '--resources-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\default\\resources',
+  '--index-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\default\\resources.index',
+  '--pack-info-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\outputs\\default\\pack.info',
+  '--out-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\outputs\\default\\entry-default-unsigned.hap',
+  '--ets-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader_out\\default\\ets',
+  '--pkg-context-path',
+  'C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader\\default\\pkgContextInfo.json'
+]
+[2026-03-19T18:56:25.586] [DEBUG] debug-file - java daemon socket received message:{"code":0,"message":"pack success"}
+[2026-03-19T18:56:25.589] [DEBUG] debug-file - entry : default@PackageHap cost memory -0.9517669677734375
+[2026-03-19T18:56:25.589] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 596 ms 
+[2026-03-19T18:56:25.590] [INFO] debug-file - Finished :entry:default@PackageHap... after 61 ms 
+[2026-03-19T18:56:25.591] [DEBUG] debug-file - Executing task :entry:default@PackingCheck
+[2026-03-19T18:56:25.595] [DEBUG] debug-file - entry : default@PackingCheck cost memory 0.4042816162109375
+[2026-03-19T18:56:25.595] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 602 ms 
+[2026-03-19T18:56:25.596] [INFO] debug-file - Finished :entry:default@PackingCheck... after 5 ms 
+[2026-03-19T18:56:25.597] [DEBUG] debug-file - Executing task :entry:default@SignHap
+[2026-03-19T18:56:25.599] [DEBUG] debug-file - entry:default@SignHap is not up-to-date, since the input file 'C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\entry-default-unsigned.hap' has been changed.
+[2026-03-19T18:56:25.599] [DEBUG] debug-file - Incremental task entry:default@SignHap pre-execution cost: 2 ms .
+[2026-03-19T18:56:25.615] [DEBUG] debug-file - java daemon socket close code:1000 reason:close by user
+[2026-03-19T18:56:25.649] [DEBUG] debug-file - java daemon socket received message:{"code":0,"message":"verify profile success"}
+[2026-03-19T18:56:25.653] [DEBUG] debug-file - java daemon socket close code:1000 reason:close by user
+[2026-03-19T18:56:25.818] [DEBUG] debug-file - java daemon socket received message:{"code":0,"message":"sign app success"}
+[2026-03-19T18:56:25.819] [DEBUG] debug-file - entry : default@SignHap cost memory 0.5550384521484375
+[2026-03-19T18:56:25.819] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 826 ms 
+[2026-03-19T18:56:25.819] [INFO] debug-file - Finished :entry:default@SignHap... after 222 ms 
+[2026-03-19T18:56:25.820] [DEBUG] debug-file - Executing task :entry:default@CollectDebugSymbol
+[2026-03-19T18:56:25.821] [DEBUG] debug-file - entry : default@CollectDebugSymbol cost memory 0.0959320068359375
+[2026-03-19T18:56:25.821] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 828 ms 
+[2026-03-19T18:56:25.821] [INFO] debug-file - Finished :entry:default@CollectDebugSymbol... after 1 ms 
+[2026-03-19T18:56:25.822] [DEBUG] debug-file - Executing task :entry:assembleHap
+[2026-03-19T18:56:25.822] [DEBUG] debug-file - entry : assembleHap cost memory 0.01178741455078125
+[2026-03-19T18:56:25.822] [DEBUG] debug-file - runTaskFromQueue task cost before running: 1 s 829 ms 
+[2026-03-19T18:56:25.822] [INFO] debug-file - Finished :entry:assembleHap... after 1 ms 
+[2026-03-19T18:56:25.840] [INFO] debug-file - BUILD SUCCESSFUL in 1 s 847 ms 
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@PreBuild is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - Update task entry:default@CreateModuleInfo output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\generated\profile\default\ModuleInfo.ts cache.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - Incremental task entry:default@CreateModuleInfo post-execution cost:1 ms .
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@GenerateMetadata is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@MergeProfile is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@CreateBuildProfile is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@GeneratePkgContextInfo is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - Update task entry:default@ProcessIntegratedHsp output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\build\cache\default\integrated_hsp\integratedHspCache.json cache.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - Incremental task entry:default@ProcessIntegratedHsp post-execution cost:1 ms .
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@MakePackInfo is up-to-date.
+[2026-03-19T18:56:25.841] [DEBUG] debug-file - Update task entry:default@SyscapTransform input file:E:\app\deveco6.0.2\DevEco Studio\sdk\default\openharmony\toolchains\syscap_tool.exe cache by regenerate.
+[2026-03-19T18:56:25.842] [DEBUG] debug-file - Update task entry:default@SyscapTransform input file:E:\app\deveco6.0.2\DevEco Studio\sdk\default\openharmony\ets\api\device-define cache by regenerate.
+[2026-03-19T18:56:25.843] [DEBUG] debug-file - Update task entry:default@SyscapTransform output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\syscap\default\rpcid.sc cache.
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - Incremental task entry:default@SyscapTransform post-execution cost:3 ms .
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@ProcessProfile is up-to-date.
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@ProcessRouterMap is up-to-date.
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@ProcessShareConfig is up-to-date.
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - Update task entry:default@ProcessStartupConfig input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default\pkgContextInfo.json cache by regenerate.
+[2026-03-19T18:56:25.844] [DEBUG] debug-file - Update task entry:default@ProcessStartupConfig output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\startup\default\startup_config.json cache.
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - Incremental task entry:default@ProcessStartupConfig post-execution cost:1 ms .
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@ProcessResource is up-to-date.
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@GenerateLoaderJson is up-to-date.
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@ProcessLibs is up-to-date.
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@CompileResource is up-to-date.
+[2026-03-19T18:56:25.845] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@DoNativeStrip is up-to-date.
+[2026-03-19T18:56:25.846] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default cache by regenerate.
+[2026-03-19T18:56:25.847] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources\rawfile cache by regenerate.
+[2026-03-19T18:56:25.848] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\ResourceTable.txt cache by regenerate.
+[2026-03-19T18:56:25.849] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\ark_module.json cache by regenerate.
+[2026-03-19T18:56:25.849] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources\base\profile cache by regenerate.
+[2026-03-19T18:56:25.849] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\src\main\ets cache from map.
+[2026-03-19T18:56:25.849] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default\pkgContextInfo.json cache by regenerate.
+[2026-03-19T18:56:25.850] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\generated\profile\default\BuildProfile.ets cache by regenerate.
+[2026-03-19T18:56:25.850] [DEBUG] debug-file - Update task entry:default@CompileArkTS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\src\mock\mock-config.json5 cache by regenerate.
+[2026-03-19T18:56:25.850] [DEBUG] debug-file - Update task entry:default@CompileArkTS output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\ets cache.
+[2026-03-19T18:56:25.851] [DEBUG] debug-file - Incremental task entry:default@CompileArkTS post-execution cost:6 ms .
+[2026-03-19T18:56:25.852] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default cache by regenerate.
+[2026-03-19T18:56:25.852] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources\rawfile cache by regenerate.
+[2026-03-19T18:56:25.854] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\ResourceTable.txt cache by regenerate.
+[2026-03-19T18:56:25.854] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\ark_module.json cache by regenerate.
+[2026-03-19T18:56:25.854] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources\base\profile cache by regenerate.
+[2026-03-19T18:56:25.854] [DEBUG] debug-file - Update task entry:default@BuildJS input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default\pkgContextInfo.json cache by regenerate.
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - Update task entry:default@BuildJS output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\js cache.
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - Incremental task entry:default@BuildJS post-execution cost:5 ms .
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@CacheNativeLibs is up-to-date.
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - There is no need to refresh cache, since the incremental task entry:default@GeneratePkgModuleJson is up-to-date.
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - Incremental task entry:default@ProcessCompiledResources post-execution cost:1 ms .
+[2026-03-19T18:56:25.855] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\stripped_native_libs\default cache by regenerate.
+[2026-03-19T18:56:25.856] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\module.json cache by regenerate.
+[2026-03-19T18:56:25.856] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources cache by regenerate.
+[2026-03-19T18:56:25.858] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\res\default\resources.index cache by regenerate.
+[2026-03-19T18:56:25.859] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\pack.info cache by regenerate.
+[2026-03-19T18:56:25.859] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\ets cache from map.
+[2026-03-19T18:56:25.859] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader\default\pkgContextInfo.json cache by regenerate.
+[2026-03-19T18:56:25.859] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\ets\sourceMaps.map cache by regenerate.
+[2026-03-19T18:56:25.859] [DEBUG] debug-file - Update task entry:default@PackageHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\generated\profile\default\BuildProfile.ets cache by regenerate.
+[2026-03-19T18:56:25.860] [DEBUG] debug-file - Update task entry:default@PackageHap output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\entry-default-unsigned.hap cache.
+[2026-03-19T18:56:25.860] [DEBUG] debug-file - Update task entry:default@PackageHap output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\source_map\default\sourceMaps.map cache.
+[2026-03-19T18:56:25.860] [DEBUG] debug-file - Update task entry:default@PackageHap output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\mapping\sourceMaps.map cache.
+[2026-03-19T18:56:25.860] [DEBUG] debug-file - Incremental task entry:default@PackageHap post-execution cost:6 ms .
+[2026-03-19T18:56:25.861] [DEBUG] debug-file - Update task entry:default@SignHap input file:C:\Users\wxj05\.ohos\config\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.cer cache by regenerate.
+[2026-03-19T18:56:25.861] [DEBUG] debug-file - Update task entry:default@SignHap input file:C:\Users\wxj05\.ohos\config\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p7b cache by regenerate.
+[2026-03-19T18:56:25.861] [DEBUG] debug-file - Update task entry:default@SignHap input file:C:\Users\wxj05\.ohos\config\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p12 cache by regenerate.
+[2026-03-19T18:56:25.861] [DEBUG] debug-file - Update task entry:default@SignHap input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\entry-default-unsigned.hap cache from map.
+[2026-03-19T18:56:25.862] [DEBUG] debug-file - Update task entry:default@SignHap output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\entry-default-signed.hap cache.
+[2026-03-19T18:56:25.863] [DEBUG] debug-file - Incremental task entry:default@SignHap post-execution cost:3 ms .
+[2026-03-19T18:56:25.863] [DEBUG] debug-file - Update task entry:default@CollectDebugSymbol input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\loader_out\default\ets\sourceMaps.map cache by regenerate.
+[2026-03-19T18:56:25.863] [DEBUG] debug-file - Update task entry:default@CollectDebugSymbol input file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\intermediates\libs\default cache by regenerate.
+[2026-03-19T18:56:25.864] [DEBUG] debug-file - Update task entry:default@CollectDebugSymbol output file:C:\Users\wxj05\Desktop\openclaw-on-openharmony-main\entry\build\default\outputs\default\symbol cache.
+[2026-03-19T18:56:25.864] [DEBUG] debug-file - Incremental task entry:default@CollectDebugSymbol post-execution cost:2 ms .
+[2026-03-19T18:56:25.896] [DEBUG] debug-file - hvigor build process will be closed.
+[2026-03-19T18:56:25.896] [DEBUG] debug-file - java daemon socket close code:1000 reason:close by user
+[2026-03-19T18:56:25.904] [DEBUG] debug-file - session manager: send message to worker process.
+[2026-03-19T18:56:25.904] [DEBUG] debug-file - session manager: send message to worker process.
+[2026-03-19T18:56:25.904] [DEBUG] debug-file - watch worker: worker id should be larger than 0. Nothing will be sent to any worker thread.
+[2026-03-19T18:56:25.904] [DEBUG] debug-file - watch worker: worker id should be larger than 0. Nothing will be sent to any worker thread.

@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "ohos-module-entry": {
+    "SELECT_TARGET": "default",
+    "MODULE_BUILD_DIR": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build",
+    "TARGETS": {
+      "default": {
+        "SOURCE_ROOT": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\src\\main",
+        "RESOURCES_PATH": [
+          "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\src\\main\\resources"
+        ],
+        "BUILD_PATH": {
+          "OUTPUT_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\outputs\\default",
+          "INTERMEDIA_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates",
+          "JS_ASSETS_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader_out\\default",
+          "JS_LITE_ASSETS_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader_out_lite\\default",
+          "RES_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\default",
+          "RES_PROFILE_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\default\\resources\\base\\profile",
+          "ETS_SUPER_VISUAL_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\cache\\default\\default@CompileArkTS\\esmodule",
+          "JS_SUPER_VISUAL_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\cache\\default\\default@CompileJS\\jsbundle",
+          "WORKER_LOADER": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader\\default\\loader.json",
+          "MANIFEST_JSON": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\manifest\\default",
+          "OUTPUT_METADATA_JSON": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\hap_metadata\\default\\output_metadata.json",
+          "SOURCE_MAP_DIR": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\source_map\\default"
+        },
+        "BUILD_OPTION": {
+          "debuggable": true
+        }
+      },
+      "ohosTest": {
+        "SOURCE_ROOT": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\src\\ohosTest",
+        "RESOURCES_PATH": [
+          "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\src\\ohosTest\\resources"
+        ],
+        "BUILD_PATH": {
+          "OUTPUT_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\outputs\\ohosTest",
+          "INTERMEDIA_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates",
+          "JS_ASSETS_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader_out\\ohosTest",
+          "JS_LITE_ASSETS_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader_out_lite\\ohosTest",
+          "RES_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\ohosTest",
+          "RES_PROFILE_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\res\\ohosTest\\resources\\base\\profile",
+          "ETS_SUPER_VISUAL_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\cache\\ohosTest\\ohosTest@OhosTestCompileArkTS\\esmodule",
+          "JS_SUPER_VISUAL_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\cache\\ohosTest\\ohosTest@OhosTestCompileJS\\jsbundle",
+          "WORKER_LOADER": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\loader\\ohosTest\\loader.json",
+          "MANIFEST_JSON": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\manifest\\ohosTest",
+          "OUTPUT_METADATA_JSON": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\hap_metadata\\ohosTest\\output_metadata.json",
+          "SOURCE_MAP_DIR": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry\\build\\default\\intermediates\\source_map\\ohosTest"
+        },
+        "BUILD_OPTION": {
+          "debuggable": true
+        }
+      }
+    },
+    "BUILD_OPTION": {
+      "default-default": {
+        "debuggable": true,
+        "copyFrom": "default",
+        "strictMode": {
+          "caseSensitiveCheck": true,
+          "useNormalizedOHMUrl": true
+        },
+        "resOptions": {
+          "copyCodeResource": {
+            "enable": false
+          }
+        },
+        "name": "debug"
+      }
+    },
+    "BUILD_PROFILE_OPT": {
+      "apiType": "stageMode",
+      "buildOption": {
+        "resOptions": {
+          "copyCodeResource": {
+            "enable": false
+          }
+        }
+      },
+      "buildOptionSet": [
+        {
+          "name": "release",
+          "arkOptions": {
+            "obfuscation": {
+              "ruleOptions": {
+                "enable": false,
+                "files": [
+                  "./obfuscation-rules.txt"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "default"
+        },
+        {
+          "name": "debug"
+        }
+      ],
+      "targets": [
+        {
+          "name": "default"
+        },
+        {
+          "name": "ohosTest"
+        }
+      ]
+    },
+    "BUILD_CACHE_DIR": ""
+  },
+  "ohos-project": {
+    "SELECT_PRODUCT_NAME": "default",
+    "MODULE_BUILD_DIR": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\build",
+    "BUNDLE_NAME": "com.example.openclaw_on_openharmony",
+    "VERSION_CODE": 1000000,
+    "VERSION_NAME": "1.0.0",
+    "BUILD_PATH": {
+      "OUTPUT_PATH": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\build\\outputs\\default"
+    },
+    "MODULES": [
+      {
+        "name": "entry",
+        "srcPath": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main\\entry",
+        "targets": [
+          {
+            "name": "default",
+            "applyToProducts": [
+              "default"
+            ]
+          }
+        ],
+        "belongProjectPath": "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main"
+      }
+    ],
+    "PROFILE_OPT": {
+      "app": {
+        "signingConfigs": [
+          {
+            "name": "default",
+            "type": "HarmonyOS",
+            "material": {
+              "certpath": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.cer",
+              "keyAlias": "debugKey",
+              "keyPassword": "0000001BBA9CE5A896D24E8F5DDA03B88F04752F4A7CFBC9B24C6F099FA3F405556D52CCC923F8D9A2874E",
+              "profile": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p7b",
+              "signAlg": "SHA256withECDSA",
+              "storeFile": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p12",
+              "storePassword": "0000001B094762E8CBF66DA71061DC2285DD55436391CBF818BB01E2136942F63954EE351871DDF18A9353"
+            }
+          }
+        ],
+        "products": [
+          {
+            "name": "default",
+            "signingConfig": "default",
+            "targetSdkVersion": "6.0.1(21)",
+            "compatibleSdkVersion": "6.0.0(20)",
+            "runtimeOS": "HarmonyOS",
+            "buildOption": {
+              "strictMode": {
+                "caseSensitiveCheck": true,
+                "useNormalizedOHMUrl": true
+              }
+            }
+          }
+        ],
+        "buildModeSet": [
+          {
+            "name": "debug"
+          },
+          {
+            "name": "release"
+          }
+        ]
+      },
+      "modules": [
+        {
+          "name": "entry",
+          "srcPath": "./entry",
+          "targets": [
+            {
+              "name": "default",
+              "applyToProducts": [
+                "default"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "CONFIG_PROPERTIES": {
+      "enableSignTask": true,
+      "skipNativeIncremental": false,
+      "hvigor.keepDependency": true
+    },
+    "OVERALL_PROJECT_PATHS": [
+      "C:\\Users\\wxj05\\Desktop\\openclaw-on-openharmony-main"
+    ],
+    "BUILD_CACHE_DIR": ""
+  }
+}

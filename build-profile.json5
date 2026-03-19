@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "C:\\Users\\lmxxf\\.ohos\\config\\default_openclaw_on_openharmony_YSImOC2OH-EreMlYkCx0zedV1xsi5FtwLBc11wv2WwQ=.cer",
+          "certpath": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001B4F7FDC1299AC7F5C1E079CA0FB12092603DFB8FFFEABEF48029CB56DA6049A247D967BC44ACE45",
-          "profile": "C:\\Users\\lmxxf\\.ohos\\config\\default_openclaw_on_openharmony_YSImOC2OH-EreMlYkCx0zedV1xsi5FtwLBc11wv2WwQ=.p7b",
+          "keyPassword": "0000001BBA9CE5A896D24E8F5DDA03B88F04752F4A7CFBC9B24C6F099FA3F405556D52CCC923F8D9A2874E",
+          "profile": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "C:\\Users\\lmxxf\\.ohos\\config\\default_openclaw_on_openharmony_YSImOC2OH-EreMlYkCx0zedV1xsi5FtwLBc11wv2WwQ=.p12",
-          "storePassword": "0000001B483EC0A1FFCEDE81FCF833FA290F021362305DA581D7091DAF4536E6A937540F26D7528CB9214D"
+          "storeFile": "C:\\Users\\wxj05\\.ohos\\config\\default_openclaw-on-openharmony-main_UH480sBHVNzEpS6EhWsZfqHn9u-sJMBC5CpQ1j2hYGU=.p12",
+          "storePassword": "0000001B094762E8CBF66DA71061DC2285DD55436391CBF818BB01E2136942F63954EE351871DDF18A9353"
         }
       }
     ],

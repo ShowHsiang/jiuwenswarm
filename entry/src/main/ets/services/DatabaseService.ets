@@ -96,6 +96,14 @@ export class DatabaseService {
     )
   }
 
+  async clearChat(chatId: string): Promise<void> {
+    await this.rdbStore!.executeSql(
+      `DELETE FROM messages WHERE chat_id = ?`,
+      [chatId]
+    )
+    Logger.info('Chat cleared: ' + chatId)
+  }
+
   async getAllChats(): Promise<ChatConversation[]> {
     const resultSet = await this.rdbStore!.querySql(
       `SELECT id, name, last_message_time, last_message_preview FROM chats ORDER BY last_message_time DESC`
