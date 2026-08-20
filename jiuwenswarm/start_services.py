@@ -503,7 +503,9 @@ def _start_process(
     from jiuwenswarm.dotenv_early import CLI_PORTS_ENV_FLAG
 
     logging.info(f"[start_services] starting {name}: {' '.join(cmd)} (cwd={cwd})")
-    env = os.environ.copy()
+    from jiuwenswarm.common.daily_activity import child_process_env
+
+    env = child_process_env()
     env["JIUWENSWARM_START_CMD"] = json.dumps(sys.argv[:])
     if ports:
         # Inject the resolved port group and mark the child so
@@ -1046,12 +1048,19 @@ def _dispatch_action(args: argparse.Namespace) -> int:
 
     # --restart <name>: restart specific instance
     if args.restart:
+        from jiuwenswarm.common.daily_activity import report_launch
+
+        report_launch("start_services")
         return _action_restart(args.restart, args.mode)
 
     # debug: rebuild frontend + sync deps, then run the services in background
     if args.mode == "debug":
         from jiuwenswarm.debug_launcher import run_debug
         return run_debug(skip_build=args.skip_build)
+
+    from jiuwenswarm.common.daily_activity import report_launch
+
+    report_launch("start_services")
 
     # --name <name>: start named instance
     if args.name:

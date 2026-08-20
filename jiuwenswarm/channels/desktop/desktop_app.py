@@ -361,7 +361,9 @@ def _build_child_command(name: str, extra_args: list[str] | None = None) -> list
 
 
 def _build_child_env(name: str, ports: dict[str, int]) -> dict[str, str]:
-    env = os.environ.copy()
+    from jiuwenswarm.common.daily_activity import child_process_env
+
+    env = child_process_env()
     env[DESKTOP_ENV_FLAG] = "1"
     # Inject the full session port group so app → agent/gateway and web agree.
     # load_dotenv_runtime preserves these under JIUWENSWARM_DESKTOP=1.
@@ -2181,6 +2183,10 @@ def main() -> None:
     except RuntimeError as exc:
         logger.error("[desktop] port resolution failed: %s", exc)
         raise SystemExit(1) from exc
+
+    from jiuwenswarm.common.daily_activity import report_launch
+
+    report_launch("desktop")
 
     runtime = DesktopRuntime(
         frontend_host=FRONTEND_HOST,

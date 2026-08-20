@@ -78,6 +78,15 @@ def _run_source_dist(entry: Path, argv: list[str]) -> int:
 
 
 def main() -> None:
+    try:
+        from jiuwenswarm.common.daily_activity import report_launch
+
+        report_launch("tui")
+    except ImportError:
+        # The launcher can be distributed independently; JiuwenSwarm owns the
+        # telemetry implementation when the main package is installed.
+        pass
+
     source_entry = _source_dist_entry_path()
     if source_entry is not None:
         source_exit_code = _run_source_dist(source_entry, sys.argv[1:])

@@ -79,6 +79,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    from jiuwenswarm.common.daily_activity import report_launch
+
+    report_launch("app")
+
     # Route SIGTERM through the same shutdown path as Ctrl-C.
     #
     # Python's default SIGTERM disposition kills this process outright, so the
@@ -115,7 +119,9 @@ def main() -> None:
         agent_cmd.extend(["--dotenv", str(dotenv_path)])
         gateway_cmd.extend(["--dotenv", str(dotenv_path)])
 
-    _popen_kwargs: dict = {}
+    from jiuwenswarm.common.daily_activity import child_process_env
+
+    _popen_kwargs: dict = {"env": child_process_env()}
 
     if "JIUWENSWARM_START_CMD" not in os.environ:
         try:

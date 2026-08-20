@@ -48,6 +48,9 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.warning("Interrupted during startup. Exiting.")
         sys.exit(130)
+    from jiuwenswarm.common.daily_activity import report_launch
+
+    report_launch("cli")
     sys.exit(run_chat(chat_args))
 
 

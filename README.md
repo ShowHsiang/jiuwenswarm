@@ -195,6 +195,21 @@ Full index: [Documentation](docs/README_EN.md)
 
 Full notes for every version are on [GitHub Releases](https://github.com/openJiuwen-ai/jiuwenswarm/releases).
 
+## Anonymous usage metrics
+
+JiuwenSwarm sends one anonymous event for each valid top-level application launch
+to measure daily active installations and launch frequency. A random installation
+ID, event ID, version, OS/architecture, distribution type, entry point, time, and
+timezone are included, together with a coarse system-timezone/locale-derived
+region and ISO country code. Account details, hostname, hardware identifiers, project
+paths, prompts, and conversation content are not collected.
+
+Failed uploads are queued under `~/.jiuwenswarm/telemetry/` and retried; event IDs
+make retries idempotent. Set `JIUWENSWARM_TELEMETRY_DISABLED=1` before launch to
+disable event creation, storage, and sending. Self-signed test deployments may set
+`JIUWENSWARM_TELEMETRY_INSECURE_TLS=1`; never enable it in production. See the
+[anonymous metrics documentation](docs/zh/匿名使用统计.md) for details.
+
 ## FAQ
 
 For solutions to common issues, see: [FAQ](docs/en/FAQ.md).
