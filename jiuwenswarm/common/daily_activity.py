@@ -27,7 +27,7 @@ from jiuwenswarm.common.version import __version__
 from tzlocal import get_localzone_name
 
 
-DEFAULT_TELEMETRY_URL = "https://4.145.114.205/v1/launches"
+DEFAULT_TELEMETRY_URL = "https://117.78.11.91/v1/launches"
 TELEMETRY_DISABLED_ENV = "JIUWENSWARM_TELEMETRY_DISABLED"
 TELEMETRY_URL_ENV = "JIUWENSWARM_TELEMETRY_URL"
 TELEMETRY_INSECURE_TLS_ENV = "JIUWENSWARM_TELEMETRY_INSECURE_TLS"
@@ -76,6 +76,20 @@ def _env_flag(name: str) -> bool:
 
 def _is_child_process() -> bool:
     return os.environ.get(TELEMETRY_CHILD_ENV, "").strip() == "1"
+
+
+def _insecure_tls_enabled(endpoint: str) -> bool:
+    """Return whether TLS verification is disabled for this endpoint.
+
+    The built-in monitor currently generates a self-signed certificate when
+    its Docker stack first starts, so that exact endpoint needs a narrow
+    compatibility default.  Custom endpoints remain strict by default, and
+    an explicit environment value always wins so production deployments can
+    require a trusted certificate.
+    """
+    if TELEMETRY_INSECURE_TLS_ENV in os.environ:
+        return _env_flag(TELEMETRY_INSECURE_TLS_ENV)
+    return endpoint.rstrip("/") == DEFAULT_TELEMETRY_URL.rstrip("/")
 
 
 def _ensure_state_dir() -> None:
@@ -323,11 +337,9 @@ def _post_event(event: dict[str, Any]) -> bool:
     if not endpoint:
         return False
     tls_context = None
-    if endpoint.lower().startswith("https://") and _env_flag(
-        TELEMETRY_INSECURE_TLS_ENV
-    ):
-        # Explicit test-only escape hatch for self-signed monitoring stacks.
-        # Production telemetry must leave this unset and use a trusted cert.
+    if endpoint.lower().startswith("https://") and _insecure_tls_enabled(endpoint):
+        # Keep the exception scoped to telemetry; production/custom monitors
+        # should use a trusted certificate and strict verification.
         tls_context = ssl.create_default_context()
         tls_context.check_hostname = False
         tls_context.verify_mode = ssl.CERT_NONE

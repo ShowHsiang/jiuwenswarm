@@ -206,8 +206,9 @@ paths, prompts, and conversation content are not collected.
 
 Failed uploads are queued under `~/.jiuwenswarm/telemetry/` and retried; event IDs
 make retries idempotent. Set `JIUWENSWARM_TELEMETRY_DISABLED=1` before launch to
-disable event creation, storage, and sending. Self-signed test deployments may set
-`JIUWENSWARM_TELEMETRY_INSECURE_TLS=1`; never enable it in production. See the
+disable event creation, storage, and sending. The built-in monitor currently uses
+a deployment-generated self-signed certificate, accepted only for its exact URL;
+custom HTTPS endpoints still verify TLS by default. See the
 [anonymous metrics documentation](docs/zh/匿名使用统计.md) for details.
 
 ## FAQ

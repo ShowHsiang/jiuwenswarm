@@ -169,6 +169,59 @@ def test_tls_verification_stays_enabled_by_default(monkeypatch):
     assert captured["context"] is None
 
 
+def test_builtin_monitor_accepts_its_generated_self_signed_certificate(monkeypatch):
+    captured = {}
+
+    class _Response:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def _urlopen(request, **kwargs):
+        captured["url"] = request.full_url
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.delenv("JIUWENSWARM_TELEMETRY_URL", raising=False)
+    monkeypatch.delenv("JIUWENSWARM_TELEMETRY_INSECURE_TLS", raising=False)
+    monkeypatch.setattr(daily_activity.urllib.request, "urlopen", _urlopen)
+
+    assert daily_activity._post_event({"event_id": str(uuid.uuid4())}) is True
+    assert captured["url"] == "https://117.78.11.91/v1/launches"
+    context = captured["context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is False
+    assert context.verify_mode == ssl.CERT_NONE
+
+
+def test_builtin_monitor_can_require_strict_tls_explicitly(monkeypatch):
+    captured = {}
+
+    class _Response:
+        status = 201
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def _urlopen(_request, **kwargs):
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.delenv("JIUWENSWARM_TELEMETRY_URL", raising=False)
+    monkeypatch.setenv("JIUWENSWARM_TELEMETRY_INSECURE_TLS", "0")
+    monkeypatch.setattr(daily_activity.urllib.request, "urlopen", _urlopen)
+
+    assert daily_activity._post_event({"event_id": str(uuid.uuid4())}) is True
+    assert captured["context"] is None
+
+
 def test_child_process_env_preserves_values_and_sets_marker(monkeypatch):
     monkeypatch.setenv("EXISTING_VALUE", "yes")
     env = daily_activity.child_process_env()
