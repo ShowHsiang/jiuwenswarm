@@ -12,12 +12,17 @@ import { AgentPanel } from './components/AgentPanel/index';
 import { TeamPanel } from './components/TeamPanel';
 import { SessionsPanel } from './components/SessionsPanel';
 import CronPanel from './components/CronPanel';
+import HeartbeatPanel from './components/HeartbeatPanel';
 import { ToolPanel } from './components/ToolPanel';
-import { ConfigPanel } from './components/ConfigPanel';
-import { ChannelsPanel } from './components/ChannelsPanel';
-import { BrowserPanel } from './components/BrowserPanel';
 import { UpdatePanel } from './components/UpdatePanel';
-import { ExtensionsHubPanel } from './components/ExtensionsHubPanel';
+import { SettingsPage } from './features/settings/SettingsPage';
+import type { SettingsPageDefinition } from './features/settings/registry/types';
+import type { SettingsRequest } from './features/settings/services/settingsContract';
+import {
+  SETTINGS_MODULE_NAVIGATION_EVENT,
+  requestSettingsModule,
+  type SettingsModuleTarget,
+} from './features/settings/settingsNavigation';
 import { ConnectorMarketPanel } from './components/ConnectorMarket';
 import {
   ShareImageDocument,
@@ -42,16 +47,22 @@ import {
 import { prefetchHistoryPages } from './features/historyPagination';
 import { isPlanWireMode } from './features/planMode/wireMode';
 import { queueOrAddGoalObjectiveMessage } from './features/goalPendingObjectiveBubble';
+import { LoginPage } from './features/auth/LoginPage';
+import { LogoutButton } from './features/auth/LogoutButton';
 import {
   normalizeToolCallPayload,
   normalizeToolResultPayload,
 } from './features/tool-events/toolEventNormalizer';
-import { useWebSocket, mergePersistedGoalCompletionMessages, stampGoalObjectiveMessages, useResponsiveLayout } from './hooks';
+import { useWebSocket, mergePersistedGoalCompletionMessages, stampGoalObjectiveMessages, useResponsiveLayout, useResponsivePanelResize } from './hooks';
 import { webRequest } from './services/webClient';
 import { processOAuthCallback } from './utils/gitcodeOAuth';
 import { useTeamPanelState } from './features/teamPanelState';
 import { useSingleAgentPanelState } from './features/singleAgentPanelState';
 import { AgentMode, MediaItem, UserAnswer, ModelEntry, type Session } from './types';
+import type {
+  CodexDependencyInstallStatus,
+  ExternalCliAgentKind,
+} from './components/ExternalCliAgentsSection';
 import {
   ensureSessionRuntimes,
   useSessionStore,
@@ -127,14 +138,6 @@ type ChatPanelResizeDrag = {
 };
 const PREVIEW_MODEL_SETUP_GUIDE = import.meta.env.DEV
   && new URLSearchParams(window.location.search).get('modelSetupGuide') === '1';
-const EXTERNAL_CLI_AGENT_CONFIG_KEYS = new Set([
-  "external_cli_agent_claude_enabled",
-  "external_cli_agent_claude_use_builtin",
-  "external_cli_agent_claude_cli_path",
-  "external_cli_agent_codex_enabled",
-  "external_cli_agent_codex_use_builtin",
-  "external_cli_agent_codex_cli_path",
-]);
 
 function shouldPreviewModelSetupGuide(): boolean {
   return PREVIEW_MODEL_SETUP_GUIDE;
@@ -156,82 +159,6 @@ type LoadedHistoryPage = {
   totalPages: number;
   result: FetchHistoryPageResult | null;
 };
-
-type AgentsTeamsSavePayload = {
-  agents: Record<string, {
-    model: { provider: string; api_base: string; api_key: string; model: string };
-    skills: string[];
-  }>;
-  team: Array<{
-    team_name: string;
-    lifecycle: string;
-    teammate_mode: string;
-    spawn_mode: string;
-    enable_permissions: boolean;
-    external_cli_agents?: Array<{ cli_agent: "claude" | "codex"; cli_path?: string }>;
-    external_cli_publish_url?: string;
-    leader: { member_name: string; display_name: string; persona: string; agent_key: string };
-    teammate: { agent_key: string };
-    predefined_members: Array<{ member_name: string; display_name: string; persona: string; prompt_hint: string; agent_key: string }>;
-  }>;
-};
-
-type ConfigSaveAllPayload = {
-  config?: Record<string, string>;
-  models?: ModelEntry[];
-  agents?: AgentsTeamsSavePayload["agents"];
-  team?: AgentsTeamsSavePayload["team"];
-};
-
-type ConfigSaveResult = {
-  updated?: string[];
-  applied_without_restart?: boolean;
-  models_count?: number | null;
-  external_cli_dependency_installs?: Partial<Record<ExternalCliAgentKind, ExternalCliDependencyInstallStatus>>;
-};
-
-type ExternalCliAgentKind = "claude" | "codex";
-
-type ExternalCliDependencyInstallStatus = {
-  cli_agent?: ExternalCliAgentKind;
-  status?: string;
-  phase?: string;
-  error?: string;
-  last_log?: string;
-  log_tail?: string[];
-  started_at?: number;
-  finished_at?: number;
-  updated_at?: number;
-};
-
-function externalCliDependencyInstallAgents(result: ConfigSaveResult | void): Set<ExternalCliAgentKind> {
-  const installs = result?.external_cli_dependency_installs ?? {};
-  return new Set(
-    Object.entries(installs)
-      .filter((entry): entry is [ExternalCliAgentKind, ExternalCliDependencyInstallStatus] => {
-        const [cliAgent, status] = entry;
-        return (cliAgent === "claude" || cliAgent === "codex") && !!status?.status;
-      })
-      .map(([cliAgent]) => cliAgent),
-  );
-}
-
-function hasExternalCliDependencyInstallResult(result: ConfigSaveResult | void): boolean {
-  return externalCliDependencyInstallAgents(result).size > 0;
-}
-
-function removeExternalCliAgentsFromTeamPayload(
-  team: AgentsTeamsSavePayload["team"],
-  cliAgents: Set<ExternalCliAgentKind>,
-): AgentsTeamsSavePayload["team"] {
-  if (cliAgents.size === 0) {
-    return team;
-  }
-  return team.map((item) => ({
-    ...item,
-    external_cli_agents: item.external_cli_agents?.filter((agent) => !cliAgents.has(agent.cli_agent)),
-  }));
-}
 
 function getWorkContextForSession(sessionId: string): {
   project_id?: string;
@@ -333,7 +260,13 @@ async function saveShareImage(blob: Blob, filename: string): Promise<boolean> {
   return outcome === 'saved';
 }
 
-function AppContent() {
+function AppContent({
+  settingsPageDefinition,
+  resolveSettingsRequest,
+}: {
+  settingsPageDefinition: SettingsPageDefinition;
+  resolveSettingsRequest: (openSourceRequest: SettingsRequest) => SettingsRequest;
+}) {
   const { t, i18n } = useTranslation();
   const { route, navigate } = useChatRoute();
   const tRef = useRef(t);
@@ -356,24 +289,21 @@ function AppContent() {
   const [shareExportSnapshot, setShareExportSnapshot] = useState<ShareImageSnapshot | null>(null);
   const [restartSeenDisconnect, setRestartSeenDisconnect] = useState(false);
   const [appliedWithoutRestart, setAppliedWithoutRestart] = useState(false);
-  const [a2uiRefreshPending, setA2uiRefreshPending] = useState(false);
   const [saveToastVisible, setSaveToastVisible] = useState(false);
-  const [configChangedConfirmOpen, setConfigChangedConfirmOpen] = useState(false);
   const [proactiveToastVisible, setProactiveToastVisible] = useState(false);
   const [proactiveToastMessage, setProactiveToastMessage] = useState('');
   const [securityAlertVisible, setSecurityAlertVisible] = useState(false);
   const [securityAlertContent, setSecurityAlertContent] = useState('');
   const [hasVisitedSkills, setHasVisitedSkills] = useState(false);
-  const [hasVisitedChannels, setHasVisitedChannels] = useState(false);
-  const [sidebarMorePanelOpen, setSidebarMorePanelOpen] = useState(false);
+  const [requestedSettingsModuleId, setRequestedSettingsModuleId] =
+    useState<SettingsModuleTarget | null>(null);
   const {
+    isMobile,
     conversationSidebarCollapsed,
     setConversationSidebarCollapsed,
     conversationSidebarFloating,
     toolPanelHidden,
     setToolPanelHidden,
-    toolPanelMaximized,
-    setToolPanelMaximized,
   } = useResponsiveLayout();
 
   const [modelSetupGuideStep, setModelSetupGuideStep] = useState<ModelSetupGuideStep | null>(null);
@@ -385,8 +315,8 @@ function AppContent() {
   const [missingSessionId, setMissingSessionId] = useState<string | null>(null);
   const startupUpdateCheckRef = useRef(false);
   const modelSetupGuideEvaluatedRef = useRef(false);
-  /** 从 SkillNet 等入口跳转配置页时，首次展开对应配置分组（如第三方服务） */
-  const [configInitialExpandGroup, setConfigInitialExpandGroup] = useState<string | null>(null);
+  /** OAuth 回调恢复导航后标记，防止 fetchConfig 等后续逻辑覆盖 activeNav */
+  const oauthNavRestoredRef = useRef(false);
 
   useEffect(() => {
     tRef.current = t;
@@ -396,15 +326,20 @@ function AppContent() {
   useEffect(() => {
     processOAuthCallback()
       .finally(() => {
+        // 备份：OAuth 回调完成后再次确认导航（通常路由 effect 已设置）
+        const nav = sessionStorage.getItem('oauth_redirect_nav');
+        if (nav) {
+          sessionStorage.removeItem('oauth_redirect_nav');
+          oauthNavRestoredRef.current = true;
+          setActiveNav(nav as MainNavKey);
+          if (nav === 'skills') setHasVisitedSkills(true);
+        }
         // 无论成功或失败都派发事件，SkillPanel 根据有无 oauth_error 决定显示错误或开抽屉
         window.dispatchEvent(new CustomEvent('oauth-callback-complete'));
       });
   }, []);
 
   useEffect(() => {
-    if (activeNav !== 'configpanel') {
-      setConfigInitialExpandGroup(null);
-    }
     if (activeNav === 'chat') {
       const { defaultModelName, setSelectedModelName } = useSessionStore.getState();
       const runtime = useSessionStore.getState().getRuntime(sessionId);
@@ -430,10 +365,20 @@ function AppContent() {
     return () => window.removeEventListener('jiuwen:nav', handler);
   }, []);
 
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const moduleId = (event as CustomEvent<SettingsModuleTarget>).detail;
+      setRequestedSettingsModuleId(moduleId);
+      setActiveNav('settings');
+    };
+    window.addEventListener(SETTINGS_MODULE_NAVIGATION_EVENT, handler);
+    return () => window.removeEventListener(SETTINGS_MODULE_NAVIGATION_EVENT, handler);
+  }, []);
+
   const restartAutoCloseTimerRef = useRef<number | null>(null);
   const saveToastTimerRef = useRef<number | null>(null);
   const proactiveToastTimerRef = useRef<number | null>(null);
-  const hasChangesRef = useRef(false);
+  const settingsHasChangesRef = useRef(false);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [historyPrepending, setHistoryPrepending] = useState(false);
   const [historyRetrySessions, setHistoryRetrySessions] = useState<ReadonlySet<string>>(
@@ -538,12 +483,22 @@ function AppContent() {
   } = useSingleAgentPanelState();
 
   useEffect(() => {
+    const oauthNav = sessionStorage.getItem('oauth_redirect_nav');
+    const targetNav = (oauthNav || 'chat') as MainNavKey;
+    if (oauthNav === 'skills') setHasVisitedSkills(true);
     if (route.kind === 'chat-session') {
       sessionIdRef.current = route.sessionId;
       setSessionId(route.sessionId);
-      setActiveNav('chat');
+      setActiveNav(targetNav);
     } else if (route.kind === 'chat-new') {
-      if (window.location.pathname !== '/chat/new') navigate({ kind: 'chat-new' }, { replace: true });
+      if (window.location.pathname !== '/chat/new') {
+        if (oauthNav) {
+          // OAuth 重定向：用 replaceState 改 URL 但不触发 route 变化，避免 effect 重跑覆盖 activeNav
+          window.history.replaceState(null, '', '/chat/new');
+        } else {
+          navigate({ kind: 'chat-new' }, { replace: true });
+        }
+      }
       pendingNewConversationRef.current = true;
       if (preserveSelectedProjectOnChatNewRef.current) {
         preserveSelectedProjectOnChatNewRef.current = false;
@@ -552,17 +507,13 @@ function AppContent() {
       }
       sessionIdRef.current = 'new';
       setSessionId('new');
-      setActiveNav('chat');
-      setTeamAreaExpanded(false);
-      setSingleAgentPanelExpanded(false);
+      setActiveNav(targetNav);
+      if (!oauthNav) {
+        setTeamAreaExpanded(false);
+        setSingleAgentPanelExpanded(false);
+      }
     }
-  }, [navigate, route, setSingleAgentPanelExpanded, setTeamAreaExpanded]);
-
-  useEffect(() => {
-    if (!teamAreaExpanded || toolPanelHidden) {
-      setToolPanelMaximized(false);
-    }
-  }, [teamAreaExpanded, toolPanelHidden]);
+  }, [navigate, route, setSingleAgentPanelExpanded, setTeamAreaExpanded, setHasVisitedSkills]);
 
   useEffect(() => {
     ensureSessionRuntimes(sessionId);
@@ -577,7 +528,12 @@ function AppContent() {
     void loadProjects();
   }, [initialDataLoaded, loadProjects]);
 
-  const { setCurrentSession, setAvailableModels, setMode, setTeamLeaderMemberIds } = useSessionStore();
+  const {
+    setCurrentSession,
+    setAvailableModels,
+    setMode,
+    setTeamLeaderMemberIds,
+  } = useSessionStore.getState();
   const sessions = useSessionStore((s) => s.sessions);
   const currentSession = useSessionStore((s) => s.currentSession);
   const routeSessionId = route.kind === 'chat-session' ? route.sessionId : null;
@@ -614,22 +570,38 @@ function AppContent() {
   const [chatPanelWidthPct, setChatPanelWidthPct] = useState(CHAT_PANEL_DEFAULT_WIDTH_PCT);
   const chatPanelResizeDragRef = useRef<ChatPanelResizeDrag | null>(null);
   const [codeReviewTarget, setCodeReviewTarget] = useState<CodeReviewTarget | null>(null);
+  const [heartbeatPanelOpen, setHeartbeatPanelOpen] = useState(false);
 
   useEffect(() => {
     setCodeReviewTarget(null);
   }, [sessionId]);
 
+  // 心跳面板是会话级功能，切换会话时收起，避免带着上一个会话的任务列表进入新会话
+  useEffect(() => {
+    setHeartbeatPanelOpen(false);
+  }, [sessionId]);
+
+  const handleToggleHeartbeatPanel = useCallback(() => {
+    setHeartbeatPanelOpen((v) => !v);
+  }, []);
+
   const handleToggleDetailPanel = useCallback((expanded: boolean | null) => {
+    // 团队/代码审核面板和心跳面板互斥，共用右侧工作区同一栏
+    setHeartbeatPanelOpen(false);
     if (expanded === null) {
       setToolPanelHidden(true);
       setTeamAreaExpanded(false);
       setSingleAgentPanelExpanded(false);
-      setToolPanelMaximized(false);
       return;
     }
     setToolPanelHidden(false);
-    setToolPanelMaximized(false);
     if (mode === 'team') {
+      // 真正处于 Team 模式时不动 teamAreaActiveTab：下面这段"陈旧 team tab 切回
+      // planning"的兜底只是给单 Agent 面板用的。曾经按某版交接文档建议去掉这层
+      // mode 隔离，复核后确认那条建议的前提不成立（mode 是 zustand selector，
+      // 渲染时始终最新，不存在"滞后短路"的竞态窗口），且会导致真正在 Team 模式、
+      // 停留在 team tab 的用户每次收起/展开面板都被强制踢回 planning——teamArea
+      // 组件把 'team' 当合法 tab，没有兜底。这个 early return 就是隔离本身。
       setTeamAreaExpanded(expanded);
       return;
     }
@@ -640,6 +612,7 @@ function AppContent() {
   }, [mode, setSingleAgentPanelExpanded, setTeamAreaActiveTab, setTeamAreaExpanded, teamAreaActiveTab]);
 
   const handleOpenCodeReview = useCallback((target: CodeReviewTarget) => {
+    setHeartbeatPanelOpen(false);
     setCodeReviewTarget(target);
     setToolPanelHidden(false);
     if (mode === 'team') {
@@ -818,11 +791,22 @@ function AppContent() {
   // 单 agent 模式同样复用集群模式的展开布局（百分比宽度 + 可拖拽分割线），
   // 避免右侧面板与聊天面板平分空间导致宽度与集群模式不一致；auto_harness 走收起态分支。
   const panelExpanded = mode === 'team' ? teamAreaExpanded : singleAgentPanelExpanded;
-  const isTeamAreaExpanded = mode !== 'auto_harness' && panelExpanded && toolPanelHasContent;
+  // 心跳面板打开时，团队/代码审核面板让出右侧工作区（两者互斥，不共同占用宽度）。
+  const isTeamAreaExpanded = mode !== 'auto_harness' && panelExpanded && toolPanelHasContent && !heartbeatPanelOpen;
+
+  const { shouldFullscreen } = useResponsivePanelResize({
+    isTeamAreaExpanded,
+    conversationSidebarCollapsed,
+    setConversationSidebarCollapsed,
+    setSingleAgentPanelExpanded,
+    setTeamAreaExpanded,
+    mode,
+  });
 
   // WebSocket 连接 - provider 由后端配置决定 - provider 由后端配置决定，前端默认不在 URL query 传递
   const {
     isConnected,
+    connectionState,
     request,
     persistMedia,
     persistDocuments,
@@ -868,6 +852,7 @@ function AppContent() {
       }
     },
   });
+  const settingsRequest = useMemo(() => resolveSettingsRequest(request), [request, resolveSettingsRequest]);
 
   const applySubagentHistoryReplay = useCallback((sid: string, items: HistorySubagentReplayItem[]) => {
     const subagentStore = useSubagentStore.getState();
@@ -1386,9 +1371,9 @@ function AppContent() {
       setConfigError(null);
       if (!modelSetupGuideEvaluatedRef.current) {
         modelSetupGuideEvaluatedRef.current = true;
-        if (shouldPreviewModelSetupGuide() || isSetupGuideEnabled(config.setup_guide_enabled)) {
-        setActiveNav('chat');
-        setModelSetupGuideManual(false);
+        if (!oauthNavRestoredRef.current && (shouldPreviewModelSetupGuide() || isSetupGuideEnabled(config.setup_guide_enabled))) {
+          setActiveNav('chat');
+          setModelSetupGuideManual(false);
           setModelSetupGuideStep(0);
         }
       }
@@ -1440,7 +1425,6 @@ function AppContent() {
     setRestartSuccess(false);
     setRestartSeenDisconnect(false);
     setAppliedWithoutRestart(false);
-    setA2uiRefreshPending(false);
   }, [clearRestartAutoCloseTimer]);
 
   const clearSaveToastTimer = useCallback(() => {
@@ -1487,33 +1471,12 @@ function AppContent() {
     };
   }, []);
 
-  const validateModelConfig = useCallback(
-    async (fields: {
-      api_base: string;
-      api_key: string;
-      model: string;
-      model_provider: string;
-      reasoning_level?: string;
-    }) => {
-      await request('config.validate_model', fields, { timeoutMs: 60000 });
-    },
-    [request],
-  );
-
-  const handleModelsReplaceAll = useCallback(async (models: ModelEntry[]) => {
-    await request('models.replace_all', { models });
-  }, [request]);
-
   const handleConfigChanged = useCallback(() => {
-    if (hasChangesRef.current) {
-      setConfigChangedConfirmOpen(true);
-      return;
-    }
     void fetchConfig();
   }, [fetchConfig]);
 
-  const handleHasChangesChange = useCallback((hasChanges: boolean) => {
-    hasChangesRef.current = hasChanges;
+  const handleSettingsHasChangesChange = useCallback((hasChanges: boolean) => {
+    settingsHasChangesRef.current = hasChanges;
   }, []);
 
   const handleModelsRefresh = useCallback(async () => {
@@ -1564,8 +1527,8 @@ function AppContent() {
   }, [request, t]);
 
   const getExternalCliDependencyInstallStatus = useCallback(
-    async (cliAgent: ExternalCliAgentKind): Promise<ExternalCliDependencyInstallStatus> => {
-      return request<ExternalCliDependencyInstallStatus>(
+    async (cliAgent: ExternalCliAgentKind): Promise<CodexDependencyInstallStatus> => {
+      return request<CodexDependencyInstallStatus>(
         "external_cli.install_status",
         { cli_agent: cliAgent },
         { timeoutMs: 10 * 1000 },
@@ -1574,57 +1537,10 @@ function AppContent() {
     [request],
   );
 
-  const saveConfigAndRestart = useCallback(async (updates: Record<string, string>): Promise<ConfigSaveResult> => {
-    const payload = await request<ConfigSaveResult>(
-      'config.set',
-      updates
-    );
-    const hasExternalCliDependencyInstall = hasExternalCliDependencyInstallResult(payload);
-    const effectiveUpdates = hasExternalCliDependencyInstall
-      ? Object.fromEntries(
-          Object.entries(updates).filter(([key]) => !EXTERNAL_CLI_AGENT_CONFIG_KEYS.has(key)),
-        )
-      : updates;
-    setServerConfig((prev) => {
-      if (!prev) return effectiveUpdates;
-      const next: Record<string, unknown> = { ...prev, ...effectiveUpdates };
-      // Keep the bilingual memory_forbidden_description dictionary structure.
-      if (typeof prev?.memory_forbidden_description === 'object' && prev.memory_forbidden_description !== null
-          && !Array.isArray(prev.memory_forbidden_description) && effectiveUpdates.memory_forbidden_description !== undefined) {
-        const prevDict = prev.memory_forbidden_description as Record<string, string>;
-        const lang = i18n.language || 'zh';
-        next.memory_forbidden_description = { ...prevDict, [lang]: effectiveUpdates.memory_forbidden_description };
-      }
-      return next;
-    });
-    if (hasExternalCliDependencyInstall) {
-      return payload;
-    }
-    setConfigError(null);
-    setRestartModalOpen(true);
-    setRestartSuccess(false);
-    setRestartSeenDisconnect(false);
-    if ('a2ui_enabled' in updates) {
-      setAppliedWithoutRestart(false);
-      setA2uiRefreshPending(true);
-      setRestartSuccess(true);
-      clearRestartAutoCloseTimer();
-      restartAutoCloseTimerRef.current = window.setTimeout(() => {
-        closeRestartModal();
-        window.location.reload();
-      }, 5000);
-    } else {
-      setAppliedWithoutRestart(payload?.applied_without_restart === true);
-      clearRestartAutoCloseTimer();
-      if (payload?.applied_without_restart === true) {
-        setRestartSuccess(true);
-        restartAutoCloseTimerRef.current = window.setTimeout(() => {
-          closeRestartModal();
-        }, 5000);
-      }
-    }
-    return payload;
-  }, [clearRestartAutoCloseTimer, closeRestartModal, request]);
+  const getCodexDependencyInstallStatus = useCallback(
+    () => getExternalCliDependencyInstallStatus('codex'),
+    [getExternalCliDependencyInstallStatus],
+  );
 
   const savePermissionSilent = useCallback(async (updates: Record<string, string>) => {
     try {
@@ -1671,127 +1587,6 @@ function AppContent() {
     }
     return appliedWithoutRestart;
   }, [applyConfigSaveUiState, request]);
-
-  const buildAgentsTeamsFlatConfig = useCallback((payload: AgentsTeamsSavePayload) => {
-    const updates: Record<string, string> = {};
-    const agentCount = Object.keys(payload.agents).length;
-    Object.entries(payload.agents).forEach(([name, agent], idx) => {
-      updates[`agent_name_${idx}`] = name;
-      updates[`agent_model_${idx}`] = agent.model.model;
-      updates[`agent_skills_${idx}`] = agent.skills.join(',');
-    });
-    for (let i = agentCount; i < 10; i++) {
-      updates[`agent_name_${i}`] = "";
-      updates[`agent_model_${i}`] = "";
-      updates[`agent_skills_${i}`] = "";
-    }
-    payload.team.forEach((team, idx) => {
-      // 使用与后端一致的键名格式：team_${idx}_name
-      updates[`team_${idx}_name`] = team.team_name;
-      updates[`team_${idx}_lifecycle`] = team.lifecycle;
-      updates[`team_${idx}_teammate_mode`] = team.teammate_mode;
-      updates[`team_${idx}_spawn_mode`] = team.spawn_mode;
-      updates[`team_${idx}_enable_permissions`] = String(team.enable_permissions);
-      updates[`team_${idx}_leader_member_name`] = team.leader.member_name;
-      updates[`team_${idx}_leader_display_name`] = team.leader.display_name;
-      updates[`team_${idx}_leader_persona`] = team.leader.persona;
-      updates[`team_${idx}_leader_agent_key`] = team.leader.agent_key;
-      updates[`team_${idx}_teammate_agent_key`] = team.teammate.agent_key;
-      updates[`team_${idx}_predefined_members`] = team.predefined_members?.length
-        ? JSON.stringify(team.predefined_members)
-        : "";
-      updates[`team_${idx}_external_cli_agents`] = team.external_cli_agents?.length
-        ? JSON.stringify(team.external_cli_agents)
-        : "";
-    });
-    for (let i = payload.team.length; i < 10; i++) {
-      // 使用与后端一致的键名格式：team_${i}_name
-      updates[`team_${i}_name`] = "";
-      updates[`team_${i}_lifecycle`] = "";
-      updates[`team_${i}_teammate_mode`] = "";
-      updates[`team_${i}_spawn_mode`] = "";
-      updates[`team_${i}_enable_permissions`] = "";
-      updates[`team_${i}_leader_member_name`] = "";
-      updates[`team_${i}_leader_display_name`] = "";
-      updates[`team_${i}_leader_persona`] = "";
-      updates[`team_${i}_leader_agent_key`] = "";
-      updates[`team_${i}_teammate_agent_key`] = "";
-      updates[`team_${i}_predefined_members`] = "";
-      updates[`team_${i}_external_cli_agents`] = "";
-    }
-    return updates;
-  }, []);
-
-  const handleAgentsTeamsSave = useCallback(async (payload: AgentsTeamsSavePayload) => {
-    const result = await request<{ updated?: string[]; applied_without_restart?: boolean }>(
-      'config.set',
-      payload as unknown as Record<string, string>
-    );
-    // 更新前端配置缓存
-    const updates = buildAgentsTeamsFlatConfig(payload);
-    setServerConfig((prev: Record<string, unknown> | null) => ({ ...prev, ...updates }));
-    applyConfigSaveUiState(result?.applied_without_restart === true);
-  }, [applyConfigSaveUiState, buildAgentsTeamsFlatConfig, request]);
-
-  const saveAllConfigAndRestart = useCallback(async (payload: ConfigSaveAllPayload): Promise<ConfigSaveResult> => {
-    const isA2UIChange = payload.config && 'a2ui_enabled' in payload.config;
-    const result = await request<ConfigSaveResult>(
-      'config.save_all',
-      payload as unknown as Record<string, unknown>
-    );
-    const pendingExternalCliAgents = externalCliDependencyInstallAgents(result);
-    const hasExternalCliDependencyInstall = pendingExternalCliAgents.size > 0;
-    setServerConfig((prev) => {
-      const next: Record<string, unknown> = { ...(prev ?? {}) };
-      if (payload.config) {
-        const effectiveConfig = hasExternalCliDependencyInstall
-          ? Object.fromEntries(
-              Object.entries(payload.config).filter(([key]) => !EXTERNAL_CLI_AGENT_CONFIG_KEYS.has(key)),
-            )
-          : payload.config;
-        Object.assign(next, effectiveConfig);
-        if (typeof prev?.memory_forbidden_description === 'object' && prev.memory_forbidden_description !== null
-            && !Array.isArray(prev.memory_forbidden_description)
-            && effectiveConfig.memory_forbidden_description !== undefined) {
-          const prevDict = prev.memory_forbidden_description as Record<string, string>;
-          const lang = i18n.language || 'zh';
-          next.memory_forbidden_description = {
-            ...prevDict,
-            [lang]: effectiveConfig.memory_forbidden_description,
-          };
-        }
-      }
-      if (payload.agents !== undefined || payload.team !== undefined) {
-        const agents = payload.agents || {};
-        const team = removeExternalCliAgentsFromTeamPayload(payload.team || [], pendingExternalCliAgents);
-        Object.assign(next, buildAgentsTeamsFlatConfig({
-          agents,
-          team,
-        }));
-      }
-      return next;
-    });
-    if (hasExternalCliDependencyInstall) {
-      return result;
-    }
-    if (isA2UIChange) {
-      // Show modal then refresh page after 5 seconds
-      setConfigError(null);
-      setRestartModalOpen(true);
-      setRestartSuccess(true);
-      setRestartSeenDisconnect(false);
-      setAppliedWithoutRestart(false);
-      setA2uiRefreshPending(true);
-      clearRestartAutoCloseTimer();
-      restartAutoCloseTimerRef.current = window.setTimeout(() => {
-        closeRestartModal();
-        window.location.reload();
-      }, 5000);
-    } else {
-      applyConfigSaveUiState(result?.applied_without_restart === true);
-    }
-    return result;
-  }, [applyConfigSaveUiState, buildAgentsTeamsFlatConfig, i18n.language, request]);
 
   useEffect(() => {
     if (!restartModalOpen || restartSuccess) {
@@ -2413,6 +2208,8 @@ function AppContent() {
             explicitEntry: usePlanStore
               .getState()
               .hasPendingExplicitEntry(NEW_CONVERSATION_ID),
+            entrySource:
+              usePlanStore.getState().getPendingEntrySource(NEW_CONVERSATION_ID) ?? undefined,
           });
         }
         usePlanStore.getState().removeRuntime(NEW_CONVERSATION_ID);
@@ -2737,12 +2534,12 @@ function AppContent() {
 
   const requestSessionNavigation = useCallback((target: Session | 'new', options?: NewConversationOptions) => {
     if (target === 'new') { enterNewConversation(mode, options); return; }
-    if (window.matchMedia('(max-width: 823px)').matches) {
+    if (isMobile) {
       setTeamAreaExpanded(false);
       setToolPanelHidden(true);
     }
     void handleRestoreSession(target.session_id, target.mode, target);
-  }, [enterNewConversation, handleRestoreSession, mode, setTeamAreaExpanded, setToolPanelHidden]);
+  }, [enterNewConversation, handleRestoreSession, isMobile, mode, setTeamAreaExpanded, setToolPanelHidden]);
 
   const handleTeamSessionsDeleted = useCallback(async (sessionIds: string[]) => {
     const deletedSessionIds = new Set(sessionIds);
@@ -2816,22 +2613,33 @@ function AppContent() {
     finally { setDialogBusy(false); }
   }, [deleteTarget, enterNewConversation, mode, request, t]);
 
-  const handleNavigate = useCallback((nav: MainNavKey) => {
-    const isSmallScreen = window.matchMedia('(max-width: 823px)').matches;
-    setActiveNav(nav);
-    if (nav === 'chat') {
-      setConversationSidebarCollapsed(false);
-      if (isSmallScreen) {
-        setTeamAreaExpanded(false);
-        setToolPanelHidden(true);
+  const handleNavigate = useCallback(
+    (nav: MainNavKey) => {
+      if (
+        activeNav === 'settings' &&
+        nav !== 'settings' &&
+        settingsHasChangesRef.current &&
+        !window.confirm(t('settingsPanel.dialog.discardConfirm'))
+      ) {
+        return;
       }
-    }
-    if (modelSetupGuideStep === 1 && nav === 'configpanel') {
-      setModelSetupGuideStep(2);
-    }
-    if (nav === 'skills') setHasVisitedSkills(true);
-    if (nav === 'channels') setHasVisitedChannels(true);
-  }, [modelSetupGuideStep, setTeamAreaExpanded, setToolPanelHidden]);
+      if (nav !== 'settings') setRequestedSettingsModuleId(null);
+      setActiveNav(nav);
+      if (nav === 'chat') {
+        setConversationSidebarCollapsed(false);
+        if (isMobile) {
+          setTeamAreaExpanded(false);
+          setToolPanelHidden(true);
+        }
+      }
+      if (modelSetupGuideStep === 1 && nav === 'settings') {
+        setRequestedSettingsModuleId('models');
+        setModelSetupGuideStep(2);
+      }
+      if (nav === 'skills') setHasVisitedSkills(true);
+    },
+    [activeNav, isMobile, modelSetupGuideStep, setTeamAreaExpanded, setToolPanelHidden, t],
+  );
 
   const skipModelSetupGuide = useCallback(() => {
     setModelSetupGuideStep(null);
@@ -2961,7 +2769,7 @@ function AppContent() {
     && missingSessionId === routeSessionId
     && isConversationMissing(routeSessionId, true, sessions);
   const showConversationNotFound = route.kind === 'not-found' || routeSessionMissing;
-  const showWorkspaceDivider = isTeamAreaExpanded && !showConversationNotFound && !toolPanelMaximized;
+  const showWorkspaceDivider = isTeamAreaExpanded && !showConversationNotFound && !shouldFullscreen;
   const isNewSessionPromotion = Boolean(sessionId && sessionIdsCreatedInThisPageRef.current.has(sessionId));
   const composerFocusKey = showConversationNotFound ? null : `${sessionId}:${composerFocusNonce}`;
 
@@ -2973,21 +2781,14 @@ function AppContent() {
   }, [clearChatPanelResize, showWorkspaceDivider]);
 
   return (
-    <div
-      className={`shell shell--icon-rail ${sidebarMorePanelOpen ? 'shell--more-panel-open' : ''}`}
-      data-testid="app-shell"
-      data-session-id={sessionId}
-    >
+    <div className="shell shell--icon-rail" data-testid="app-shell" data-session-id={sessionId}>
       {/* Navigation Sidebar */}
       <SessionSidebar
         activeNav={activeNav}
         onNavigate={handleNavigate}
-        appVersion={typeof serverConfig?.app_version === 'string' ? serverConfig.app_version : ''}
-        isConnected={isConnected}
         onNewSession={handleNewSession}
         showNewSession={false}
         hiddenNavItems={hiddenNavItems}
-        onMorePanelOpenChange={setSidebarMorePanelOpen}
       />
 
       {modelSetupGuideStep !== null ? (
@@ -3042,7 +2843,7 @@ function AppContent() {
                 )}
                 {/* Chat Panel - 在展开时可拖拽调整宽度 */}
                 <div
-                  className={`${showConversationNotFound || toolPanelMaximized ? 'hidden' : 'flex'} chat-layout__surface  pt-0 flex-col ${isTeamAreaExpanded ? '' : 'min-w-0'} min-h-0 ${isTeamAreaExpanded ? '' : 'flex-1'}`}
+                  className={`${showConversationNotFound || shouldFullscreen ? 'hidden' : 'flex'} chat-layout__surface  pt-0 flex-col ${isTeamAreaExpanded ? '' : 'min-w-0'} min-h-0 ${isTeamAreaExpanded ? '' : 'flex-1'}`}
                   style={isTeamAreaExpanded ? { width: `${chatPanelWidthPct}%` } : undefined}
                   data-testid="app-chat-surface"
                 >
@@ -3069,6 +2870,8 @@ function AppContent() {
                       onToggleTeamArea={handleToggleDetailPanel}
                       onOpenCodeReview={handleOpenCodeReview}
                       permissionsEnabled={serverConfig?.permissions_enabled !== 'false'}
+                      heartbeatPanelOpen={heartbeatPanelOpen}
+                      onToggleHeartbeatPanel={handleToggleHeartbeatPanel}
                       onSavePermission={savePermissionSilent}
                       historyPager={chatHistoryPager}
                       isHistoryRestoring={isRestoringHistorySession}
@@ -3099,7 +2902,7 @@ function AppContent() {
                 )}
 
                 {/* Tool Panel / Expanded Team Panel */}
-                {(!toolPanelHidden && (toolPanelHasContent || isRestoringTeamHistory)) && !showConversationNotFound && (
+                {!toolPanelHidden && (toolPanelHasContent || isRestoringTeamHistory) && !showConversationNotFound && !heartbeatPanelOpen && (
                   <ToolPanel
                     sessionId={sessionId}
                     project={sessionProject}
@@ -3122,10 +2925,13 @@ function AppContent() {
                     setSingleAgentPanelExpanded={setSingleAgentPanelExpanded}
                     setSingleAgentPanelActiveTab={setSingleAgentPanelActiveTab}
                     setSingleAgentPanelSelectedArtifactId={setSingleAgentPanelSelectedArtifactId}
-                    onMaximize={() => setToolPanelMaximized(true)}
-                    onRestore={() => setToolPanelMaximized(false)}
-                    maximized={toolPanelMaximized}
+                    shouldFullscreen={shouldFullscreen}
                   />
+                )}
+
+                {/* 心跳面板：跟 ToolPanel 一样占用右侧工作区一栏，而不是浮在页面上方的浮层 */}
+                {heartbeatPanelOpen && sessionId && sessionId !== NEW_CONVERSATION_ID && !showConversationNotFound && (
+                  <HeartbeatPanel sessionId={sessionId} onClose={() => setHeartbeatPanelOpen(false)} />
                 )}
               </div>
             </div>
@@ -3197,30 +3003,19 @@ function AppContent() {
             </div>
           </div>
         )}
-        {activeNav === 'configpanel' && (
+        {activeNav === 'settings' && (
           <div className="app-section">
-            <ConfigPanel
-              config={serverConfig}
+            <SettingsPage
+              definition={settingsPageDefinition}
               isConnected={isConnected}
-              sessionId={sessionId}
-              onSaveConfig={saveConfigAndRestart}
-              onSaveAllConfig={saveAllConfigAndRestart}
-              onValidateModel={validateModelConfig}
-              initialExpandGroupTag={configInitialExpandGroup}
-              onModelsReplaceAll={handleModelsReplaceAll}
-              onModelValidate={validateModelConfig}
-              onModelsRefresh={handleModelsRefresh}
-              onAgentsTeamsSave={handleAgentsTeamsSave}
-              onHasChangesChange={handleHasChangesChange}
+              connectionState={connectionState}
+              request={settingsRequest}
+              onHasChangesChange={handleSettingsHasChangesChange}
               onDetectExternalCli={detectExternalCli}
               onSelectExternalCliPath={selectExternalCliPath}
-              onGetExternalCliDependencyInstallStatus={getExternalCliDependencyInstallStatus}
+              onGetCodexDependencyInstallStatus={getCodexDependencyInstallStatus}
+              initialModuleId={requestedSettingsModuleId ?? undefined}
             />
-          </div>
-        )}
-        {activeNav === 'browserpanel' && (
-          <div className="app-section">
-            <BrowserPanel isConnected={isConnected} request={request} />
           </div>
         )}
         {FEATURE_APP_UPDATER_UI && activeNav === 'updatepanel' && (
@@ -3237,27 +3032,20 @@ function AppContent() {
               isActive={activeNav === 'skills'}
               symphonyEnabled={normalizeConfigBoolean(serverConfig?.symphony_enabled)}
               onSymphonyEnabledChange={saveSymphonyEnabled}
-              onNavigateToConfig={() => {
-                setConfigInitialExpandGroup('third_party_api');
-                setActiveNav('configpanel');
-              }}
+              onNavigateToSettings={() => requestSettingsModule('agent')}
             />
-          </div>
-        )}
-        {hasVisitedChannels && (
-          <div className={`app-section ${activeNav === 'channels' ? '' : 'is-hidden'}`}>
-            <ChannelsPanel isConnected={isConnected} />
-          </div>
-        )}
-        {activeNav === 'extensions' && (
-          <div className="app-section">
-            <ExtensionsHubPanel sessionId={sessionId} isConnected={isConnected} />
           </div>
         )}
         {activeNav === 'connectorMarket' && (
           <div className="app-section">
             <ConnectorMarketPanel
-              onCreateViaChat={() => requestSessionNavigation('new')}
+              onCreateViaChat={() => window.dispatchEvent(new CustomEvent('jiuwen:new-conversation', {
+                detail: {
+                  skillName: 'plugin-creator',
+                  suffixText: t('connectorMarket.chatPrompts.createPlugin'),
+                  metadata: { scene: 'create_plugin' },
+                },
+              }))}
               onUseExample={(initialInputValue, mcpName) =>
                 requestSessionNavigation('new', { initialInputValue, initialEnabledMcps: [mcpName] })
               }
@@ -3361,62 +3149,27 @@ function AppContent() {
               <h3 className="text-base font-semibold text-text mb-1" data-testid="app-restart-modal-title">
                 {!restartSuccess
                   ? t('app.restarting')
-                  : a2uiRefreshPending
-                    ? t('app.a2uiRefresh')
-                    : appliedWithoutRestart
-                      ? t('app.configApplied')
-                      : t('app.restartSuccess')}
+                  : appliedWithoutRestart
+                    ? t('app.configApplied')
+                    : t('app.restartSuccess')}
               </h3>
               <p className="text-sm text-text-muted mb-5" data-testid="app-restart-modal-description">
                 {!restartSuccess
                   ? t('app.restartWaiting')
-                  : a2uiRefreshPending
-                    ? t('app.a2uiRefreshDesc')
-                    : appliedWithoutRestart
-                      ? t('app.configAppliedDesc')
-                      : t('app.restartSuccessDesc')}
+                  : appliedWithoutRestart
+                    ? t('app.configAppliedDesc')
+                    : t('app.restartSuccessDesc')}
               </p>
               {restartSuccess && (
                 <button
                   type="button"
-                  onClick={() => {
-                    if (a2uiRefreshPending) {
-                      window.location.reload();
-                    } else {
-                      closeRestartModal();
-                    }
-                  }}
+                  onClick={closeRestartModal}
                   className="btn primary !px-4 !py-2"
                   data-testid="app-restart-modal-ok"
                 >
                   {t('common.ok')}
                 </button>
               )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {configChangedConfirmOpen && (
-        <div className="app-restart-modal" data-testid="app-config-changed-modal">
-          <div className="app-restart-modal__backdrop" data-testid="app-config-changed-modal-backdrop" />
-          <div className="app-restart-modal__panel" data-testid="app-config-changed-modal-panel">
-            <div className="flex flex-col items-center text-center" data-testid="app-config-changed-modal-body">
-              <div className="w-12 h-12 rounded-full bg-warn-subtle text-warn flex items-center justify-center mb-4" data-testid="app-config-changed-modal-icon">
-                <svg className="w-7 h-7" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
-                </svg>
-              </div>
-              <h3 className="text-base font-semibold text-text mb-1" data-testid="app-config-changed-modal-title">{t('config.errors.configChangedTitle')}</h3>
-              <p className="text-sm text-text-muted mb-5" data-testid="app-config-changed-modal-description">{t('config.errors.configChangedDesc')}</p>
-              <div className="flex gap-3" data-testid="app-config-changed-modal-actions">
-                <button type="button" onClick={() => { setConfigChangedConfirmOpen(false); void fetchConfig(); }} className="btn primary !px-4 !py-2" data-testid="app-config-changed-modal-confirm">
-                  {t('config.errors.configChangedConfirm')}
-                </button>
-                <button type="button" onClick={() => setConfigChangedConfirmOpen(false)} className="btn !px-4 !py-2" data-testid="app-config-changed-modal-cancel">
-                  {t('config.errors.configChangedCancel')}
-                </button>
-              </div>
             </div>
           </div>
         </div>
@@ -3429,12 +3182,106 @@ function AppContent() {
   );
 }
 
-function App() {
+function App({
+  settingsPageDefinition,
+  resolveSettingsRequest,
+}: {
+  settingsPageDefinition: SettingsPageDefinition;
+  resolveSettingsRequest: (openSourceRequest: SettingsRequest) => SettingsRequest;
+}) {
   return (
     <ErrorBoundary>
-      <AppContent />
+      <AppContent
+        settingsPageDefinition={settingsPageDefinition}
+        resolveSettingsRequest={resolveSettingsRequest}
+      />
     </ErrorBoundary>
   );
 }
 
-export default App;
+/**
+ * 鉴权外壳: 进入前探测 cookie 是否携带有效 access_token + 是否一体机模式。
+ * - GET /api/web-config: 本地端点, 拿 {remote: bool, iam_enabled: bool}
+ *   - iam_enabled=false: 未配置 IAM, 无鉴权, 直接渲染主 App
+ *   - iam_enabled=true: 配置了 IAM, 继续探测登录态
+ * - GET /auth-api/v1/auth/permissions (同源, 浏览器自动带 HttpOnly cookie)
+ *   - 200 -> 已登录, 渲染主 App (+ 一体机模式时浮 LogoutButton)
+ *   - 401/其他 -> 未登录, 渲染 LoginPage
+ * control-panel 只认 Authorization: Bearer, app_web.py 的 _proxy_auth_http
+ * 会从 jw_token cookie 取 token 注入头, 故前端只需同源请求。
+ */
+function AppWithAuth({
+  settingsPageDefinition,
+  resolveSettingsRequest,
+}: {
+  settingsPageDefinition: SettingsPageDefinition;
+  resolveSettingsRequest: (openSourceRequest: SettingsRequest) => SettingsRequest;
+}) {
+  const [authStatus, setAuthStatus] = useState<'checking' | 'loggedOut' | 'loggedIn' | 'noIam'>('checking');
+  const [remote, setRemote] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    // 先拿 web-config: 如果 iam_enabled=false, 直接跳过鉴权探测
+    fetch('/api/web-config', { credentials: 'same-origin' })
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (cancelled) return;
+        if (cfg && typeof cfg.remote === 'boolean') setRemote(cfg.remote);
+        if (cfg && cfg.iam_enabled === false) {
+          setAuthStatus('noIam');
+          return;
+        }
+        // IAM 已配置, 探测登录态
+        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
+          .then((resp) => {
+            if (cancelled) return;
+            if (resp.ok) {
+              setAuthStatus('loggedIn');
+            } else {
+              setAuthStatus('loggedOut');
+            }
+          })
+          .catch(() => {
+            if (!cancelled) setAuthStatus('loggedOut');
+          });
+      })
+      .catch(() => {
+        // web-config 获取失败, 回退到探测登录态
+        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
+          .then((resp) => {
+            if (cancelled) return;
+            if (resp.ok) {
+              setAuthStatus('loggedIn');
+            } else {
+              setAuthStatus('loggedOut');
+            }
+          })
+          .catch(() => {
+            if (!cancelled) setAuthStatus('loggedOut');
+          });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (authStatus === 'checking') {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-900">
+        <div className="text-slate-400 text-sm">Loading…</div>
+      </div>
+    );
+  }
+  if (authStatus === 'loggedOut') {
+    return <LoginPage />;
+  }
+  return (
+    <>
+      {remote && <LogoutButton />}
+      <App settingsPageDefinition={settingsPageDefinition} resolveSettingsRequest={resolveSettingsRequest} />
+    </>
+  );
+}
+
+export default AppWithAuth;

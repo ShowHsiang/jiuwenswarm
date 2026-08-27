@@ -96,10 +96,6 @@ class WebClient {
     return this.state;
   }
 
-  getInflightCount(): number {
-    return this.pending.size;
-  }
-
   onStateChange(handler: StateHandler): () => void {
     this.stateHandlers.add(handler);
     return () => {
@@ -204,6 +200,15 @@ class WebClient {
         );
         if (this.manualClose || closeEvent.code === 1000) {
           this.updateState('closed');
+          return;
+        }
+        // 1008 Policy Violation: gateway 鉴权失败 (token 失效/缺失)。
+        // 重载页面, AppWithAuth 会探测 cookie 失效 -> 回到登录页。
+        if (closeEvent.code === 1008) {
+          this.updateState('closed');
+          if (typeof window !== 'undefined') {
+            window.location.reload();
+          }
           return;
         }
         this.scheduleReconnect();

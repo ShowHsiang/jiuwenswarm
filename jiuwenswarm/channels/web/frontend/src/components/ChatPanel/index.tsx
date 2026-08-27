@@ -6,7 +6,7 @@
 
 import React, { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowRight, CheckCircle2, ClipboardList, Copy, Info, LoaderCircle, Share2, Sparkles, X } from 'lucide-react';
+import { Activity, ArrowRight, CheckCircle2, ClipboardList, Copy, Info, LoaderCircle, Share2, Sparkles, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { useChatStore, useHarnessStore, useSessionStore, useTodoStore } from '../../stores';
@@ -15,14 +15,16 @@ import type { HumanShareCommand } from '../../stores/sessionStore';
 import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
 import { InputArea, type InputAreaHandle } from './InputArea';
-import chatIcon from '../../assets/chat.svg';
-import expandIcon from '../../assets/expand.svg';
+import ChatOverviewIcon from '../../assets/chat-overview.svg?react';
+import PanelCollapseIcon from '../../assets/panel-collapse.svg?react';
 import lineUpIcon from '../../assets/lineUp.svg';
+import { NEW_CONVERSATION_ID } from '../../multi-session/state/newConversationLifecycle';
 import loadSendIcon from '../../assets/load-send.svg';
 import editIcon from '../../assets/edit.svg';
 import deleteIcon from '../../assets/delete.svg';
 import moveIcon from '../../assets/move.svg';
 import restartIcon from '../../assets/restart.svg';
+import ShareExportIcon from '../../assets/share-export.svg?react';
 import { InlineQuestionCard } from './InlineQuestionCard';
 import { InteractionSlot } from '../InteractionSlot';
 import { GoalBar } from '../GoalBar';
@@ -31,7 +33,7 @@ import { AgentTeamActivityCard } from './TeamEventGroupDisplay';
 import { isTeamActivityMessage, parseTeamEventMessage } from './teamEventUtils';
 import { isTeamLeaderMember, type TeamMemberIdentity } from '../../utils/teamMemberAvatar';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
-import welcomeBanner from '../../assets/home-banner-workswarm.png';
+import welcomeBanner from '../../assets/home-banner-workswarm.svg';
 import './ChatPanel.css';
 import { CodeChangesCard } from '../../features/code-mode/CodeChangesCard';
 import { useCodeTurnDiffHistory } from '../../features/code-mode/useCodeTurnDiffHistory';
@@ -101,6 +103,10 @@ interface ChatPanelProps {
   /** 打开右侧面板并切换到代码审核 Tab */
   onOpenCodeReview?: (target: CodeReviewTarget) => void;
   permissionsEnabled: boolean;
+  /** 心跳面板展开状态：由 App.tsx 统一管理，跟团队/代码审核面板一样占用右侧工作区一栏 */
+  heartbeatPanelOpen?: boolean;
+  /** 切换心跳面板展开状态 */
+  onToggleHeartbeatPanel?: () => void;
   onSavePermission: (updates: Record<string, string>) => Promise<void>;
   /** Goal（持续目标）控制，见 GoalBar 组件 */
   onSetGoal?: (sessionId: string, objective: string) => void;
@@ -748,10 +754,13 @@ export function ChatPanel({
   sessionProject = null,
   historyPager = null,
   isHistoryRestoring = false,
-  teamAreaExpanded = false,  autoFocusKey = null,
+  teamAreaExpanded = false,
+  autoFocusKey = null,
   onNavigateToSkills,
   onToggleTeamArea,
   onOpenCodeReview,
+  heartbeatPanelOpen = false,
+  onToggleHeartbeatPanel,
   permissionsEnabled,
   onSavePermission,
   onSetGoal,
@@ -823,6 +832,8 @@ export function ChatPanel({
   const shouldShowShareExport = Boolean(onExportShare);
   const shouldShowHumanShare = mode === 'team' && teamHumanShareCommands.length > 0;
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
+  // 新会话占位符 'new' 还没有真实 session_id，隐藏心跳入口，见接口规格说明 §16.2
+  const heartbeatAvailable = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
   const {
     turnsByMessageId: codeTurnsByMessageId,
     loading: codeTurnHistoryLoading,
@@ -1270,7 +1281,7 @@ export function ChatPanel({
                     <span className="share-export-btn__label" data-testid="chat-panel-share-export-loading-label">{t('share.generating')}</span>
                   </>
                 ) : (
-                  <Share2 size={14} strokeWidth={2} />
+                  <ShareExportIcon className="h-[32px] w-[32px]" />
                 )}
               </button>
             )}
@@ -1285,24 +1296,34 @@ export function ChatPanel({
                 <Sparkles size={16} strokeWidth={2} />
               </button>
             )}
+            {heartbeatAvailable && (
+              <button
+                type="button"
+                className={`chat-header-icon-btn ${heartbeatPanelOpen ? 'chat-header-icon-btn--active' : ''}`}
+                onClick={() => onToggleHeartbeatPanel?.()}
+                title={t('heartbeat.panel.title')}
+              >
+                <Activity size={14} strokeWidth={2} />
+              </button>
+            )}
             <button
               type="button"
-              className={`chat-header-icon-btn ${teamAreaExpanded === false ? 'chat-header-icon-btn--active' : ''}`}
+              className={`chat-header-icon-btn ${teamAreaExpanded === false && !heartbeatPanelOpen ? 'chat-header-icon-btn--active' : ''}`}
               data-testid="chat-panel-header-chat-toggle"
               data-variant="collapse"
               onClick={() => onToggleTeamArea?.(teamAreaExpanded === false ? null : false)}
             >
-              <img src={chatIcon} alt="" className="chat-header-icon-btn__icon" />
+              <ChatOverviewIcon className="h-[32px] w-[32px]" aria-hidden />
             </button>
             {!(teamAreaExpanded && mode !== 'team') && (
               <button
                 type="button"
-                className={`chat-header-icon-btn ${teamAreaExpanded === true ? 'chat-header-icon-btn--active' : ''}`}
+                className={`chat-header-icon-btn ${teamAreaExpanded === true && !heartbeatPanelOpen ? 'chat-header-icon-btn--active' : ''}`}
                 data-testid="chat-panel-header-expand-toggle"
                 data-variant="expand"
                 onClick={() => onToggleTeamArea?.(teamAreaExpanded === true ? null : true)}
               >
-                <img src={expandIcon} alt="" className="chat-header-icon-btn__icon" />
+                <PanelCollapseIcon className="h-[32px] w-[32px]" aria-hidden />
               </button>
             )}
           </div>
@@ -1361,9 +1382,9 @@ export function ChatPanel({
             </>
           ) : (
             <div className="chat-welcome" data-testid="chat-panel-welcome">
-              <img className="chat-welcome__banner" src={welcomeBanner} alt={t('chat.welcomeLogoAlt')} data-testid="chat-panel-welcome-banner" />
               <h2 className="chat-welcome__heading" data-testid="chat-panel-welcome-heading"><WelcomeHeading /></h2>
               <div className="chat-welcome__composer" data-testid="chat-panel-welcome-composer">
+                <img className="chat-welcome__banner" src={welcomeBanner} alt={t('chat.welcomeLogoAlt')} data-testid="chat-panel-welcome-banner" />
                 <ActiveTeamGroupEntry isProcessing={isProcessing} teamAreaExpanded={teamAreaExpanded} />
                 <AgentActivityCard isProcessing={isProcessing} onSendTask={handleSendMessage} />
                 <InterruptResultBubble />

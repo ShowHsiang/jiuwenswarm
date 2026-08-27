@@ -24,6 +24,7 @@ from jiuwenswarm.gateway.channel_manager.web.app_web_handlers import (
     _register_web_handlers,
     _validate_wechat_numeric_params,
 )
+from jiuwenswarm.gateway.heartbeat import HeartbeatServiceUnavailableError
 
 
 class FakeWebChannel:
@@ -178,7 +179,7 @@ class FakeHeartbeatService:
     def __init__(self):
         self.config = {"every": 60.0, "target": "web"}
 
-    async def set_heartbeat_conf(self, *, every=None, target=None, active_hours=None):
+    async def set_health_check_conf(self, *, every=None, target=None, active_hours=None):
         if every is not None:
             self.config["every"] = every
         if target is not None:
@@ -186,8 +187,134 @@ class FakeHeartbeatService:
         if active_hours is not None:
             self.config["active_hours"] = active_hours
 
-    def get_heartbeat_conf(self):
+    def get_health_check_conf(self):
         return dict(self.config)
+
+
+class FakeHeartbeatController:
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def get_meta(self):
+        return {"statuses": ["scheduled"]}
+
+    async def list_jobs(self, params, *, access_session_id=None, user_id=""):
+        self.calls.append(("list", dict(params), access_session_id, user_id))
+        return {"jobs": []}
+
+    async def create_job(self, params, *, user_id=""):
+        self.calls.append(("create", dict(params), user_id))
+        return dict(params, id="hb-test")
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_web_methods_preserve_health_check_aliases_and_session() -> None:
+    channel = FakeWebChannel()
+    controller = FakeHeartbeatController()
+    _register_web_handlers(
+        WebHandlersBindParams(channel=channel, heartbeat_controller=controller)
+    )
+    assert "health_check.get_conf" in channel.methods
+    assert "health_check.set_conf" in channel.methods
+    assert "health_check.get_path" not in channel.methods
+    assert "heartbeat.get_conf" in channel.methods
+    assert "heartbeat.set_conf" in channel.methods
+    assert "heartbeat.get_path" not in channel.methods
+    assert channel.methods["heartbeat.get_conf"] is channel.methods["health_check.get_conf"]
+    assert channel.methods["heartbeat.set_conf"] is channel.methods["health_check.set_conf"]
+    expected = {
+        "heartbeat.job.list", "heartbeat.job.meta", "heartbeat.job.get",
+        "heartbeat.job.create", "heartbeat.job.update", "heartbeat.job.delete",
+        "heartbeat.job.toggle", "heartbeat.job.preview", "heartbeat.job.run_now",
+        "heartbeat.job.cancel",
+    }
+    assert expected <= set(channel.methods)
+
+    await channel.methods["heartbeat.job.list"](
+        object(), "list-1", {}, "session-current", user_id="user-current"
+    )
+    await channel.methods["heartbeat.job.create"](
+        object(),
+        "create-1",
+        {
+            "name": "n",
+            "prompt": "p",
+            "channel_id": "other",
+            "session_id": "other-session",
+            "schedule": {"type": "interval", "interval_seconds": 120},
+        },
+        "session-current",
+        user_id="user-current",
+    )
+    assert controller.calls[0] == (
+        "list",
+        {},
+        "session-current",
+        "user-current",
+    )
+    created = controller.calls[1][1]
+    assert created["channel_id"] == "web"
+    assert created["session_id"] == "session-current"
+    assert created["source"] == "web_rpc"
+    assert controller.calls[1][2] == "user-current"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_web_reports_unavailable_and_missing_job_codes() -> None:
+    channel = FakeWebChannel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+
+    await channel.methods["heartbeat.job.list"](
+        object(), "list-unavailable", {}, "session-current"
+    )
+    assert channel.responses[-1]["code"] == "SERVICE_UNAVAILABLE"
+
+    class Controller:
+        async def get_job(self, *_args, **_kwargs):
+            raise KeyError("missing")
+
+        async def get_meta(self, **_kwargs):
+            raise HeartbeatServiceUnavailableError("agentserver offline")
+
+    channel = FakeWebChannel()
+    _register_web_handlers(
+        WebHandlersBindParams(channel=channel, heartbeat_controller=Controller())
+    )
+    await channel.methods["heartbeat.job.get"](
+        object(), "get-missing", {"id": "missing"}, "session-current"
+    )
+    assert channel.responses[-1]["code"] == "NOT_FOUND"
+    await channel.methods["heartbeat.job.meta"](
+        object(), "meta-unavailable", {}, "session-current"
+    )
+    assert channel.responses[-1]["code"] == "SERVICE_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_session_delete_delegates_heartbeat_lifecycle_to_agentserver() -> None:
+    class Agent:
+        server_ready = True
+
+        def __init__(self):
+            self.requests = []
+
+        async def send_request(self, env):
+            self.requests.append(env)
+            return SimpleNamespace(ok=True, payload={"session_id": "deleted"})
+
+    channel = FakeWebChannel()
+    agent = Agent()
+    _register_web_handlers(
+        WebHandlersBindParams(
+            channel=channel,
+            agent_client=agent,
+        )
+    )
+    await channel.methods["session.delete"](
+        object(), "delete-1", {"session_id": "session-to-delete"}, "current"
+    )
+    assert agent.requests[0].method == "session.delete"
+    assert channel.responses[-1]["ok"] is True
 
 
 @pytest.mark.asyncio
@@ -611,6 +738,40 @@ class FakeOpenAIAccountModelCatalog:
 
 
 @pytest.mark.asyncio
+async def test_models_list_returns_exact_vendor_identity(monkeypatch) -> None:
+    from jiuwenswarm.server.runtime import opencode_zen
+
+    monkeypatch.setattr(app_web_handlers, "get_config", lambda: {"models": {}})
+    monkeypatch.setattr(
+        app_web_handlers,
+        "get_default_models",
+        lambda _config: [{
+            "model_client_config": {
+                "model_name": "qwen3.8-max",
+                "api_base": "https://example.com/v1",
+                "api_key": "secret",
+                "client_provider": "OpenAI",
+                "vendor_key": "alibaba",
+                "plan": "token_plan",
+            },
+            "model_config_obj": {"temperature": 0.95},
+            "alias": "qwen3.8-max",
+            "is_default": True,
+        }],
+    )
+    monkeypatch.setattr(opencode_zen, "get_zen_free_model_entries", lambda: [])
+    channel = FakeWebChannel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+
+    await channel.methods["models.list"](object(), "req-models", {}, "session-1")
+
+    model = channel.responses[-1]["payload"]["models"][0]
+    assert channel.responses[-1]["ok"] is True
+    assert model["vendor_key"] == "alibaba"
+    assert model["plan"] == "token_plan"
+
+
+@pytest.mark.asyncio
 async def test_models_list_includes_cached_zen_free_models(monkeypatch) -> None:
     """Free models are in-memory entries but must remain selectable in new sessions."""
     from jiuwenswarm.server.runtime import opencode_zen
@@ -770,6 +931,7 @@ async def test_openai_account_logout_wins_against_inflight_poll(
     [
         ("channel.feishu.set_conf", {"apps": [{"app_id": "app-1"}]}),
         ("channel.dingtalk.set_conf", {"enabled": False, "client_id": "client-1"}),
+        ("health_check.set_conf", {"every": 30, "target": "web"}),
         ("heartbeat.set_conf", {"every": 30, "target": "web"}),
     ],
 )
@@ -789,8 +951,8 @@ async def test_config_save_handlers_respond_before_agent_reload_finishes(monkeyp
         lambda channel_id, subsection, conf, keep_keys: persisted.append((channel_id, conf)),
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.channel_manager.web.app_web_handlers.update_heartbeat_in_config",
-        lambda payload: persisted.append(("heartbeat", dict(payload))),
+        "jiuwenswarm.gateway.channel_manager.web.app_web_handlers.update_health_check_in_config",
+        lambda payload: persisted.append(("health_check", dict(payload))),
     )
 
     _register_web_handlers(
@@ -1039,6 +1201,8 @@ async def test_models_replace_all_applies_scoped_reload_before_responding(monkey
                     "api_key": "secret",
                     "model_provider": "OpenAI",
                     "is_default": True,
+                    "vendor_key": "alibaba",
+                    "plan": "token_plan",
                 }
             ]
         },
@@ -1052,11 +1216,49 @@ async def test_models_replace_all_applies_scoped_reload_before_responding(monkey
     await task
 
     assert persisted
+    persisted_mcc = persisted[0][0]["model_client_config"]
+    assert persisted_mcc["vendor_key"] == "alibaba"
+    assert persisted_mcc["plan"] == "token_plan"
     assert reload_options_seen[-1]["target_channel_id"] == "web"
     assert reload_options_seen[-1]["reload_scopes"] == ["model"]
     assert channel.responses[-1]["id"] == "req-models"
     assert channel.responses[-1]["ok"] is True
     assert channel.responses[-1]["payload"]["applied_without_restart"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vendor_key", "plan", "expected_error"),
+    [
+        ("alibaba", "unsupported_plan", "plan must be one of"),
+        (None, "token_plan", "vendor_key is required when plan is set"),
+    ],
+)
+async def test_models_replace_all_rejects_invalid_vendor_identity(vendor_key, plan, expected_error):
+    channel = FakeWebChannel()
+    _register_web_handlers(WebHandlersBindParams(channel=channel))
+
+    await channel.methods["models.replace_all"](
+        object(),
+        "req-models-invalid-provider",
+        {
+            "models": [{
+                "model_name": "model-one",
+                "api_base": "https://example.com/v1",
+                "api_key": "secret",
+                "model_provider": "OpenAI",
+                "is_default": True,
+                "vendor_key": vendor_key,
+                "plan": plan,
+            }],
+        },
+        "sess-1",
+    )
+
+    response = channel.responses[-1]
+    assert response["ok"] is False
+    assert response["code"] == "BAD_REQUEST"
+    assert expected_error in response["error"]
 
 
 @pytest.mark.asyncio
@@ -1902,8 +2104,8 @@ def test_config_panel_flatten_reads_symphony_enabled_and_skill_retrieval():
             "orchestration": {"mode": "fast"},
             "skill_retrieval": {
                 "enabled": True,
-                "build": {"branching_factor": 64},
-                "retrieve": {"top_k": 5, "flatten_tree": True},
+                "index": {"enabled": True},
+                "discovery": {"max_results": 17},
             },
         }
     }
@@ -1914,9 +2116,9 @@ def test_config_panel_flatten_reads_symphony_enabled_and_skill_retrieval():
     assert "symphony_dynamic_graph_enabled" not in flat
     assert "symphony_orchestration_mode" not in flat
     assert flat["skill_retrieval_enabled"] == "true"
-    assert flat["skill_retrieval_build_branching_factor"] == "64"
-    assert "skill_retrieval_retrieve_top_k" not in flat
-    assert flat["skill_retrieval_retrieve_flatten_tree"] == "true"
+    assert flat["skill_retrieval_index_enabled"] == "true"
+    assert flat["skill_retrieval_max_results"] == "17"
+    assert "skill_retrieval_build_branching_factor" not in flat
 
 
 @pytest.mark.asyncio
@@ -1951,13 +2153,15 @@ async def test_config_set_routes_symphony_payload_to_config_helper(monkeypatch):
             "symphony_enabled": "true",
             "symphony_dynamic_graph_enabled": "false",
             "skill_retrieval_enabled": "false",
-            "skill_retrieval_retrieve_flatten_tree": "true",
+            "skill_retrieval_index_enabled": "true",
         },
         "sess-3",
     )
 
     assert recorded_symphony == [{"enabled": True}]
-    assert recorded_skill_retrieval == [{"enabled": False, "retrieve": {"flatten_tree": True}}]
+    assert recorded_skill_retrieval == [
+        {"enabled": False, "index": {"enabled": True}}
+    ]
     assert channel.responses[-1] == {
         "id": "req-3",
         "ok": True,
@@ -1965,7 +2169,7 @@ async def test_config_set_routes_symphony_payload_to_config_helper(monkeypatch):
             "updated": [
                 "symphony_enabled",
                 "skill_retrieval_enabled",
-                "skill_retrieval_retrieve_flatten_tree",
+                "skill_retrieval_index_enabled",
             ],
             "applied_without_restart": True,
         },
