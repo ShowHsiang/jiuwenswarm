@@ -193,6 +193,64 @@ async def test_mcp_no_keys_does_not_dispatch(monkeypatch):
     runner.assert_not_called()
 
 
+def test_release_mcp_exports_preserve_tool_identity():
+    assert mcp_toolkits.mcp_free_search is search_tools.mcp_free_search
+    assert mcp_toolkits.mcp_paid_search is search_tools.mcp_paid_search
+
+
+@pytest.mark.asyncio
+async def test_release_free_search_result_contract(monkeypatch):
+    search = MagicMock(return_value=(
+        "duckduckgo", [{"title": "Result", "url": "https://example.invalid/a", "snippet": "Summary"}],
+    ))
+    monkeypatch.setattr(search_tools, "_search_free_sync", search)
+
+    result = await search_tools.mcp_free_search.invoke({
+        "query": " test ", "max_results": 99, "timeout_seconds": 1,
+    })
+
+    search.assert_called_once_with("test", 20, 5)
+    assert result == (
+        "Free search results (DuckDuckGo) for: test\n"
+        "1. Result\n   URL: https://example.invalid/a\n   Snippet: Summary"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_paid_search_returns_text_error_without_keys(monkeypatch):
+    runner = MagicMock(side_effect=AssertionError("No configured provider"))
+    for name in ("bocha", "perplexity", "serper", "jina"):
+        monkeypatch.setattr(search_tools, f"_{name}_search_sync", runner)
+    mcp_toolkits.refresh_mcp_paid_search_tools()
+
+    result = await mcp_paid_search.invoke({"query": "test"})
+
+    assert result == "[ERROR]: no paid search API keys configured."
+    runner.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_fallback_skips_provider_disabled_during_previous_attempt(monkeypatch):
+    for provider in ("BOCHA", "SERPER", "JINA"):
+        monkeypatch.setenv(f"{provider}_API_KEY", "test-key")
+
+    def fail_first_provider(**kwargs):
+        monkeypatch.setenv("SERPER_API_KEY", "")
+        raise RuntimeError("First provider unavailable")
+
+    disabled = MagicMock(side_effect=AssertionError("Disabled provider was dispatched"))
+    available = MagicMock(return_value={"answer": "answer", "urls": []})
+    monkeypatch.setattr(search_tools, "_bocha_search_sync", fail_first_provider)
+    monkeypatch.setattr(search_tools, "_serper_search_sync", disabled)
+    monkeypatch.setattr(search_tools, "_jina_search_sync", available)
+
+    used, answer, _ = await search_tools.run_paid_search_structured("test")
+
+    assert (used, answer) == ("jina", "answer")
+    disabled.assert_not_called()
+    available.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_existing_mcp_agent_refreshes_model_tools_on_enable_change_and_disable(monkeypatch):
     from openjiuwen.core.single_agent.ability_manager import AbilityManager
