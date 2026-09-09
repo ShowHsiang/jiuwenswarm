@@ -1816,16 +1816,14 @@ class JiuWenSwarm:
                         f"rebuild Agent 失败: {exc}",
                     ) from exc
                 payload = {"success": True}
-            elif (
-                handler_name == "handle_skills_create_from_knowledge"
-                and self._is_skills_create_from_knowledge_followup(payload)
-            ):
-                payload = await self._run_skills_create_from_knowledge_silent(
-                    request, payload
-                )
-                if payload.get("success"):
-                    await self.create_instance()
-                    await self._reload_team_skill_rails(request.session_id)
+            elif handler_name == "handle_skills_create_from_knowledge":
+                if self._is_skills_create_from_knowledge_followup(payload):
+                    payload = await self._run_skills_create_from_knowledge_silent(
+                        request, payload
+                    )
+                    if payload.get("success"):
+                        await self.create_instance()
+                        await self._reload_team_skill_rails(request.session_id)
         except Exception as exc:
             logger.error("[JiuWenSwarm] skills 请求处理失败: %s", exc)
             err_payload: dict = {"error": str(exc), "message": str(exc)}
@@ -1996,10 +1994,13 @@ class JiuWenSwarm:
         metadata["skills_create_from_knowledge_silent"] = True
         metadata["scene"] = "create_skill"
 
+        # Windows 禁止路径分量含 ':'；用 '-' 隔离，避免 sessions 目录 mkdir 失败。
+        raw_rid = str(request.request_id or "").strip() or "anon"
+        safe_rid = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_rid).strip("._-") or "anon"
         return AgentRequest(
             request_id=f"{request.request_id}-knowledge-followup",
             channel_id=request.channel_id,
-            session_id=f"skills-knowledge:{request.request_id}",
+            session_id=f"skills-knowledge-{safe_rid}",
             chat_id=request.chat_id,
             req_method=ReqMethod.CHAT_SEND,
             params=params,
@@ -2036,6 +2037,8 @@ class JiuWenSwarm:
         skills = self._coerce_optional_str_list(payload.get("skills"))
         trusted_dirs = self._coerce_optional_str_list(payload.get("trusted_dirs"))
         input_file = str(payload.get("input_file") or "").strip()
+        skills_root = Path(self._skill_manager.skills_dir)
+        before_names = set(self._skill_manager.list_installed_skill_dir_names())
 
         try:
             chat_request = self._build_skills_knowledge_followup_request(
@@ -2050,8 +2053,30 @@ class JiuWenSwarm:
             async for _chunk in adapter.process_message_stream_impl(chat_request, inputs):
                 pass
 
-            result = self._skill_manager.finalize_create_from_knowledge(output_dir)
-            await self._refresh_skill_rails_after_change()
+            after_names = set(self._skill_manager.list_installed_skill_dir_names())
+            skip_names = {
+                "_marketplace",
+                "_pending_knowledge",
+                "skill-omni-creation",
+                "skill-creator",
+                "skill-creator-normal",
+                "skill-creator-router",
+                "swarmskill-creator",
+                "agent-creator",
+                "plugin-creator",
+            }
+            workspace_candidates = [
+                skills_root / name
+                for name in sorted(after_names - before_names)
+                if name not in skip_names
+            ]
+            result = self._skill_manager.finalize_create_from_knowledge(
+                output_dir,
+                workspace_candidates=workspace_candidates,
+                existing_skill_names=before_names,
+            )
+            if result.get("success"):
+                await self._refresh_skill_rails_after_change()
             return result
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
