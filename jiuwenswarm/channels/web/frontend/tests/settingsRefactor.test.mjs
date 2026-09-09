@@ -1086,6 +1086,7 @@ test('every visible Settings control maps to an exact persistence field or RPC',
     'proactive_recommendation_enabled',
     'proactive_recommendation_max_recommend_per_day',
     'proactive_recommendation_max_rounds_per_tick',
+    'rsi_enabled',
     'trajectory_ui_enabled',
   ]);
 
@@ -1236,7 +1237,7 @@ test('Settings form dialogs share the same dirty-close contract without disablin
 
 test('Agent configuration entry points are disabled while the backend is connecting', () => {
   const agentSettings = source('src/features/settings/modules/agent/AgentSettings.tsx');
-  assert.equal(agentSettings.match(/disabled=\{disabled \|\| !isConnected\}/g)?.length, 1);
+  assert.equal(agentSettings.match(/disabled=\{disabled \|\| !isConnected\}/g)?.length, 2);
   assert.equal(agentSettings.match(/disabled=\{disabled \|\| !isConnected \|\| busy\}/g)?.length, 3);
   assert.match(agentSettings, /<FormDialog[\s\S]*confirmDisabled=\{!isConnected\}/);
 });

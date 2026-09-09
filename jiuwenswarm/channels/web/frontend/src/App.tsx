@@ -11,6 +11,12 @@ import { ChatPanel } from './components/ChatPanel';
 import { SessionSidebar } from './components/SessionSidebar';
 import { SkillPanel } from './components/SkillPanel';
 import { AgentManagementPanel } from './components/AgentManagementPanel';
+import { RsiPage } from './features/rsi/RsiPage';
+import {
+  normalizeRSIEnabled,
+  setRSIFeatureEnabled,
+  useRSIFeatureEnabled,
+} from './features/rsi/featureConfig';
 import { SessionsPanel } from './components/SessionsPanel';
 import CronPanel from './components/CronPanel';
 import HeartbeatPanel from './components/HeartbeatPanel';
@@ -750,7 +756,17 @@ function AppContent({
     import.meta.env.MODE,
     typeof serverConfig?.runtime_platform === 'string' ? serverConfig.runtime_platform : undefined,
   );
-  const hiddenNavItems = getHiddenNavItemsForPlatform(frontendPlatform);
+  const rsiFeatureEnabled = useRSIFeatureEnabled();
+  const hiddenNavItems: SidebarNavKey[] = [
+    ...getHiddenNavItemsForPlatform(frontendPlatform),
+    ...(rsiFeatureEnabled ? [] : ['experiments' as const]),
+  ];
+
+  useEffect(() => {
+    if (!rsiFeatureEnabled && activeNav === 'experiments') {
+      setActiveNav('chat');
+    }
+  }, [activeNav, rsiFeatureEnabled]);
 
   useEffect(() => {
     if (!serverConfig) {
@@ -1466,6 +1482,7 @@ function AppContent({
     try {
       const config = await request<Record<string, unknown>>('config.get');
       setA2UIFeatureEnabled(normalizeA2UIEnabled(config.a2ui_enabled));
+      setRSIFeatureEnabled(normalizeRSIEnabled(config.rsi_enabled));
       setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(config.trajectory_ui_enabled));
       setServerConfig(config);
       setConfigError(null);
@@ -3230,6 +3247,11 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               </div>
             </div>
           </>
+        )}
+        {activeNav === 'experiments' && (
+          <div className="app-section">
+            <RsiPage />
+          </div>
         )}
         {hasVisitedAgents && (
           <div className={`app-section min-h-0 ${activeNav === 'agents' ? '' : 'is-hidden'}`}>
