@@ -132,6 +132,10 @@ from openjiuwen.harness.schema.task import TodoStatus
 from openjiuwen.harness.workspace.workspace import Workspace, WorkspaceNode
 from openjiuwen.harness.schema.config import SubAgentConfig
 
+from jiuwenswarm.server.runtime.session.history_io import (
+    run_history_io, run_stream_parser, stream_chunk_writes_history,
+)
+
 from jiuwenswarm.server.runtime.agent_adapter.permission_rail_group import (
     PERMISSION_GROUP_TYPES, PERMISSION_RAIL_TYPES, PermissionRailGroup, build_permission_group,
 )
@@ -12299,7 +12303,7 @@ class JiuWenSwarmDeepAdapter:
         return cancelled_tool_results
 
     @staticmethod
-    def _append_cancelled_tools_to_history(
+    async def _append_cancelled_tools_to_history(
         request: AgentRequest,
         cancelled_tool_results: list[dict[str, Any]],
     ) -> None:
@@ -12312,7 +12316,7 @@ class JiuWenSwarmDeepAdapter:
             else "unknown"
         )
         for tool_info in cancelled_tool_results:
-            append_history_record(
+            await run_history_io(append_history_record,
                 session_id=request.session_id,
                 request_id=request.request_id,
                 channel_id=request.channel_id,
@@ -12489,7 +12493,7 @@ class JiuWenSwarmDeepAdapter:
             return False
         return str(getattr(chunk_type, "value", chunk_type)) in _ROUND_TERMINAL_CHUNK_TYPES
 
-    def _begin_visible_chat_content(
+    async def _begin_visible_chat_content(
         self,
         stream_is_user_originated: bool = False,
         *,
@@ -12526,7 +12530,7 @@ class JiuWenSwarmDeepAdapter:
             stream_is_user_originated and kind == "goal" and prev is None
         )
         if kind == "goal" and session_id:
-            self._flush_pending_goal_objective_history(session_id)
+            await self._flush_pending_goal_objective_history(session_id)
         if switched_from_user or hijacked_before_user_token:
             boundary = {"event_type": "chat.final", "content": ""}
             self._stream_content_run_kind = None
@@ -13322,7 +13326,7 @@ class JiuWenSwarmDeepAdapter:
         if cancelled_tool_results:
             payload["cancelled_tools"] = cancelled_tool_results
             # 写入历史记录，确保刷新网页后工具状态正确显示
-            self._append_cancelled_tools_to_history(request, cancelled_tool_results)
+            await self._append_cancelled_tools_to_history(request, cancelled_tool_results)
         if cutover_handoff is not None:
             try:
                 continuation_discarded = await self._permission_dispatch.complete_cutover(
@@ -13452,7 +13456,7 @@ class JiuWenSwarmDeepAdapter:
             payload["goal"] = paused_goal_payload
         if cancelled_tool_results:
             payload["cancelled_tools"] = cancelled_tool_results
-            self._append_cancelled_tools_to_history(request, cancelled_tool_results)
+            await self._append_cancelled_tools_to_history(request, cancelled_tool_results)
         # Best-effort todo cancellation for user cancel (does not touch runtime).
         if cancelled and intent == "cancel" and request.session_id:
             try:
@@ -14062,6 +14066,8 @@ class JiuWenSwarmDeepAdapter:
 
     @staticmethod
     def _approval_chunk_from_event(event: Any) -> dict[str, Any] | None:
+        if stream_chunk_writes_history(event):
+            return None
         parsed = JiuWenSwarmDeepAdapter._parse_stream_chunk(event)
         if not isinstance(parsed, dict) or parsed.get("event_type") != "chat.ask_user_question":
             return None
@@ -14340,7 +14346,7 @@ class JiuWenSwarmDeepAdapter:
         # chat 持有 output lease 时 goal set 仍会 mark；再看其它未完成 task
         return self._session_has_other_running_agent_tasks(sid)
 
-    def _flush_pending_goal_objective_history(
+    async def _flush_pending_goal_objective_history(
         self, session_id: str, *, timestamp: float | None = None
     ) -> None:
         """把挂起的 Goal 用户历史落到磁盘；无挂起则 noop。"""
@@ -14348,12 +14354,12 @@ class JiuWenSwarmDeepAdapter:
         pending = _pending_goal_objective_history.pop(sid, None)
         if not pending:
             return
-        append_history_record(
+        await run_history_io(append_history_record,
             timestamp=float(timestamp if timestamp is not None else time.time()),
             **pending,
         )
 
-    def _record_goal_set_history_if_needed(
+    async def _record_goal_set_history_if_needed(
         self,
         request: AgentRequest,
         *,
@@ -14396,7 +14402,7 @@ class JiuWenSwarmDeepAdapter:
             _pending_goal_objective_history[resolved] = record_kwargs
             return
         _pending_goal_objective_history.pop(resolved, None)
-        append_history_record(timestamp=time.time(), **record_kwargs)
+        await run_history_io(append_history_record, timestamp=time.time(), **record_kwargs)
 
     @staticmethod
     def _goal_completed_history_exists(session_id: str, goal_id: str) -> bool:
@@ -14420,7 +14426,7 @@ class JiuWenSwarmDeepAdapter:
         return False
 
     @staticmethod
-    def _record_goal_completed_history_if_needed(
+    async def _record_goal_completed_history_if_needed(
         *,
         session_id: str,
         channel_id: str,
@@ -14439,7 +14445,7 @@ class JiuWenSwarmDeepAdapter:
         if not goal_id:
             return
         sid = (session_id or "default").strip() or "default"
-        if JiuWenSwarmDeepAdapter._goal_completed_history_exists(sid, goal_id):
+        if await run_history_io(JiuWenSwarmDeepAdapter._goal_completed_history_exists, sid, goal_id):
             return
 
         evidence = ""
@@ -14450,7 +14456,7 @@ class JiuWenSwarmDeepAdapter:
         # restore / localStorage merge keep working without a content-parser fork.
         content = "goal.completed:" + json.dumps({"evidence": evidence}, ensure_ascii=False)
         message_id = f"goal-completed-{goal_id}"
-        append_history_record(
+        await run_history_io(append_history_record,
             session_id=sid,
             request_id=message_id,
             channel_id=channel_id,
@@ -15158,7 +15164,11 @@ class JiuWenSwarmDeepAdapter:
                             collected_content.append(text)
                     else:
                         # check for error in other typed chunks (e.g. controller_output.task_failed)
-                        parsed = self._parse_stream_chunk(chunk, _parent_session_id=self._parent_session_id)
+                        parsed = await run_stream_parser(
+                            self._parse_stream_chunk,
+                            chunk,
+                            _parent_session_id=self._parent_session_id,
+                        )
                         if parsed is not None:
                             event_type = str(parsed.get("event_type") or "").strip()
                             # execution.error（DeepAgent round 级异常，如模型调用失败）
@@ -15174,7 +15184,11 @@ class JiuWenSwarmDeepAdapter:
                                             or event_type
                                         )
                 else:
-                    parsed = self._parse_stream_chunk(chunk, _parent_session_id=self._parent_session_id)
+                    parsed = await run_stream_parser(
+                        self._parse_stream_chunk,
+                        chunk,
+                        _parent_session_id=self._parent_session_id,
+                    )
                     if parsed is not None:
                         text = parsed.get("content", "")
                         if text:
@@ -15791,7 +15805,7 @@ class JiuWenSwarmDeepAdapter:
             emitted_ask_user_events.add(identity)
             return False
 
-        def note_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        async def note_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal had_assistant_output, emitted_terminal_chat_final
             nonlocal run_answer_final
             event_type = payload.get("event_type")
@@ -15818,7 +15832,7 @@ class JiuWenSwarmDeepAdapter:
             # without touching the pure payload parser.
             if event_type == GOAL_UPDATED_EVENT_TYPE:
                 goal_obj = payload.get("goal")
-                self._record_goal_completed_history_if_needed(
+                await self._record_goal_completed_history_if_needed(
                     session_id=session_id,
                     channel_id=cid,
                     channel_metadata=request.metadata if isinstance(request.metadata, dict) else None,
@@ -16142,7 +16156,7 @@ class JiuWenSwarmDeepAdapter:
                         },
                         is_complete=False,
                     )
-                self._record_goal_set_history_if_needed(
+                await self._record_goal_set_history_if_needed(
                     request,
                     action=goal_action if isinstance(goal_action, str) else None,
                     result_type=result_type if isinstance(result_type, str) else None,
@@ -16152,7 +16166,7 @@ class JiuWenSwarmDeepAdapter:
                 # Only keep the lease when set/resume left an ACTIVE goal to run.
                 if result_type != "goal_stream":
                     # 控制类结果（未进入 goal 执行）：挂起历史立刻落盘
-                    self._flush_pending_goal_objective_history(session_id)
+                    await self._flush_pending_goal_objective_history(session_id)
                     if interaction_stream is not None:
                         await interaction_stream.close(abort_active_round=False)
                         interaction_stream = None
@@ -16166,7 +16180,7 @@ class JiuWenSwarmDeepAdapter:
                     # 仍停在 set 瞬间，重载顺序必错（见 web_19fd08* 会话）。
                     # 忙碌推迟时留给持有 lease 的流在 user→goal 边界再落盘。
                     if not defer_goal_history:
-                        self._flush_pending_goal_objective_history(session_id)
+                        await self._flush_pending_goal_objective_history(session_id)
                     async for chunk in _yield_runtime_accepted():
                         yield chunk
                     interaction_stream_abort = False
@@ -16185,7 +16199,7 @@ class JiuWenSwarmDeepAdapter:
                         },
                         is_complete=False,
                     )
-                self._record_goal_set_history_if_needed(
+                await self._record_goal_set_history_if_needed(
                     request,
                     action=goal_action if isinstance(goal_action, str) else None,
                     result_type="goal_stream" if goal_stream_request else "goal_control",
@@ -16331,18 +16345,22 @@ class JiuWenSwarmDeepAdapter:
                     failure=run_failure,
                 )
                 if not (hasattr(chunk, "type") and hasattr(chunk, "payload")):
-                    parsed = self._parse_stream_chunk(chunk, _parent_session_id=self._parent_session_id)
+                    parsed = await run_stream_parser(
+                        self._parse_stream_chunk,
+                        chunk,
+                        _parent_session_id=self._parent_session_id,
+                    )
                     # Only stamp provenance / inject split on new visible deltas.
                     # A late user-round chat.final must keep the prior content kind.
                     if isinstance(parsed, dict) and parsed.get("event_type") == "chat.delta":
-                        boundary = self._begin_visible_chat_content(
+                        boundary = await self._begin_visible_chat_content(
                             stream_is_user_originated, session_id=session_id
                         )
                         if boundary is not None:
                             yield AgentResponseChunk(
                                 request_id=rid,
                                 channel_id=cid,
-                                payload=note_chat_payload(boundary),
+                                payload=await note_chat_payload(boundary),
                                 is_complete=False,
                             )
                             # Boundary closes the user bubble only; goal segment follows.
@@ -16355,7 +16373,9 @@ class JiuWenSwarmDeepAdapter:
                             yield AgentResponseChunk(
                                 request_id=rid,
                                 channel_id=cid,
-                                payload=note_chat_payload({"event_type": "chat.delta", "content": accumulated_text}),
+                                payload=await note_chat_payload(
+                                    {"event_type": "chat.delta", "content": accumulated_text}
+                                ),
                                 is_complete=False,
                             )
                             accumulated_text = ""
@@ -16363,7 +16383,7 @@ class JiuWenSwarmDeepAdapter:
                             yield AgentResponseChunk(
                                 request_id=rid,
                                 channel_id=cid,
-                                payload=note_chat_payload({
+                                payload=await note_chat_payload({
                                     "event_type": "chat.reasoning",
                                     "content": accumulated_reasoning,
                                 }),
@@ -16375,7 +16395,7 @@ class JiuWenSwarmDeepAdapter:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload(parsed),
+                            payload=await note_chat_payload(parsed),
                             is_complete=False,
                         )
                     continue
@@ -16422,21 +16442,21 @@ class JiuWenSwarmDeepAdapter:
                     )
                     if reasoning_payload is None:
                         continue
-                    boundary = self._begin_visible_chat_content(
+                    boundary = await self._begin_visible_chat_content(
                         stream_is_user_originated, session_id=session_id
                     )
                     if boundary is not None:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload(boundary),
+                            payload=await note_chat_payload(boundary),
                             is_complete=False,
                         )
                         emitted_terminal_chat_final = False
                     yield AgentResponseChunk(
                         request_id=rid,
                         channel_id=cid,
-                        payload=note_chat_payload(reasoning_payload),
+                        payload=await note_chat_payload(reasoning_payload),
                         is_complete=False,
                     )
                     continue
@@ -16455,28 +16475,28 @@ class JiuWenSwarmDeepAdapter:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload({
+                            payload=await note_chat_payload({
                                 "event_type": "chat.reasoning",
                                 "content": accumulated_reasoning,
                             }),
                             is_complete=False,
                         )
                         accumulated_reasoning = ""
-                    boundary = self._begin_visible_chat_content(
+                    boundary = await self._begin_visible_chat_content(
                         stream_is_user_originated, session_id=session_id
                     )
                     if boundary is not None:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload(boundary),
+                            payload=await note_chat_payload(boundary),
                             is_complete=False,
                         )
                         emitted_terminal_chat_final = False
                     yield AgentResponseChunk(
                         request_id=rid,
                         channel_id=cid,
-                        payload=note_chat_payload(delta_payload),
+                        payload=await note_chat_payload(delta_payload),
                         is_complete=False,
                     )
                     continue
@@ -16486,7 +16506,7 @@ class JiuWenSwarmDeepAdapter:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload({"event_type": "chat.delta", "content": accumulated_text}),
+                            payload=await note_chat_payload({"event_type": "chat.delta", "content": accumulated_text}),
                             is_complete=False,
                         )
                         accumulated_text = ""
@@ -16494,7 +16514,7 @@ class JiuWenSwarmDeepAdapter:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload({
+                            payload=await note_chat_payload({
                                 "event_type": "chat.reasoning",
                                 "content": accumulated_reasoning,
                             }),
@@ -16502,7 +16522,7 @@ class JiuWenSwarmDeepAdapter:
                         )
                         accumulated_reasoning = ""
                     if has_streamed_content:
-                        parsed = self._parse_stream_chunk(
+                        parsed = await run_stream_parser(self._parse_stream_chunk,
                             chunk,
                             _has_streamed_content=True,
                             _parent_session_id=self._parent_session_id,
@@ -16516,11 +16536,15 @@ class JiuWenSwarmDeepAdapter:
                             yield AgentResponseChunk(
                                 request_id=rid,
                                 channel_id=cid,
-                                payload=note_chat_payload(parsed),
+                                payload=await note_chat_payload(parsed),
                                 is_complete=False,
                             )
                         continue
-                    parsed = self._parse_stream_chunk(chunk, _parent_session_id=self._parent_session_id)
+                    parsed = await run_stream_parser(
+                        self._parse_stream_chunk,
+                        chunk,
+                        _parent_session_id=self._parent_session_id,
+                    )
                     parsed = self._adapt_goal_intermediate_final(parsed)
                     if parsed is not None:
                         if should_skip_duplicate_ask_user(parsed):
@@ -16530,7 +16554,7 @@ class JiuWenSwarmDeepAdapter:
                         yield AgentResponseChunk(
                             request_id=rid,
                             channel_id=cid,
-                            payload=note_chat_payload(parsed),
+                            payload=await note_chat_payload(parsed),
                             is_complete=False,
                         )
                     continue
@@ -16539,7 +16563,7 @@ class JiuWenSwarmDeepAdapter:
                     yield AgentResponseChunk(
                         request_id=rid,
                         channel_id=cid,
-                        payload=note_chat_payload({"event_type": "chat.delta", "content": accumulated_text}),
+                        payload=await note_chat_payload({"event_type": "chat.delta", "content": accumulated_text}),
                         is_complete=False,
                     )
                     accumulated_text = ""
@@ -16547,11 +16571,20 @@ class JiuWenSwarmDeepAdapter:
                     yield AgentResponseChunk(
                         request_id=rid,
                         channel_id=cid,
-                        payload=note_chat_payload({"event_type": "chat.reasoning", "content": accumulated_reasoning}),
+                        payload=await note_chat_payload(
+                            {
+                                "event_type": "chat.reasoning",
+                                "content": accumulated_reasoning,
+                            }
+                        ),
                         is_complete=False,
                     )
                     accumulated_reasoning = ""
-                parsed = self._parse_stream_chunk(chunk, _parent_session_id=self._parent_session_id)
+                parsed = await run_stream_parser(
+                    self._parse_stream_chunk,
+                    chunk,
+                    _parent_session_id=self._parent_session_id,
+                )
                 parsed = self._adapt_goal_intermediate_final(parsed)
                 if parsed is not None:
                     if should_skip_duplicate_ask_user(parsed):
@@ -16561,7 +16594,7 @@ class JiuWenSwarmDeepAdapter:
                     yield AgentResponseChunk(
                         request_id=rid,
                         channel_id=cid,
-                        payload=note_chat_payload(parsed),
+                        payload=await note_chat_payload(parsed),
                         is_complete=False,
                     )
 
@@ -16583,14 +16616,14 @@ class JiuWenSwarmDeepAdapter:
                 yield AgentResponseChunk(
                     request_id=rid,
                     channel_id=cid,
-                    payload=note_chat_payload(flush_payload),
+                    payload=await note_chat_payload(flush_payload),
                     is_complete=False,
                 )
             if accumulated_reasoning:
                 yield AgentResponseChunk(
                     request_id=rid,
                     channel_id=cid,
-                    payload=note_chat_payload({"event_type": "chat.reasoning", "content": accumulated_reasoning}),
+                    payload=await note_chat_payload({"event_type": "chat.reasoning", "content": accumulated_reasoning}),
                     is_complete=False,
                 )
 
@@ -16642,7 +16675,7 @@ class JiuWenSwarmDeepAdapter:
                 yield AgentResponseChunk(
                     request_id=rid,
                     channel_id=cid,
-                    payload=note_chat_payload({
+                    payload=await note_chat_payload({
                         "event_type": "chat.final",
                         "content": "",
                     }),
@@ -16715,7 +16748,7 @@ class JiuWenSwarmDeepAdapter:
             # 兜底落盘：仅当没有其它并发流可接管时才 flush。
             # goal set 因 lease 被占而早退时，chat 流还在，不能在这里落盘。
             if not self._session_has_other_running_agent_tasks(session_id):
-                self._flush_pending_goal_objective_history(session_id)
+                await self._flush_pending_goal_objective_history(session_id)
             if _debug_logger is not None:
                 _debug_logger.flush()
             if _debug_trace_token is not None:
