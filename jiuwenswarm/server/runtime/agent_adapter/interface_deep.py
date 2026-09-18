@@ -281,6 +281,7 @@ from jiuwenswarm.agents.harness.team.a2x.a2x_registry_runtime import (
 from jiuwenswarm.agents.harness.common.browser_defaults import (
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
 )
+from jiuwenswarm.agents.harness.common.electron_sideview import apply_session_sideview_target
 from jiuwenswarm.agents.harness.common.tools.cron.cron_runtime import CronRuntimeBridge
 from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (  # noqa: E402
     SessionMessagingRouteRail,
@@ -556,6 +557,7 @@ from jiuwenswarm.common.mcp_config import (
     preflight_mcp_server_reachable,
 )
 from jiuwenswarm.server.runtime.mcp.call_timeout_patch import apply_mcp_call_timeout_patch
+from jiuwenswarm.server.runtime.agent_adapter.task_tool_events import apply_task_tool_event_patch
 from jiuwenswarm.common.task_loop_config import (
     resolve_task_loop_completion_timeout,
 )
@@ -1815,6 +1817,13 @@ class JiuWenSwarmDeepAdapter:
         # killed remote MCP server fails fast instead of hanging on the MCP
         # SDK's 300s SSE read timeout. Idempotent (module-level _PATCHED guard).
         apply_mcp_call_timeout_patch()
+        # SDK TaskTool creates ephemeral subagents (browser_agent included)
+        # without emitting roster events, so Web clients never learn the
+        # browser agent exists and the desktop browser tab never appears.
+        # Applied here (not at module import) so importing this adapter has
+        # no global side effects; idempotent, and guaranteed to run before
+        # any DeepAgent/TaskTool is created below.
+        apply_task_tool_event_patch()
         self._instance: DeepAgent | None = None
         self._interaction_output_handoff: OutputHandoff | None = None
         self._session_input_guard: SessionInputGuard | None = None
@@ -4238,32 +4247,11 @@ class JiuWenSwarmDeepAdapter:
         config_base: dict[str, Any] | None = None,
     ) -> str:
         """Resolve managed-browser binary from saved browser config."""
+        from jiuwenswarm.agents.harness.common.browser_config import resolve_chrome_path
+
         if config_base is None:
             config_base = get_config()
-        if not isinstance(config_base, dict):
-            return ""
-        config = resolve_env_vars(config_base)
-        browser_cfg = config.get("browser", {}) if isinstance(config, dict) else {}
-        if not isinstance(browser_cfg, dict):
-            return ""
-        chrome_path = browser_cfg.get("chrome_path", "")
-        if isinstance(chrome_path, str):
-            return chrome_path.strip()
-        if not isinstance(chrome_path, dict):
-            return ""
-        platform_map = {
-            "win32": "windows",
-            "cygwin": "windows",
-            "darwin": "macos",
-            "linux": "linux",
-            "linux2": "linux",
-        }
-        os_key = platform_map.get(os.sys.platform, "default")
-        for key in (os_key, "default"):
-            value = chrome_path.get(key, "")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return ""
+        return resolve_chrome_path(config_base)
 
     @staticmethod
     def _resolve_headless_from_config(
@@ -4372,36 +4360,40 @@ class JiuWenSwarmDeepAdapter:
         runtime_enabled: bool | None = None,
     ) -> None:
         """Synchronize browser launch settings before browser runtimes are built."""
-        headless = self._resolve_headless_from_config(config_base)
-        browser_runtime_enabled = (
-            self._browser_runtime_enabled()
-            if runtime_enabled is None
-            else runtime_enabled
-        )
-        if browser_runtime_enabled:
-            launch = resolve_playwright_mcp_launch()
-            mcp_args = [arg for arg in launch.args if arg != "--headless"]
-            if headless:
-                mcp_args.append("--headless")
-            serialized_args = serialize_playwright_mcp_args(mcp_args)
-            os.environ["PLAYWRIGHT_MCP_COMMAND"] = launch.command
-            os.environ["PLAYWRIGHT_MCP_ARGS"] = serialized_args
-            record_managed_launch_environment(os.environ, launch, serialized_args)
-            logger.info(
-                "[%s] Playwright MCP launch: source=%s, version=%s, runtime=%s",
-                type(self).__name__,
-                launch.source,
-                launch.version,
-                launch.runtime_display_path or "external",
-            )
-        else:
-            clear_managed_launch_environment(os.environ)
+        runtime_on = runtime_enabled if runtime_enabled is not None else self._browser_runtime_enabled()
+        from jiuwenswarm.agents.harness.common.electron_sideview import electron_browser_selected
 
-        if headless:
+        # Discovery is opt-in and restores its own stale overrides before launch resolution.
+        electron_selected = electron_browser_selected()
+        headless = self._resolve_headless_from_config(config_base)
+        chrome_path = self._resolve_managed_browser_binary_from_config(config_base)
+        # Never append launch flags to Electron's target-aware MCP wrapper.
+        if not electron_selected:
+            if runtime_on:
+                launch = resolve_playwright_mcp_launch()
+                mcp_args = [arg for arg in launch.args if arg != "--headless"]
+                if headless:
+                    mcp_args.append("--headless")
+                serialized_args = serialize_playwright_mcp_args(mcp_args)
+                os.environ["PLAYWRIGHT_MCP_COMMAND"] = launch.command
+                os.environ["PLAYWRIGHT_MCP_ARGS"] = serialized_args
+                record_managed_launch_environment(os.environ, launch, serialized_args)
+                logger.info(
+                    "[%s] Playwright MCP launch: source=%s, version=%s, runtime=%s",
+                    type(self).__name__,
+                    launch.source,
+                    launch.version,
+                    launch.runtime_display_path or "external",
+                )
+            else:
+                clear_managed_launch_environment(os.environ)
+
+        # A configured path enables Swarm-only managed instances in Electron.
+        # This shared setting affects managed Chrome, not remote Electron pages.
+        if headless and (not electron_selected or chrome_path):
             os.environ["BROWSER_MANAGED_ARGS"] = "--headless=new"
         else:
             os.environ.pop("BROWSER_MANAGED_ARGS", None)
-        chrome_path = self._resolve_managed_browser_binary_from_config(config_base)
         if chrome_path:
             os.environ["BROWSER_MANAGED_BINARY"] = chrome_path
         else:
@@ -4663,6 +4655,18 @@ class JiuWenSwarmDeepAdapter:
                 ),
             )
             self._prepare_browser_runtime_security(browser_spec)
+            # Electron 每会话隔离：把本会话 sideview 的 CDP TargetID 注入 browser
+            # subagent 的 MCP env（与 swarm.browser_agent 同一契约；放在安全加固
+            # 之后，注入的 env 落在最终 guarded settings 之上。resolver 不可用时
+            # 返回原 settings，回退 openjiuwen 默认行为）。
+            _electron_session_id = str(getattr(self, "_parent_session_id", "") or "").strip()
+            if (
+                _electron_session_id
+                and (browser_spec.factory_kwargs or {}).get("settings") is not None
+            ):
+                browser_spec.factory_kwargs["settings"] = apply_session_sideview_target(
+                    browser_spec.factory_kwargs["settings"], _electron_session_id
+                )
             subagents.append(browser_spec)
         elif (
             isinstance(subagents_cfg, dict)
