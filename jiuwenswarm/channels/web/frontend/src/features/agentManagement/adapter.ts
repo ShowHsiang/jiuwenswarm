@@ -26,6 +26,7 @@ import type {
   RawAgentGroupMember,
   RawLocalizedText,
   RawSkillOption,
+  RawTeamSkillMarketplaceItem,
 } from './raw';
 import { normalizeEquipmentIdentity, normalizeEquipmentSource } from '../equipmentMarketplace';
 
@@ -221,9 +222,45 @@ export function normalizeAgentFileContent(raw: RawAgentFileReadPayload): AgentFi
 
 export function normalizeSkillOption(raw: RawSkillOption): SkillOption {
   const name = raw.name || raw.display_name || '';
+  const source = raw.source?.trim() || '';
+  const installed = raw.installed === true;
+  const marketplace = raw.marketplace?.trim() || (source && source !== 'builtin' ? source : undefined);
+  const installSpec =
+    raw.install_spec?.trim() ||
+    raw.spec?.trim() ||
+    (installed ? undefined : source === 'builtin' ? name : marketplace ? `${name}@${marketplace}` : undefined);
   return {
     id: name,
     name: raw.display_name || name,
     description: raw.description || '',
+    source,
+    installed,
+    ...(raw.kind?.trim() ? { kind: raw.kind.trim() } : {}),
+    ...(raw.skill_type?.trim() ? { skillType: raw.skill_type.trim() } : {}),
+    ...(marketplace ? { marketplace } : {}),
+    ...(installSpec ? { installSpec } : {}),
+  };
+}
+
+export function normalizeTeamMarketplaceSkill(
+  raw: RawTeamSkillMarketplaceItem,
+  existing?: SkillOption,
+): SkillOption | null {
+  const id = raw.name?.trim() || raw.asset_id?.trim() || '';
+  const hubAssetId = raw.asset_id?.trim() || '';
+  if (!id || !hubAssetId) return null;
+
+  return {
+    ...(existing || {
+      id,
+      name: raw.display_name?.trim() || id,
+      description: raw.short_desc?.trim() || raw.description?.trim() || '',
+      installed: false,
+    }),
+    id,
+    source: 'teamskillshub',
+    pluginType: raw.plugin_type?.trim() || 'swarmskill',
+    hubAssetId,
+    marketplace: existing?.marketplace || 'teamskillshub',
   };
 }
