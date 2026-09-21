@@ -6595,6 +6595,21 @@ class JiuWenSwarmDeepAdapter:
         return model
 
     @staticmethod
+    def _with_execution_deadline(inputs: dict[str, Any], request: AgentRequest) -> dict[str, Any]:
+        deadline = (request.metadata or {}).get("execution_deadline_at")
+        if not isinstance(deadline, (int, float)) or deadline <= 0:
+            return inputs
+        updated = dict(inputs)
+        run = dict(updated.get("run") or {})
+        context = dict(run.get("context") or {})
+        extra = dict(context.get("extra") or {})
+        extra["execution_deadline_at"] = deadline
+        context["extra"] = extra
+        run["context"] = context
+        updated["run"] = run
+        return updated
+
+    @staticmethod
     def _with_symphony_request_model(
         inputs: dict[str, Any],
         model: Model,
@@ -15068,6 +15083,7 @@ class JiuWenSwarmDeepAdapter:
             sync_agent_observability,
         )
         inputs = self._with_symphony_request_model(inputs, resolved_model)
+        inputs = self._with_execution_deadline(inputs, request)
         inputs = with_session_messaging_route(
             inputs, current_session_messaging_route()
         )
@@ -15959,6 +15975,7 @@ class JiuWenSwarmDeepAdapter:
             sync_agent_observability,
         )
         inputs = self._with_symphony_request_model(inputs, resolved_model)
+        inputs = self._with_execution_deadline(inputs, request)
         inputs = with_session_messaging_route(
             inputs, current_session_messaging_route()
         )
