@@ -295,6 +295,9 @@ def _domain_operation(facts: ToolDecisionFacts) -> str:
     operation = (raw or facts.tool_name).strip().lower().replace("-", "_")
     category = facts.tool_category
     if category == "browser":
+        if facts.tool_name == "browser_page_action" and operation == "scroll":
+            # The bounded runtime helper still needs the normal interaction review.
+            return "click"
         if "cancel" in operation:
             return "control_cancel"
         if "route" in operation or "unroute" in operation:
