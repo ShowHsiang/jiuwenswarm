@@ -2576,6 +2576,59 @@ def _masked_with_fp(value: Any) -> str:
 
 
 def _sanitize_log_text(text: str) -> str:
+    """Redact JSON by value, preserving numbers and valid serialization.
+
+    Metrics can contain 18 decimal digits; applying an identity-number regex to
+    serialized JSON corrupts them. Plain text retains the existing redaction.
+    """
+    decoder = json.JSONDecoder()
+    # Logger prefixes precede a JSON object/array. A bounded scan also handles
+    # embedded JSON in messages without quadratic work on arbitrary page text.
+    for match in list(re.finditer(r'[\{\[]', text))[:32]:
+        try:
+            value, end = decoder.raw_decode(text, match.start())
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(value, (dict, list)):
+            continue
+        return (
+            _sanitize_plain_log_text(text[:match.start()])
+            + json.dumps(_sanitize_log_value(value), ensure_ascii=False, separators=(",", ":"))
+            + _sanitize_log_text(text[end:])
+        )
+    return _sanitize_plain_log_text(text)
+
+
+def _sanitize_log_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            safe_outcome = key == "authorization_outcome" and item in ("allow", "deny", "block", "cancel")
+            # Reuse the existing key classifier without letting quotes/escapes in
+            # actual values change the matching boundaries.
+            sensitive = bool(_NAMED_SENSITIVE_KV_PATTERN.fullmatch(json.dumps(str(key)) + ':"value"'))
+            if key in {"input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens"} and type(item) in {int, float}:
+                sensitive = False
+            if sensitive and not safe_outcome:
+                result[_sanitize_plain_log_text(str(key))] = _masked_with_fp(item)
+            else:
+                result[_sanitize_plain_log_text(str(key))] = _sanitize_log_value(item)
+        return result
+    if isinstance(value, list):
+        return [
+            _masked_with_fp(item) if index and isinstance(value[index - 1], str)
+            and _CLI_FLAG_SENSITIVE_PATTERN.fullmatch(value[index - 1] + " value")
+            else _sanitize_log_value(item)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, str):
+        return _sanitize_log_text(value)
+    if type(value) is int and any(pattern.fullmatch(str(value)) for pattern in _SENSITIVE_PII_PATTERNS):
+        return _SENSITIVE_MASK
+    return value
+
+
+def _sanitize_plain_log_text(text: str) -> str:
     if not text:
         return text
 

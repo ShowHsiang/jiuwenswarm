@@ -46,3 +46,39 @@ def test_shadow_evaluation_is_not_counted_as_an_additional_model_window():
     report = module.summarize(events)
     assert report["routes"] == {"llm": 1}
     assert report["jev_total_ms"] == 50
+
+
+def test_corrupt_decimal_lines_are_reported_and_never_silently_dropped(tmp_path):
+    path = tmp_path / "sanitized.log"
+    path.write_text(
+        '[BROWSER_POLICY_REQUEST] {"decision_id":"jev_trace"}\n'
+        '[BROWSER_POLICY_RESPONSE] {"decision_id":"jev_trace","probability_margin":0.******}\n'
+        '[BROWSER_POLICY] {"decision_id":"jev_trace","route":"jev"}\n', encoding="utf-8"
+    )
+    report = module.summarize(module.read_events(path))
+    assert report["measurement_status"] == "incomplete"
+    assert report["log_integrity"]["invalid_lines"] == [{"line": 2, "marker": "BROWSER_POLICY_RESPONSE"}]
+    assert report["log_integrity"]["requests_without_response"] == ["jev_trace"]
+    assert report["log_integrity"]["adopted_without_execution"] == ["jev_trace"]
+
+
+def test_execution_success_is_separate_from_business_verification():
+    report = module.summarize([
+        {"event": "BROWSER_POLICY_EXECUTION", "decision_id": "jev_a", "success": True,
+         "execution_state": "acknowledged"},
+        {"event": "BROWSER_POLICY_POSTCONDITION", "decision_id": "jev_a", "postcondition": "conditions_unsatisfied"},
+    ])
+    assert report["execution_successes"] == 1
+    assert report["postconditions"] == {"conditions_unsatisfied": 1}
+    assert report["labelled_decisions"] == 0
+
+
+def test_component_timing_totals_do_not_claim_end_to_end_latency():
+    report = module.summarize([
+        {"event": "BROWSER_TIMING", "component": "observation", "elapsed_ms": 18.123456789012345},
+        {"event": "BROWSER_TIMING", "component": "guard", "elapsed_ms": 5},
+        {"event": "BROWSER_TIMING", "component": "tool_lifecycle", "elapsed_ms": 50},
+    ])
+    assert report["timings_by_component"]["observation"]["count"] == 1
+    assert report["timings_by_component"]["tool_lifecycle"]["total_ms"] == 50
+    assert "do not sum" in report["timing_note"]
