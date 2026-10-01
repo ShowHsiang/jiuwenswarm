@@ -357,7 +357,9 @@
       "chromePathPlaceholder": "For example, /Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
       "decisionLlm": "LLM only",
       "decisionShadow": "Jev shadow (observe only)",
-      "decisionHybrid": "Jev hybrid"
+      "decisionHybrid": "Jev hybrid",
+      "providerOpenrouter": "OpenRouter",
+      "providerTypesafe": "TypeSafe"
     },
     "experimental": {
       "taskAsr": "Speech transcription",
@@ -431,7 +433,20 @@
       },
       "decision_mode": {
         "title": "Browser decisions",
-        "description": "Choose who decides each browser step. Jev needs its API key configured on the server."
+        "description": "Choose who decides each browser step. Jev modes need the Jev API key below."
+      },
+      "decision_provider": {
+        "title": "Jev provider",
+        "description": "Where Jev is called: through OpenRouter, or TypeSafe directly."
+      },
+      "jev_api_key": {
+        "title": "Jev API key"
+      },
+      "jev_openrouter_api_key": {
+        "title": "OpenRouter API key"
+      },
+      "jev_typesafe_api_key": {
+        "title": "TypeSafe API key"
       },
       "model_name": { "title": "Model name", "placeholder": "e.g. glm-4.7" },
       "alias": { "title": "Custom alias", "placeholder": "e.g. GLM-4.7 Production" },

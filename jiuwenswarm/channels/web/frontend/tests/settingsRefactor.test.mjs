@@ -1431,7 +1431,13 @@ test('SettingRow exposes a business-agnostic subSettings slot for dependent rows
     'chrome_path',
     'headless',
     'decision_mode',
+    'decision_provider',
   ]);
+  assert.match(browserDefinition, /\{ value: 'openrouter', labelKey: 'settingsPanel\.browser\.providerOpenrouter' \}/);
+  assert.match(browserDefinition, /\{ value: 'typesafe', labelKey: 'settingsPanel\.browser\.providerTypesafe' \}/);
+  // The Jev key is write-only: the page shows configured/not configured and never reads the key back.
+  assert.match(browserDefinition, /component: 'custom', render: JevKeySettings/);
+  assert.match(sourceProvider, /jev_key_configured: value\?\.jev_key_configured === true/);
   for (const mode of ['llm', 'shadow', 'hybrid']) {
     assert.match(browserDefinition, new RegExp(`\{ value: '${mode}', labelKey: 'settingsPanel\.browser\.decision`));
   }

@@ -88,14 +88,19 @@ function ConfigSourceProvider({ children }: { children: ReactNode }) {
 }
 
 type BrowserDecisionMode = 'llm' | 'shadow' | 'hybrid';
+type BrowserDecisionProvider = 'openrouter' | 'typesafe';
 
 type BrowserSettingsState = {
   chrome_path: string;
   headless: boolean;
   decision_mode: BrowserDecisionMode;
+  decision_provider: BrowserDecisionProvider;
+  // Read-only: path.get reports whether the provider's key is set, never the key.
+  jev_key_configured: boolean;
 };
 
 const BROWSER_DECISION_MODES: readonly unknown[] = ['llm', 'shadow', 'hybrid'];
+const BROWSER_DECISION_PROVIDERS: readonly unknown[] = ['openrouter', 'typesafe'];
 
 function normalizeBrowserState(value: Record<string, unknown> | undefined): BrowserSettingsState {
   return {
@@ -104,6 +109,10 @@ function normalizeBrowserState(value: Record<string, unknown> | undefined): Brow
     decision_mode: BROWSER_DECISION_MODES.includes(value?.decision_mode)
       ? (value?.decision_mode as BrowserDecisionMode)
       : 'llm',
+    decision_provider: BROWSER_DECISION_PROVIDERS.includes(value?.decision_provider)
+      ? (value?.decision_provider as BrowserDecisionProvider)
+      : 'typesafe',
+    jev_key_configured: value?.jev_key_configured === true,
   };
 }
 

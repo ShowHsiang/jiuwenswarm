@@ -78,6 +78,8 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   envField('bocha_api_key', 'agent', 'text', 'BOCHA_API_KEY'),
   envField('perplexity_api_key', 'agent', 'text', 'PERPLEXITY_API_KEY'),
   envField('serper_api_key', 'agent', 'text', 'SERPER_API_KEY'),
+  envField('jev_openrouter_api_key', 'browser', 'text', 'OPENROUTER_API_KEY'),
+  envField('jev_typesafe_api_key', 'browser', 'text', 'TYPESAFE_API_KEY'),
   envField('github_token', 'agent', 'text', 'GITHUB_TOKEN'),
   envField('vision_api_base', 'agent', 'text', 'VISION_API_BASE'),
   envField('vision_api_key', 'agent', 'text', 'VISION_API_KEY'),
@@ -195,7 +197,7 @@ export const SETTINGS_OTHER_PERSISTENCE = [
     id: 'browser',
     method: 'path.set',
     persistence: 'config.yaml',
-    path: 'browser.chrome_path, browser.headless, browser.decision.mode',
+    path: 'browser.chrome_path, browser.headless, browser.decision.mode, browser.decision.provider',
   },
   {
     id: 'permissions.tools',
