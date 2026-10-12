@@ -1911,6 +1911,32 @@ test('legacy channel and More surfaces are removed while Settings owns their rep
   assert.equal(existsSync(new URL('src/features/settings/modules/models/OpenAIAccountField.tsx', root)), true);
 });
 
+test('Jev browser settings preserve mode, provider and write-only key contracts', () => {
+  const definition = source('src/features/settings/modules/browser/definition.ts');
+  const provider = source('src/features/settings/services/SettingsSourceProvider.tsx');
+  const keySettings = source('src/features/settings/modules/browser/JevKeySettings.tsx');
+  assert.deepEqual(findSettingDefinitionKeys(parseTsx('src/features/settings/modules/browser/definition.ts')), [
+    'chrome_path', 'headless', 'decision_mode', 'decision_provider',
+  ]);
+  for (const mode of ['llm', 'shadow', 'hybrid']) {
+    assert.ok(definition.includes(`value: '${mode}'`));
+  }
+  for (const name of ['openrouter', 'typesafe']) {
+    assert.ok(definition.includes(`value: '${name}'`));
+    const field = `jev_${name}_api_key`;
+    assert.deepEqual(buildConfigSavePayload({ [field]: 'synthetic-test-key' }), {
+      config: { [field]: 'synthetic-test-key' },
+    });
+    assert.deepEqual(buildConfigSavePayload({ [field]: '' }), { config: { [field]: '' } });
+    assert.ok(keySettings.includes(field));
+  }
+  assert.match(definition, /component: 'custom', render: JevKeySettings/);
+  assert.match(provider, /jev_key_configured: value\?\.jev_key_configured === true/);
+  assert.match(keySettings, /config=\{\{\}\}/);
+  assert.match(keySettings, /decision_mode: 'llm'/);
+  assert.match(keySettings, /request\('config\.save_all', buildConfigSavePayload\(updates\)/);
+});
+
 test('legacy page translations and Harness package state are removed without deleting shared Settings keys', () => {
   const supportedChannelIds = ['dingtalk', 'discord', 'feishu', 'slack', 'telegram', 'whatsapp', 'xiaoyi'];
   const expectedConfigSections = [

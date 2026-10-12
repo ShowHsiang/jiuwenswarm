@@ -30,3 +30,19 @@ def test_real_decimal_shape_and_pii_survive_both_redaction_layers(marker):
     assert "private-token-value" not in record.getMessage()
     assert "secret" not in parsed["api_key"]
     assert first == record.getMessage()
+
+
+def test_nested_credentials_keep_structure_and_mask_every_value():
+    payload = {
+        "credentials": {"primary": "private-key", "alternatives": ["backup-key"]},
+        "tokens_used": 42,
+    }
+    first = utils.mask_sensitive(json.dumps(payload))
+    parsed = json.loads(first)
+    assert isinstance(parsed["credentials"], dict)
+    assert isinstance(parsed["credentials"]["alternatives"], list)
+    assert parsed["credentials"]["primary"].startswith("******(fp:")
+    assert parsed["credentials"]["alternatives"][0].startswith("******(fp:")
+    assert "private-key" not in first and "backup-key" not in first
+    assert parsed["tokens_used"] == 42
+    assert utils.mask_sensitive(first) == first

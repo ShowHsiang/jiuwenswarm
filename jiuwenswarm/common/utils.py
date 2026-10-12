@@ -2673,26 +2673,23 @@ def _sanitize_log_text(text: str) -> str:
 
 _SAFE_AUTHORIZATION_OUTCOMES = ("allow", "deny", "block", "cancel")
 _TOKEN_COUNT_KEYS = frozenset(
-    {"input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens"}
+    {"input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens", "tokens_used"}
 )
 
 
-def _sanitize_log_value(value: Any) -> Any:
+def _sanitize_log_value(value: Any, *, mask_values: bool = False) -> Any:
     if isinstance(value, dict):
         result = {}
         for key, item in value.items():
             safe_outcome = key == "authorization_outcome" and item in _SAFE_AUTHORIZATION_OUTCOMES
             # Reuse the existing key classifier without letting quotes/escapes in
             # actual values change the matching boundaries.
-            sensitive = bool(
-                _NAMED_SENSITIVE_KV_PATTERN.fullmatch(json.dumps(str(key)) + ':"value"')
-            )
+            sensitive = mask_values or _NAMED_SENSITIVE_KEY_PATTERN.search(str(key)) is not None
             if key in _TOKEN_COUNT_KEYS and _is_plain_number(item):
                 sensitive = False
-            if sensitive and not safe_outcome:
-                result[_sanitize_plain_log_text(str(key))] = _masked_with_fp(item)
-            else:
-                result[_sanitize_plain_log_text(str(key))] = _sanitize_log_value(item)
+            result[_sanitize_plain_log_text(str(key))] = _sanitize_log_value(
+                item, mask_values=sensitive and not safe_outcome
+            )
         return result
     if isinstance(value, list):
         sanitized = []
@@ -2701,11 +2698,10 @@ def _sanitize_log_value(value: Any) -> Any:
             flag_value = isinstance(previous, str) and _CLI_FLAG_SENSITIVE_PATTERN.fullmatch(
                 previous + " value"
             )
-            if flag_value:
-                sanitized.append(_masked_with_fp(item))
-            else:
-                sanitized.append(_sanitize_log_value(item))
+            sanitized.append(_sanitize_log_value(item, mask_values=mask_values or bool(flag_value)))
         return sanitized
+    if mask_values:
+        return _masked_with_fp(value)
     if isinstance(value, str):
         return _sanitize_log_text(value)
     if _is_plain_int(value) and any(
