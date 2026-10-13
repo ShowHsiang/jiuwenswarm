@@ -4,6 +4,7 @@
 import importlib.util
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from openjiuwen.core.foundation.tool import McpServerConfig
@@ -14,6 +15,8 @@ from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
 
 from jiuwenswarm.agents.harness.common.browser_config import (
     apply_browser_decision_config,
+    browser_decision_state,
+    browser_decision_updates,
 )
 from jiuwenswarm.agents.swarm.context import SwarmBuildContext
 from jiuwenswarm.agents.swarm.providers import code_subagents
@@ -54,9 +57,36 @@ def test_defaults_keep_existing_settings_identity(settings, config):
     assert spec.factory_kwargs["settings"] is settings
 
 
+@pytest.mark.parametrize("mode", ["LLM", " llm ", "typo", "HYBRID", "", None, 1, ["hybrid"]])
+def test_unrecognized_mode_matches_llm_settings_view(settings, mode, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr("jiuwenswarm.agents.harness.common.browser_config.logger.warning", warning)
+    config = {"browser": {"decision": {"mode": mode}}}
+    spec = SimpleNamespace(factory_kwargs={"settings": settings})
+    assert browser_decision_state(config)["decision_mode"] == "llm"
+    assert apply_browser_decision_config(spec, config) is spec
+    assert spec.factory_kwargs["settings"] is settings
+    warning.assert_called_once_with("browser.decision.mode is unrecognized; using llm")
+
+
+@pytest.mark.parametrize("mode", ["LLM", " llm ", "typo", None])
+def test_llm_save_repairs_unrecognized_saved_mode_without_jev(mode, monkeypatch):
+    monkeypatch.setitem(sys.modules, _JEV_MODULE, None)
+    config = {"browser": {"decision": {"mode": mode, "unknown_option": 1}}}
+    assert browser_decision_updates("llm", None, config) == ({"mode": "llm"}, None)
+    assert browser_decision_updates(None, None, config) == ({}, None)
+    assert config["browser"]["decision"]["mode"] == mode
+
+
+def test_llm_save_keeps_a_valid_environment_reference(monkeypatch):
+    monkeypatch.setenv("TEST_JEV_SAVED_MODE", "llm")
+    config = {"browser": {"decision": {"mode": "${TEST_JEV_SAVED_MODE}"}}}
+    assert browser_decision_updates("llm", None, config) == ({}, None)
+
+
 @requires_jev
-@pytest.mark.parametrize("mode", ["llm", "${TEST_JEV_DISABLED_MODE}"])
-def test_explicit_llm_disables_policy_when_reusing_a_spec(settings, monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["llm", "${TEST_JEV_DISABLED_MODE}", "LLM", " llm ", "typo"])
+def test_llm_mode_or_fallback_disables_policy_when_reusing_a_spec(settings, monkeypatch, mode):
     monkeypatch.setenv("TEST_JEV_DISABLED_MODE", "llm")
     spec = SimpleNamespace(factory_kwargs={"settings": settings})
     apply_browser_decision_config(spec, {"browser": {"decision": {"mode": "hybrid"}}})
@@ -160,17 +190,20 @@ def test_policy_config_preserves_runtime_and_credential_reference(
     "raw",
     [
         "hybrid",
-        pytest.param({"mode": "bad"}, marks=requires_jev),
         pytest.param({"mode": "hybrid", "max_retries": 9}, marks=requires_jev),
         pytest.param({"mode": "hybrid", "api_base": "http://example.test"}, marks=requires_jev),
+        pytest.param({"mode": "hybrid", "candidate_limti": 12}, marks=requires_jev),
+        pytest.param({"mode": "shadow", "candidate_limti": 12}, marks=requires_jev),
     ],
 )
 def test_invalid_configuration_is_explicit(settings, raw):
-    with pytest.raises(ValueError):
+    spec = SimpleNamespace(factory_kwargs={"settings": settings})
+    with pytest.raises(ValueError, match=r"browser\.decision"):
         apply_browser_decision_config(
-            SimpleNamespace(factory_kwargs={"settings": settings}),
+            spec,
             {"browser": {"decision": raw}},
         )
+    assert spec.factory_kwargs["settings"] is settings
 
 
 @requires_jev

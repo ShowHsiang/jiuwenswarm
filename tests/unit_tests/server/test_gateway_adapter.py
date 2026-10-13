@@ -1380,6 +1380,16 @@ async def test_config_adapter_switches_back_to_llm_without_a_key(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["LLM", " llm ", "typo"])
+async def test_config_adapter_repairs_unrecognized_saved_decision_mode(monkeypatch, mode) -> None:
+    writes = _browser_writes(monkeypatch, {"browser": {"decision": {"mode": mode}}})
+    response = await ConfigAdapter().handle(_set(decision_mode="llm"))
+    assert response.ok is True
+    assert response.payload["decision_mode"] == "llm"
+    assert writes == [_BROWSER, ("decision", {"mode": "llm"})]
+
+
+@pytest.mark.asyncio
 async def test_config_adapter_unrelated_save_works_while_the_jev_key_is_missing(monkeypatch) -> None:
     """The page resends its whole state; changing the Chrome path must not trip the Jev check."""
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)

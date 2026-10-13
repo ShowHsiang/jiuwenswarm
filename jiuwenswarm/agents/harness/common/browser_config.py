@@ -77,12 +77,14 @@ def browser_decision_updates(
         return {}, "decision_provider must be openrouter or typesafe"
     # The page sends its whole state on every save; only real changes are checked, so an
     # unrelated save (e.g. the Chrome path) still works while a Jev key is missing.
+    section = _decision_section(config)
     updates: dict[str, Any] = {}
-    if mode is not None and mode != browser_decision_mode(config):
+    # Compare with the saved value so selecting llm can also repair an invalid mode.
+    if mode is not None and mode != section.get("mode", "llm"):
         updates["mode"] = mode
     if provider is not None and provider != browser_decision_provider(config):
         updates.update({"provider": provider, **JEV_PROVIDER_DEFAULTS[provider]})
-    section = {**_decision_section(config), **updates}
+    section = {**section, **updates}
     if not updates or section.get("mode", "llm") == "llm":
         return updates, None
     try:
@@ -99,7 +101,11 @@ def browser_decision_updates(
 
 
 def apply_browser_decision_config(spec: Any, config: dict[str, Any] | None) -> Any:
-    """Apply the same optional policy to deep/code/swarm without rebuilding settings."""
+    """Apply optional policy without rebuilding runtime/security settings.
+
+    Unknown saved modes follow the UI's llm fallback. Explicit Jev modes still
+    require valid SDK configuration instead of silently disabling the policy.
+    """
     browser = config.get("browser", {}) if isinstance(config, dict) else {}
     raw = browser.get("decision", {}) if isinstance(browser, dict) else {}
     if raw is None:
@@ -109,7 +115,9 @@ def apply_browser_decision_config(spec: Any, config: dict[str, Any] | None) -> A
     if not raw:
         return spec
     resolved = resolve_env_vars(raw)
-    if resolved.get("mode", "llm") == "llm":
+    if browser_decision_mode(config) == "llm":
+        if resolved.get("mode", "llm") != "llm":
+            logger.warning("browser.decision.mode is unrecognized; using llm")
         kwargs = dict(spec.factory_kwargs or {})
         settings = kwargs.get("settings")
         previous = getattr(settings, "decision", None)
@@ -129,7 +137,10 @@ def apply_browser_decision_config(spec: Any, config: dict[str, Any] | None) -> A
         )
         return spec
 
-    decision = BrowserDecisionConfig(**resolved)
+    try:
+        decision = BrowserDecisionConfig(**resolved)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"browser.decision is invalid: {exc}") from exc
     kwargs = dict(spec.factory_kwargs or {})
     settings = kwargs.get("settings")
     if settings is None:
