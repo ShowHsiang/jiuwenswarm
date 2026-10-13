@@ -120,6 +120,20 @@ def test_openrouter_hybrid_config_uses_existing_credential_reference(settings):
     assert spec.factory_kwargs["settings"].mcp_cfg is settings.mcp_cfg
 
 
+@requires_jev
+@pytest.mark.parametrize("provider", ["openrouter", "typesafe"])
+def test_separate_head_thresholds_reach_browser_runtime(settings, provider):
+    spec = SimpleNamespace(factory_kwargs={"settings": settings})
+    apply_browser_decision_config(spec, {"browser": {"decision": {
+        "mode": "hybrid", "provider": provider,
+        "action_min_confidence": 0.50, "target_min_confidence": 0.60,
+    }}})
+    configured = spec.factory_kwargs["settings"]
+    assert configured.decision.action_threshold == 0.50
+    assert configured.decision.target_threshold == 0.60
+    assert configured.mcp_cfg is settings.mcp_cfg and configured.guardrails is settings.guardrails
+
+
 def test_shipped_template_is_llm_only_and_embeds_no_credential(settings):
     # Jev is opt-in: a fresh install must work on an openjiuwen without Jev.
     from pathlib import Path
@@ -132,6 +146,7 @@ def test_shipped_template_is_llm_only_and_embeds_no_credential(settings):
     )
     raw = config["browser"]["decision"]
     assert "api_key" not in raw
+    assert raw["action_min_confidence"] == 0.50 and raw["target_min_confidence"] == 0.60
     assert (raw["mode"], raw["provider"], raw["api_key_env"]) == (
         "llm",
         "openrouter",
