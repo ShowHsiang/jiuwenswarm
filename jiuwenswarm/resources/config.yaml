@@ -1419,9 +1419,7 @@ browser:
     max_retries: 1
     max_decisions: 40 # Shared across LLM handoffs and focused resume in the same task.
     candidate_limit: 30 # Eligible controls, filtered and ranked before truncation.
-    action_min_confidence: 0.50 # Operation choice; equality passes.
-    target_min_confidence: 0.60 # Selected target/value; independent of the operation threshold.
-    # Legacy min_confidence is still accepted for heads without an explicit override.
+    min_confidence: 0.55 # Initial routing threshold; calibrate on your own tasks.
     fallback_reserve_ms: 1000
   # chrome_path can be a string or per-OS map.
   # Example:
