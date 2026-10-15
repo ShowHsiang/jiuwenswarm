@@ -681,6 +681,10 @@ class WebChannel(BaseWsChannel):
         import uvicorn
 
         from jiuwenswarm.common.ws_limits import WEB_WS_MAX_MESSAGE_BYTES
+        from jiuwenswarm.gateway.channel_manager.web.transport_stall_guard import (
+            guarded_http_protocol,
+            guarded_websockets_protocol,
+        )
         from jiuwenswarm.gateway.channel_manager.web.web_channel_app import build_web_channel_app
 
         app = build_web_channel_app(self)
@@ -693,6 +697,11 @@ class WebChannel(BaseWsChannel):
             ws_max_size=WEB_WS_MAX_MESSAGE_BYTES,
             ws_ping_interval=20.0,
             ws_ping_timeout=60.0,
+            # 停止读取的客户端会让 transport 写缓冲滞留，close() 永远等不到排空，
+            # socket 永久卡在 CLOSE-WAIT（issue #4946）；带看门狗的协议类在写停滞
+            # 超时后直接 abort，释放 fd 与缓冲。
+            http=guarded_http_protocol(),
+            ws=guarded_websockets_protocol(),
         )
         self._uvicorn_server = uvicorn.Server(uv_cfg)
         self._running = True
@@ -1059,6 +1068,11 @@ class WebChannel(BaseWsChannel):
                 ws = self._ws_by_id.get(request_ws_id)
                 if ws is not None and not getattr(ws, "closed", False):
                     ws_set.add(ws)
+                elif routing_target is None:
+                    # res 与发起请求的连接一一对应（request_id 唯一）；发起连接
+                    # 断开后 session 桶里的其他连接不可能匹配该 id，改投只会串扰。
+                    self._log_orphan_request_drop(msg, request_ws_id)
+                    return
 
             if not ws_set and routing_target is not None:
                 delivery = routing_target.delivery
@@ -1144,6 +1158,14 @@ class WebChannel(BaseWsChannel):
             ws = self._ws_by_id.get(request_ws_id)
             if ws is not None and not getattr(ws, "closed", False):
                 ws_set.add(ws)
+            elif routing_target is None:
+                # 发起该请求的物理连接已断开（unregister_ws 已摘除 ws_id 映射，
+                # 重连必换新 ws_id）：这是在途流的迟到事件。落入 session 桶会投给
+                # 同 session 的新连接，被当作新请求的回复消费，造成跨请求串扰。
+                # 丢弃；重连方通过 history 拉取补齐。team fan_out（带
+                # routing_target）V2 未命中后的回退保留原语义。
+                self._log_orphan_request_drop(msg, request_ws_id)
+                return
 
         if not ws_set and not msg.session_id:
             logger.warning(
@@ -1159,7 +1181,7 @@ class WebChannel(BaseWsChannel):
                         if not getattr(w, "closed", False):
                             ws_set.add(w)
         if not ws_set:
-            logger.debug(
+            logger.info(
                 "[WebChannel] session_id=%s has no connected ws, dropping msg id=%s ws_id=%s",
                 msg.session_id, getattr(msg, "id", ""), request_ws_id,
             )
@@ -1234,6 +1256,22 @@ class WebChannel(BaseWsChannel):
                 if owner_matched:
                     clients.add(ws)
         return clients
+
+    @staticmethod
+    def _log_orphan_request_drop(msg: Message, request_ws_id: str) -> None:
+        """记录孤儿请求事件的丢弃（RC-3）：发起连接已断，事件不再改投 session 桶。"""
+        event_name = str(getattr(getattr(msg, "event_type", None), "value", "") or "")
+        if not event_name:
+            event_name = str(getattr(msg, "type", "") or "")
+        log = logger.info if event_name in ("chat.final", "chat.error") else logger.debug
+        log(
+            "[WebChannel] orphan request event dropped: originating ws gone"
+            " ws_id=%s session_id=%s event=%s id=%s",
+            request_ws_id,
+            getattr(msg, "session_id", None),
+            event_name,
+            getattr(msg, "id", ""),
+        )
 
     def _track_session_busy(self, msg: Message) -> None:
         """在所有路由分支之前维护 session busy 映射(供 /ws/git 写操作查询)。
@@ -1382,12 +1420,28 @@ class WebChannel(BaseWsChannel):
                     ),
                 )
 
+        def _on_message_task_done(task: asyncio.Task) -> None:
+            # Retrieve the exception so crashes are logged instead of silently
+            # dropped ("Task exception was never retrieved"); issue #4876's
+            # "no res and no event" symptom was exactly such a silent drop.
+            inflight.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "WebChannel message handler crashed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=exc,
+                )
+
         try:
             inflight: set[Any] = set()
             async for raw in ws:
                 task = asyncio.create_task(self._handle_raw_message(ws, raw, query))
                 inflight.add(task)
-                task.add_done_callback(inflight.discard)
+                task.add_done_callback(_on_message_task_done)
             # connection closing: let in-flight handlers finish (bounded) to avoid
             # truncating responses mid-flight; cancel if they exceed a grace period.
             if inflight:
@@ -1572,6 +1626,21 @@ class WebChannel(BaseWsChannel):
             return
         if not isinstance(params, dict):
             params = {}
+
+        # Issue #4876: non-string params.mode / params.agent_id (list / dict / ...)
+        # used to flow into AgentRef -> RoutingKey and blow up on hash() inside
+        # register_ws. The crash escaped the per-message task, so the client got
+        # no res and no event. Reject them up front so a response is guaranteed.
+        for _key in ("mode", "agent_id"):
+            if _key in params and not isinstance(params[_key], str):
+                await self.send_response(
+                    ws,
+                    req_id,
+                    ok=False,
+                    error=f"params.{_key} must be a string",
+                    code="BAD_REQUEST",
+                )
+                return
 
         # ── V2: session_id 解析 ──
         # 请求自带 session_id（如 chat.send）→ 用它更新 ws 路由注册。

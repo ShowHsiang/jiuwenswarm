@@ -18,6 +18,7 @@ import {
   Image as ImageIcon,
   Info,
   LoaderCircle,
+  Megaphone,
   PanelBottomClose,
   PanelBottomOpen,
   Presentation,
@@ -41,6 +42,7 @@ import {
 } from '../../types';
 import type { HumanShareCommand } from '../../stores/sessionStore';
 import type { AgentGroupIdentity } from '../../features/agentManagement';
+import { useAgentGroupVisualIdentity } from '../../features/agentManagement/useAgentGroupAvatars';
 import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
 import { InputArea, type InputAreaHandle } from './InputArea';
@@ -85,9 +87,10 @@ import {
   type LocalFilePick,
 } from '../../features/workspace/localFilePicker';
 import { useDesktopLocalFilePickerReady, useWelcomeBubblePosition } from '../../hooks';
-import { ApplicationPluginTaskRuntimes } from '../../applicationPlugins/ApplicationPluginOutlet';
+import { ApplicationPluginTaskRuntimes, flushApplicationConversationHistory } from '../../applicationPlugins/ApplicationPluginOutlet';
 import { generateUuidV4 } from '../../utils/uuid';
 import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
+import { requestLogin, useAuthStore } from '../../stores/authStore';
 
 export interface ChatHistoryPagerProps {
   loadedBatchSeq: number;
@@ -290,6 +293,9 @@ export function AgentActivityCard({
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
   const taskQueue = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.taskQueue ?? []);
   const queuedSessionMessages = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuedSessionMessages ?? []);
+  const canContinueQueuedSessionMessages = useChatStore(
+    (s) => s.runtimes[activeSessionId ?? '']?.canContinueQueuedSessionMessages ?? false
+  );
   const queuePaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuePaused ?? false);
   const removeFromTaskQueue = useChatStore((s) => s.removeFromTaskQueue);
   const reorderTaskQueue = useChatStore((s) => s.reorderTaskQueue);
@@ -297,6 +303,7 @@ export function AgentActivityCard({
   const setInputValue = useChatStore((s) => s.setInputValue);
 
   const isAgentMode = mode === 'agent';
+  const visibleTaskQueue = isAgentMode ? taskQueue : [];
 
   // 有等待任务时自动展开
   useEffect(() => {
@@ -320,7 +327,7 @@ export function AgentActivityCard({
     };
   }, [dragIndex]);
 
-  if (!isAgentMode || (taskQueue.length === 0 && queuedSessionMessages.length === 0)) {
+  if (visibleTaskQueue.length === 0 && queuedSessionMessages.length === 0) {
     return null;
   }
 
@@ -482,14 +489,16 @@ export function AgentActivityCard({
             {queuedSessionMessages.length > 0 && (
               <div className="team-event-group-row team-event-group-row--activity" data-testid="chat-panel-cross-session-queue-section">
                 <span>{t('chatUi.crossSessionMessageQueue')}</span>
-                <button
-                  type="button"
-                  data-testid="chat-panel-cross-session-queue-resume"
-                  onClick={handleContinueQueuedSessionMessages}
-                  style={{ marginLeft: 'auto', border: 0, background: 'transparent', color: 'var(--color-text-primary)', cursor: 'pointer' }}
-                >
-                  {t('chat.resume')}
-                </button>
+                {canContinueQueuedSessionMessages && (
+                  <button
+                    type="button"
+                    data-testid="chat-panel-cross-session-queue-resume"
+                    onClick={handleContinueQueuedSessionMessages}
+                    style={{ marginLeft: 'auto', border: 0, background: 'transparent', color: 'var(--color-text-primary)', cursor: 'pointer' }}
+                  >
+                    {t('chat.resume')}
+                  </button>
+                )}
               </div>
             )}
             {queuedSessionMessages.map((message) => (
@@ -516,7 +525,7 @@ export function AgentActivityCard({
                 </span>
               </div>
             ))}
-            {queuedSessionMessages.length > 0 && taskQueue.length > 0 && (
+            {queuedSessionMessages.length > 0 && visibleTaskQueue.length > 0 && (
               <div className="team-event-group-row team-event-group-row--activity" data-testid="chat-panel-task-queue-local-section" style={{ alignItems: 'center' }}>
                 <span>{t('chatUi.localMessageQueue')}</span>
                 {queuePaused && (
@@ -529,7 +538,7 @@ export function AgentActivityCard({
                 )}
               </div>
             )}
-            {taskQueue.map((task, index) => (
+            {visibleTaskQueue.map((task, index) => (
               <div
                 key={task.id}
                 className="team-event-group-row team-event-group-row--activity"
@@ -1092,7 +1101,12 @@ export const ChatPanel = React.memo(function ChatPanel({
   const contextCompressionRuntime = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.contextCompressionRuntime);
   const contextCompressionSummary = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.contextCompressionSummary);
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
-  const [teamGroupIdentity, setTeamGroupIdentity] = useState<AgentGroupIdentity | null>(null);
+  const [pickedGroupIdentity, setTeamGroupIdentity] = useState<AgentGroupIdentity | null>(null);
+  // 输入框的专家团列表是异步的，切会话后到达前 Leader 头像会退成首字母；已绑定的会话
+  // 直接用缓存的专家团身份兜底，列表到了再以它为准。
+  const boundGroupId = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.agentGroupBinding ?? null);
+  const boundGroupIdentity = useAgentGroupVisualIdentity(boundGroupId)?.identity ?? null;
+  const teamGroupIdentity = pickedGroupIdentity ?? boundGroupIdentity;
   const [agentGroupDeletedNoticeOpen, setAgentGroupDeletedNoticeOpen] = useState(false);
   useEffect(() => {
     setTeamGroupIdentity(null);
@@ -1181,15 +1195,18 @@ export const ChatPanel = React.memo(function ChatPanel({
   const shouldShowShareExport = Boolean(onExportShare);
   const shouldShowHumanShare = mode === 'team' && teamHumanShareCommands.length > 0;
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
+  const isAuthorized = useAuthStore((state) => state.islogin);
   const [bubbleVisible, setBubbleVisible] = useState(false);
+  const [freeModelsPromptDismissed, setFreeModelsPromptDismissed] = useState(false);
   const bubbleHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleBubbleShow = useCallback(() => {
+    if (!isAuthorized && freeModelsPromptDismissed) return;
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
       bubbleHideTimerRef.current = null;
     }
     setBubbleVisible(true);
-  }, []);
+  }, [freeModelsPromptDismissed, isAuthorized]);
   const handleBubbleLeave = useCallback(() => {
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
@@ -1198,6 +1215,14 @@ export const ChatPanel = React.memo(function ChatPanel({
       bubbleHideTimerRef.current = null;
       setBubbleVisible(false);
     }, WELCOME_BUBBLE_HIDE_DELAY);
+  }, []);
+  const handleFreeModelsPromptClose = useCallback(() => {
+    if (bubbleHideTimerRef.current) {
+      clearTimeout(bubbleHideTimerRef.current);
+      bubbleHideTimerRef.current = null;
+    }
+    setFreeModelsPromptDismissed(true);
+    setBubbleVisible(false);
   }, []);
   useEffect(() => {
     return () => {
@@ -1645,11 +1670,12 @@ export const ChatPanel = React.memo(function ChatPanel({
 
   // 包装发送消息函数，添加滚动逻辑
   const handleSendMessage = useCallback(
-    (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => {
+    async (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions) => {
+      if (activeSessionId) await flushApplicationConversationHistory(activeSessionId);
       setIsSending(true);
       onSendMessage(content, mediaItems, options);
     },
-    [onSendMessage],
+    [activeSessionId, onSendMessage],
   );
 
   // 当发送消息时强制滚动到底部
@@ -2001,10 +2027,41 @@ export const ChatPanel = React.memo(function ChatPanel({
                   <>
                     <div
                       ref={bubbleRef}
-                      className={`chat-welcome__banner chat-welcome__banner--bubble${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
+                      className={`chat-welcome__banner chat-welcome__banner--bubble${!isAuthorized ? ' chat-welcome__banner--bubble--campaign' : ''}${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
                       data-testid="chat-panel-welcome-banner-bubble"
+                      onMouseEnter={handleBubbleShow}
+                      onMouseLeave={handleBubbleLeave}
                     >
-                      {t('chat.welcomeBubbleText')}
+                      {isAuthorized ? (
+                        t('chat.welcomeBubbleText')
+                      ) : (
+                        <>
+                          <div className="chat-welcome__campaign-heading">
+                            <span>
+                              <Megaphone aria-hidden />
+                              {t('chat.freeModelsCampaign.title')}
+                            </span>
+                            <button
+                              type="button"
+                              className="chat-welcome__campaign-close"
+                              onClick={handleFreeModelsPromptClose}
+                              aria-label={t('common.close')}
+                              title={t('common.close')}
+                            >
+                              <X aria-hidden />
+                            </button>
+                          </div>
+                          <p>{t('chat.freeModelsCampaign.description')}</p>
+                          <button
+                            type="button"
+                            className="chat-welcome__campaign-claim"
+                            onClick={() => requestLogin()}
+                            data-testid="chat-panel-free-models-claim"
+                          >
+                            {t('chat.freeModelsCampaign.claim')}
+                          </button>
+                        </>
+                      )}
                     </div>
                     <BeeBanner
                       className="chat-welcome__banner chat-welcome__banner--bee"

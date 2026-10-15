@@ -5,8 +5,6 @@ import {
   ExternalCliSettingsItem,
   ProactiveLimitsSetting,
   RSISetting,
-  TaskAsrSetting,
-  TaskFullDuplexSetting,
   TrajectoryUiSetting,
 } from './ExperimentalSettings';
 import { A4PSettings } from './A4PSettings';
@@ -17,16 +15,6 @@ export const experimentalModule: SettingsModuleDefinition = {
   icon: settingsNavigationIcons.experimental,
   source: 'config',
   sections: [
-    {
-      id: 'asr',
-      titleKey: 'settingsPanel.experimental.taskAsr',
-      items: [{ id: 'task-asr-enabled', component: 'custom', render: TaskAsrSetting }],
-    },
-    {
-      id: 'task-full-duplex',
-      titleKey: 'settingsPanel.experimental.taskFullDuplex',
-      items: [{ id: 'task-full-duplex-enabled', component: 'custom', render: TaskFullDuplexSetting }],
-    },
     {
       id: 'external-cli-agents',
       titleKey: 'settingsPanel.experimental.externalCliAgents',
@@ -79,6 +67,25 @@ export const experimentalModule: SettingsModuleDefinition = {
       id: 'team-organization',
       titleKey: 'settingsPanel.experimental.teamOrganization',
       items: [{ id: 'team-organization-ui-enabled', component: 'switch', key: 'team_organization_ui_enabled' }],
+    },
+    {
+      id: 'team-scheduled-dispatch',
+      titleKey: 'settingsPanel.experimental.teamScheduledDispatch',
+      items: [
+        {
+          id: 'team-scheduled-dispatch-enabled',
+          component: 'switch',
+          key: 'team_scheduled_dispatch_enabled',
+          subItems: {
+            show: 'always',
+            disabled: 'when-parent-unchecked',
+            uncheckWithParent: true,
+            items: [
+              { id: 'team-task-verification-enabled', component: 'switch', key: 'team_task_verification_enabled' },
+            ],
+          },
+        },
+      ],
     },
     {
       id: 'proactive-recommendation',

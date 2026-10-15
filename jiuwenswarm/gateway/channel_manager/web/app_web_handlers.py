@@ -85,7 +85,6 @@ from jiuwenswarm.common.config_panel.config_set_handlers import (  # noqa: F401 
     team_item_requests_codex as _team_item_requests_codex,
     team_payload_requests_codex as _team_payload_requests_codex,
 )
-from jiuwenswarm.common.model_catalog import ModelCatalog
 from jiuwenswarm.common.config_panel.models_handlers import (  # noqa: F401  — 兼容别名
     reasoning_level_display as _reasoning_level_display,
     normalize_provider_value as _normalize_provider_value,
@@ -115,8 +114,7 @@ for _jiuwen_log in LogManager.get_all_loggers().values():
 logger = logging.getLogger(__name__)
 
 
-_CODEX_DEPENDENCY_INSTALL_LOCK = threading.Lock()
-_CODEX_DEPENDENCY_INSTALL_STATUS: dict[str, Any] = {
+_EXTERNAL_CLI_DEPENDENCY_INSTALL_IDLE_STATUS: dict[str, Any] = {
     "status": "idle",
     "phase": "idle",
     "progress_kind": "",
@@ -138,18 +136,23 @@ _CODEX_DEPENDENCY_INSTALL_STATUS: dict[str, Any] = {
     "download_max_attempts": 0,
     "switching_source": False,
 }
+_CODEX_DEPENDENCY_INSTALL_LOCK = threading.Lock()
+_CODEX_DEPENDENCY_INSTALL_STATUS: dict[str, Any] = dict(_EXTERNAL_CLI_DEPENDENCY_INSTALL_IDLE_STATUS)
 _CODEX_DEPENDENCY_INSTALL_LOG_TAIL_LIMIT = 8
 _OPTIONAL_DEPENDENCY_INSTALL_TIMEOUT_SECONDS = 60 * 60
 _CLAUDE_DEPENDENCY_INSTALL_LOCK = threading.Lock()
-_CLAUDE_DEPENDENCY_INSTALL_STATUS: dict[str, Any] = dict(_CODEX_DEPENDENCY_INSTALL_STATUS)
-_EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS = {
+_CLAUDE_DEPENDENCY_INSTALL_STATUS: dict[str, Any] = dict(_EXTERNAL_CLI_DEPENDENCY_INSTALL_IDLE_STATUS)
+# Claude and Codex are always present; other managed runtimes (third-party
+# harness providers) get their lock and status the first time they are used.
+_EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS: dict[str, threading.Lock] = {
     "claude": _CLAUDE_DEPENDENCY_INSTALL_LOCK,
     "codex": _CODEX_DEPENDENCY_INSTALL_LOCK,
 }
-_EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES = {
+_EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES: dict[str, dict[str, Any]] = {
     "claude": _CLAUDE_DEPENDENCY_INSTALL_STATUS,
     "codex": _CODEX_DEPENDENCY_INSTALL_STATUS,
 }
+_EXTERNAL_CLI_DEPENDENCY_INSTALL_REGISTRY_LOCK = threading.Lock()
 
 
 _PROJECT_ROOT = get_root_dir()
@@ -402,6 +405,8 @@ class _DummyBus:
 
 # 仅转发到 Agent 的 Web method
 _FORWARD_REQ_METHODS = frozenset({
+    "group.create", "group.delete", "group.list", "group.get", "group.update",
+    "group.member.add", "group.history.get",
     "initialize",
     "session.switch",
     "session.fork",
@@ -593,6 +598,8 @@ _FORWARD_REQ_METHODS = frozenset({
 })
 
 _FORWARD_NO_LOCAL_HANDLER_METHODS = frozenset({
+    "group.create", "group.delete", "group.list", "group.get", "group.update",
+    "group.member.add", "group.history.get",
     "initialize",
     "session.switch",
     "session.fork",
@@ -806,9 +813,21 @@ def _validate_wechat_numeric_params(params: dict) -> str | None:
     return None
 
 
+def _external_cli_dependency_install_state(cli_agent: str) -> tuple[threading.Lock, dict[str, Any]]:
+    """Return the install lock and status of ``cli_agent``, creating idle ones on first use."""
+    with _EXTERNAL_CLI_DEPENDENCY_INSTALL_REGISTRY_LOCK:
+        lock = _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS.get(cli_agent)
+        status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES.get(cli_agent)
+        if lock is None or status is None:
+            lock = threading.Lock()
+            status = dict(_EXTERNAL_CLI_DEPENDENCY_INSTALL_IDLE_STATUS)
+            _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS[cli_agent] = lock
+            _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent] = status
+        return lock, status
+
+
 def _snapshot_external_cli_dependency_install_status(cli_agent: str) -> dict[str, Any]:
-    lock = _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS[cli_agent]
-    status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent]
+    lock, status = _external_cli_dependency_install_state(cli_agent)
     with lock:
         result = dict(status)
         result["cli_agent"] = cli_agent
@@ -817,8 +836,7 @@ def _snapshot_external_cli_dependency_install_status(cli_agent: str) -> dict[str
 
 
 def _update_external_cli_dependency_install_status(cli_agent: str, updates: dict[str, Any]) -> None:
-    lock = _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS[cli_agent]
-    status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent]
+    lock, status = _external_cli_dependency_install_state(cli_agent)
     with lock:
         status.update(updates)
         status["updated_at"] = time.time()
@@ -849,8 +867,7 @@ def _append_external_cli_dependency_install_log(cli_agent: str, line: str) -> No
     stripped = line.strip()
     if not stripped:
         return
-    lock = _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS[cli_agent]
-    status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent]
+    lock, status = _external_cli_dependency_install_state(cli_agent)
     with lock:
         log_tail = list(status.get("log_tail") or [])
         log_tail.append(stripped)
@@ -940,7 +957,7 @@ def _is_frozen_runtime() -> bool:
 
 
 def _snapshot_external_cli_dependency_install_status_unlocked(cli_agent: str) -> dict[str, Any]:
-    status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent]
+    _lock, status = _external_cli_dependency_install_state(cli_agent)
     result = dict(status)
     result["cli_agent"] = cli_agent
     result["log_tail"] = list(result.get("log_tail") or [])
@@ -948,8 +965,7 @@ def _snapshot_external_cli_dependency_install_status_unlocked(cli_agent: str) ->
 
 
 def _ensure_managed_external_cli_runtime_or_start_install(cli_agent: str) -> dict[str, Any]:
-    lock = _EXTERNAL_CLI_DEPENDENCY_INSTALL_LOCKS[cli_agent]
-    status = _EXTERNAL_CLI_DEPENDENCY_INSTALL_STATUSES[cli_agent]
+    lock, status = _external_cli_dependency_install_state(cli_agent)
     with lock:
         if status.get("status") == "running":
             return _snapshot_external_cli_dependency_install_status_unlocked(cli_agent)
@@ -996,11 +1012,9 @@ def _run_managed_external_cli_runtime_install(cli_agent: str) -> None:
             log_callback=lambda line: _append_external_cli_dependency_install_log(cli_agent, line),
             progress_callback=lambda progress: _update_external_cli_dependency_install_status(cli_agent, progress),
         )
+        # The installer already verified the runtime's modules and provider
+        # entry point against the activated paths.
         activate_external_cli_runtime_paths()
-        importlib.invalidate_caches()
-        required_module = "claude_agent_sdk" if cli_agent == "claude" else "openai_codex"
-        if importlib.util.find_spec(required_module) is None:
-            raise RuntimeError(f"{required_module} is still unavailable after installation")
     except Exception as exc:  # noqa: BLE001
         logger.warning("[config.set] %s managed runtime installation failed: %s", cli_agent, exc)
         _append_external_cli_dependency_install_log(cli_agent, str(exc))
@@ -1021,6 +1035,70 @@ def _run_managed_external_cli_runtime_install(cli_agent: str) -> None:
         cli_agent,
         _external_cli_dependency_install_succeeded_updates(),
     )
+
+
+def _known_external_cli_agents() -> tuple[str, ...]:
+    """Return Claude, Codex and every runtime the managed-runtime manifest describes."""
+    from jiuwenswarm.common.external_cli_runtime import external_cli_runtime_names
+
+    try:
+        managed = external_cli_runtime_names()
+    except RuntimeError as exc:
+        logger.warning("[external-cli] managed runtime manifest is unavailable: %s", exc)
+        managed = ()
+    return tuple(dict.fromkeys(("claude", "codex", *managed)))
+
+
+def _managed_external_cli_runtime_status(cli_agent: str) -> dict[str, Any]:
+    """Describe the installed managed runtime; failures become an ``unavailable`` state."""
+    from jiuwenswarm.common.external_cli_runtime import get_external_cli_runtime_status
+
+    try:
+        return get_external_cli_runtime_status(cli_agent)
+    except (RuntimeError, ValueError) as exc:
+        return {"runtime_state": "unavailable", "managed": True, "error": str(exc)}
+
+
+def _install_managed_external_cli_runtime_if_needed(cli_agent: str) -> dict[str, Any]:
+    """Start a managed runtime install unless the current one is already installed.
+
+    Returns:
+        The install status snapshot, with the managed runtime state under ``runtime``.
+    """
+    runtime = _managed_external_cli_runtime_status(cli_agent)
+    if runtime.get("runtime_state") == "current":
+        _update_external_cli_dependency_install_status(cli_agent, _external_cli_dependency_install_succeeded_updates())
+        payload = _snapshot_external_cli_dependency_install_status(cli_agent)
+    else:
+        payload = _ensure_managed_external_cli_runtime_or_start_install(cli_agent)
+    payload["runtime"] = runtime
+    return payload
+
+
+def _remove_custom_external_cli_agent(cli_agent: str) -> None:
+    """Drop a custom agent from the team configuration, then uninstall it.
+
+    The configuration goes first: it may only name installed agents.
+
+    Raises:
+        ValueError: When ``cli_agent`` is not an installed custom agent.
+    """
+    from jiuwenswarm.common.config import EXTERNAL_CLI_AGENTS_CONFIG_PATH, update_external_cli_agents_in_config
+    from jiuwenswarm.common.config_panel.config_set_handlers import get_nested_config_value
+    from jiuwenswarm.common.custom_agent_runtime import get_custom_agent, remove_custom_agent
+
+    if get_custom_agent(cli_agent) is None:
+        raise ValueError(f"custom agent not found: {cli_agent}")
+    configured = get_nested_config_value(get_config_raw(), EXTERNAL_CLI_AGENTS_CONFIG_PATH, [])
+    if isinstance(configured, list):
+        remaining = [
+            item
+            for item in configured
+            if not (isinstance(item, dict) and item.get("cli_agent") == cli_agent) and item != cli_agent
+        ]
+        if len(remaining) != len(configured):
+            update_external_cli_agents_in_config(remaining, _build_external_cli_publish_url())
+    remove_custom_agent(cli_agent)
 
 
 def _snapshot_codex_dependency_install_status() -> dict[str, Any]:
@@ -2106,17 +2184,43 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
     async def _external_cli_install_status(ws, req_id, params, session_id):
         cli_agent = str((params or {}).get("cli_agent") or "").strip().lower()
-        if cli_agent == "claude":
-            payload = _snapshot_claude_dependency_install_status()
-        elif cli_agent == "codex":
-            payload = _snapshot_codex_dependency_install_status()
-            payload["cli_agent"] = "codex"
-        else:
+        if cli_agent not in _known_external_cli_agents():
             await channel.send_response(
                 ws, req_id, ok=False, error="unsupported external cli agent", code="BAD_REQUEST"
             )
             return
+        payload = _snapshot_external_cli_dependency_install_status(cli_agent)
+        if _is_frozen_runtime():
+            payload["runtime"] = _managed_external_cli_runtime_status(cli_agent)
         await channel.send_response(ws, req_id, ok=True, payload=payload)
+
+    async def _external_cli_install(ws, req_id, params, session_id):
+        cli_agent = str((params or {}).get("cli_agent") or "").strip().lower()
+        if cli_agent not in _known_external_cli_agents():
+            await channel.send_response(
+                ws, req_id, ok=False, error="unsupported external cli agent", code="BAD_REQUEST"
+            )
+            return
+        if not _is_frozen_runtime():
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error="managed external CLI runtimes are installed by the desktop app only",
+                code="UNSUPPORTED",
+            )
+            return
+        payload = _install_managed_external_cli_runtime_if_needed(cli_agent)
+        await channel.send_response(ws, req_id, ok=True, payload=payload)
+
+    async def _external_cli_custom_agent_remove(ws, req_id, params, session_id):
+        cli_agent = str((params or {}).get("cli_agent") or "").strip().lower()
+        try:
+            await asyncio.to_thread(_remove_custom_external_cli_agent, cli_agent)
+        except ValueError as exc:
+            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="BAD_REQUEST")
+            return
+        await channel.send_response(ws, req_id, ok=True, payload={"cli_agent": cli_agent})
 
     async def _request_zen_warmup() -> None:
         from jiuwenswarm.gateway.zen_query import request_zen_warmup
@@ -2175,45 +2279,12 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         await _config_validate_model(ws, req_id, params, session_id)
 
     async def _model_resource_rpc(ws, req_id, params, session_id, operation):
-        from jiuwenswarm.common.config import (
-            delete_model_resource, upsert_model_group_resource, upsert_model_resource,
+        from jiuwenswarm.common.config_panel.model_resource_handlers import model_resource_handler
+
+        await model_resource_handler(
+            channel, ws, req_id, params, session_id, operation=operation,
+            on_config_saved=on_config_saved, agent_client=_resolve(agent_client),
         )
-        from jiuwenswarm.common.model_errors import (
-            MODEL_SELECTION_NOT_FOUND, MODEL_SELECTION_REFERENCED, ModelSelectionError,
-        )
-        from jiuwenswarm.common.model_selection import ModelSelection
-        try:
-            catalog = ModelCatalog()
-            if operation == "groups.list":
-                payload = {"groups": catalog.list_public_groups()}
-            elif operation == "models.get":
-                model_id = str((params or {}).get("model_id") or "").strip()
-                payload = {"model": catalog.get_public_model_detail(model_id)}
-            elif operation == "models.references":
-                selection = ModelSelection.model_validate(params)
-                payload = {"references": [r.__dict__ for r in catalog.find_references(selection)]}
-            elif operation in {"models.delete", "groups.delete"}:
-                resource_type = "model_group" if operation.startswith("groups") else "model"
-                key = "model_group_id" if resource_type == "model_group" else "model_id"
-                resource_id = str((params or {}).get(key) or "").strip()
-                selection = ModelSelection(type=resource_type, id=resource_id)
-                references = catalog.find_references(selection)
-                if references:
-                    raise ModelSelectionError(MODEL_SELECTION_REFERENCED, "resource is still referenced",
-                        references=[r.__dict__ for r in references])
-                if not delete_model_resource(resource_type, resource_id):
-                    raise ModelSelectionError(MODEL_SELECTION_NOT_FOUND, "resource does not exist")
-                payload = {key: resource_id, "deleted": True}
-            elif operation == "models.upsert":
-                saved = upsert_model_resource((params or {}).get("model") or {})
-                payload = {"model": ModelCatalog().get_public_model_detail(saved["model_id"])}
-            else:
-                payload = {"group": upsert_model_group_resource((params or {}).get("group") or {})}
-            await channel.send_response(ws, req_id, ok=True, payload=payload)
-        except ModelSelectionError as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code=exc.code, payload=exc.to_payload())
-        except Exception as exc:
-            await channel.send_response(ws, req_id, ok=False, error=str(exc), code="BAD_REQUEST")
 
     async def _session_selection_set(ws, req_id, params, session_id):
         from jiuwenswarm.common.model_selection import ModelSelection
@@ -2717,6 +2788,14 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         def _attach_runtime_status(ok: bool, payload: dict[str, Any]) -> None:
             if ok:
                 payload["is_processing"] = channel.is_session_busy(target_session_id)
+                # The busy map drives the stop button on page reload; expose
+                # the value it served for that session's metadata request.
+                logger.info(
+                    "[WebHandlers] session.get_metadata runtime status: "
+                    "session_id=%s is_processing=%s",
+                    target_session_id,
+                    payload["is_processing"],
+                )
 
         await proxy_unary_request(
             channel=channel,
@@ -5040,6 +5119,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("external_cli.detect", _external_cli_detect)
     channel.register_method("external_cli.codex_install_status", _external_cli_codex_install_status)
     channel.register_method("external_cli.install_status", _external_cli_install_status)
+    channel.register_method("external_cli.install", _external_cli_install)
+    channel.register_method("external_cli.custom_agent.remove", _external_cli_custom_agent_remove)
 
     async def _proxy_config_request(ws, req_id, params, session_id, user_id=None, *, req_method):
         """经 E2A 在目标 AgentServer 注入目录执行配置请求（仅 AgentOS 多用户调用）。
@@ -5671,6 +5752,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     _register_perm("permissions.tools.get", _PermReq.PERMISSIONS_TOOLS_GET)
     _register_perm("permissions.tools.set", _PermReq.PERMISSIONS_TOOLS_SET)
     _register_perm("permissions.tools.update", _PermReq.PERMISSIONS_TOOLS_UPDATE)
+    _register_perm("permissions.tools.update_user", _PermReq.PERMISSIONS_TOOLS_UPDATE_USER)
     _register_perm("permissions.tools.delete", _PermReq.PERMISSIONS_TOOLS_DELETE)
     _register_perm("permissions.rules.get", _PermReq.PERMISSIONS_RULES_GET)
     _register_perm("permissions.rules.create", _PermReq.PERMISSIONS_RULES_CREATE)

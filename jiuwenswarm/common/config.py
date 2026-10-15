@@ -43,10 +43,14 @@ SWARMFLOW_BUDGET_CONFIG_PATH = ("modes", "team", "jiuwen_team", "swarmflow_budge
 SWARMFLOW_WORKTREE_CONFIG_PATH = ("modes", "team", "jiuwen_team", "worktree", "enabled")
 DEFAULT_SWARMFLOW_WORKTREE_ENABLED = False
 DEFAULT_SWARMFLOW_ENABLED = False
+TEAM_DISPATCH_MODE_CONFIG_PATH = ("modes", "team", "jiuwen_team", "dispatch_mode")
+TEAM_TASK_VERIFICATION_CONFIG_PATH = ("modes", "team", "jiuwen_team", "enable_task_verification")
+DEFAULT_TEAM_DISPATCH_MODE = "autonomous"
+DEFAULT_TEAM_TASK_VERIFICATION_ENABLED = False
 EXTERNAL_CLI_PUBLISH_URL_FRONT_KEY = "external_cli_publish_url"
 EXTERNAL_CLI_AGENTS_CONFIG_PATH = ("modes", "team", "jiuwen_team", "external_cli_agents")
 EXTERNAL_TRANSPORT_CONFIG_PATH = ("modes", "team", "jiuwen_team", "external_transport")
-_ALLOWED_EXTERNAL_CLI_AGENTS = {"claude", "codex"}
+_BUILTIN_EXTERNAL_CLI_AGENTS = ("claude", "codex")
 # Keep progressive tool search enabled by default for existing user workspaces
 # whose config.yaml predates this switch.
 DEFAULT_PROGRESSIVE_TOOL_ENABLED = False
@@ -427,6 +431,18 @@ def get_progressive_tool_enabled(config: dict[str, Any] | None = None) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
     return bool(value)
+
+
+def is_tool_retrieval_enabled(config: dict[str, Any] | None = None) -> bool:
+    """Return whether the ``tool_search`` progressive disclosure is enabled.
+
+    Reuses the single top-level ``progressive_tool_enabled`` switch (the same
+    one historically documented for the deferred-tool pipeline). ``true`` means
+    our skill_index-framework ``tool_search`` is mounted and deferred tools are
+    hidden until discovered; ``false`` disables it and every tool stays direct.
+    """
+
+    return False
 
 
 def get_endpoint_profile_overrides(config: dict[str, Any] | None = None) -> dict[str, str]:
@@ -936,6 +952,7 @@ def update_permissions_profile_in_config(profile: str) -> None:
     """Atomically persist the Web permission profile to runtime fields."""
     runtime_values = {
         "default": (True, "manual"),
+        "automatic": (True, "auto"),
         "full_access": (False, "manual"),
     }
     try:
@@ -1656,6 +1673,10 @@ def load_models_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     by_id: dict[str, dict[str, Any]] = {}
     for source, entries in (("defaults", defaults), ("agentos", agentos)):
         for entry in entries:
+            entry["model_detail"] = {
+                **(entry.get("model_detail") or {}),
+                "fallback_tag": (entry.get("model_client_config") or {}).get("model_name"),
+            }
             model_id = str(entry.get("model_id") or "").strip()
             if model_id:
                 by_id[model_id] = {"source": source, "entry": entry}
@@ -1741,24 +1762,92 @@ def _merge_model_update(current: dict[str, Any], update: dict[str, Any]) -> dict
 
 
 def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
-    candidate = deepcopy((get_config_raw().get("models") or {}))
-    defaults = candidate.setdefault("defaults", [])
     saved = _normalize_model_entry(entry)
     saved.setdefault("model_id", _new_business_id("mdl"))
-    for index, current in enumerate(defaults):
-        if isinstance(current, dict) and current.get("model_id") == saved["model_id"]:
-            saved = _merge_model_update(current, saved)
-            defaults[index] = saved
-            break
-    else:
-        defaults.append(saved)
-    save_models_candidate(candidate)
+
+    def _mutate(data):
+        nonlocal saved
+        candidate = data.setdefault("models", {})
+        _require_editable_model(candidate, saved["model_id"])
+        defaults = candidate.setdefault("defaults", [])
+        for index, current in enumerate(defaults):
+            if current.get("model_id") == saved["model_id"]:
+                _protect_model_key(saved, current)
+                saved = _merge_model_update(current, saved)
+                defaults[index] = saved
+                break
+        else:
+            _protect_model_key(saved, {})
+            defaults.append(saved)
+        if entry.get("is_default") is True:
+            for current in defaults:
+                current["is_default"] = current["model_id"] == saved["model_id"]
+        _validate_model_candidate(candidate)
+        return data
+
+    update_config(_mutate)
     return saved
 
 
+def _require_editable_model(models: dict[str, Any], model_id: str) -> None:
+    from jiuwenswarm.common.model_errors import MODEL_SELECTION_FORBIDDEN, ModelSelectionError
+
+    if any(entry.get("model_id") == model_id for entry in models.get("agentos") or []):
+        raise ModelSelectionError(MODEL_SELECTION_FORBIDDEN, "AgentOS models are read-only")
+
+
+def _protect_model_key(update: dict[str, Any], current: dict[str, Any]) -> None:
+    """Preserve omitted credentials; encrypt changed keys with the installed provider."""
+    client = update.get("model_client_config") or {}
+    if "api_key" not in client:
+        return
+    key = client["api_key"]
+    previous = (current.get("model_client_config") or {}).get("api_key")
+    if key == previous or not key:
+        return
+    crypto = get_crypto_provider()
+    if crypto is not None:
+        resolved = _decrypt_model_entries([current])[0]
+        previous_plaintext = (resolved.get("model_client_config") or {}).get("api_key")
+        if previous and key == previous_plaintext:
+            client["api_key"] = previous
+        else:
+            client["api_key"] = crypto.encrypt(key)
+
+
+def _validate_model_candidate(candidate: dict[str, Any]) -> None:
+    from jiuwenswarm.common.model_config_validation import raise_if_invalid
+
+    _ensure_model_business_ids(candidate)
+    raise_if_invalid(candidate)
+
+
+def _require_unreferenced_model(
+    data: dict[str, Any], resource_type: str, resource_id: str, *, cron_references_checked: bool = False,
+) -> None:
+    from jiuwenswarm.common.model_catalog import ModelCatalog
+    from jiuwenswarm.common.model_errors import MODEL_SELECTION_REFERENCED, ModelSelectionError
+    from jiuwenswarm.common.model_selection import ModelSelection
+    from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
+
+    is_etcd = load_cron_store_settings(data).backend == "etcd"
+    if is_etcd and not cron_references_checked:
+        raise ModelSelectionError(
+            MODEL_SELECTION_REFERENCED, "use the resource API to check etcd references before deletion",
+        )
+    refs = ModelCatalog(data).find_references(
+        ModelSelection(type=resource_type, id=resource_id), include_cron=not is_etcd,
+    )
+    if refs:
+        raise ModelSelectionError(
+            MODEL_SELECTION_REFERENCED, "resource is still referenced",
+            references=[ref.__dict__ for ref in refs],
+        )
+
+
 def upsert_model_group_resource(group: dict[str, Any]) -> dict[str, Any]:
-    candidate = deepcopy((get_config_raw().get("models") or {}))
-    groups = candidate.setdefault("groups", [])
+    from jiuwenswarm.common.model_errors import MODEL_GROUP_INVALID, ModelSelectionError
+
     saved = deepcopy(group)
     saved.setdefault("model_group_id", _new_business_id("mgp"))
     # Legacy routing settings are inactive in model-pool mode.
@@ -1766,27 +1855,50 @@ def upsert_model_group_resource(group: dict[str, Any]) -> dict[str, Any]:
     for route in saved.get("routes") or []:
         if isinstance(route, dict):
             route.setdefault("route_id", _new_business_id("rte"))
-    for index, current in enumerate(groups):
-        if isinstance(current, dict) and current.get("model_group_id") == saved["model_group_id"]:
-            groups[index] = saved
-            break
-    else:
-        groups.append(saved)
-    save_models_candidate(candidate)
+
+    def _mutate(data):
+        candidate = data.setdefault("models", {})
+        groups = candidate.setdefault("groups", [])
+        for index, current in enumerate(groups):
+            if current.get("model_group_id") == saved["model_group_id"]:
+                groups[index] = saved
+                break
+        else:
+            groups.append(saved)
+        if saved.get("is_default"):
+            for current in groups:
+                current["is_default"] = current["model_group_id"] == saved["model_group_id"]
+        _validate_model_candidate(candidate)
+        if saved.get("enabled", True) and not any(route.get("enabled", True) for route in saved["routes"]):
+            raise ModelSelectionError(MODEL_GROUP_INVALID, "enabled model group must contain an enabled route")
+        return data
+
+    update_config(_mutate)
     return saved
 
 
-def delete_model_resource(resource_type: str, resource_id: str) -> bool:
-    candidate = deepcopy((get_config_raw().get("models") or {}))
+def delete_model_resource(resource_type: str, resource_id: str, *, cron_references_checked: bool = False) -> bool:
     key = "groups" if resource_type == "model_group" else "defaults"
     id_key = "model_group_id" if resource_type == "model_group" else "model_id"
-    entries = candidate.get(key) or []
-    filtered = [entry for entry in entries if not isinstance(entry, dict) or entry.get(id_key) != resource_id]
-    if len(filtered) == len(entries):
-        return False
-    candidate[key] = filtered
-    save_models_candidate(candidate)
-    return True
+    deleted = False
+
+    def _mutate(data):
+        nonlocal deleted
+        candidate = data.setdefault("models", {})
+        if resource_type == "model":
+            _require_editable_model(candidate, resource_id)
+        entries = candidate.get(key) or []
+        filtered = [entry for entry in entries if entry.get(id_key) != resource_id]
+        if len(filtered) == len(entries):
+            return None
+        _require_unreferenced_model(data, resource_type, resource_id, cron_references_checked=cron_references_checked)
+        candidate[key] = filtered
+        _validate_model_candidate(candidate)
+        deleted = True
+        return data
+
+    update_config(_mutate)
+    return deleted
 
 
 def get_default_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1886,16 +1998,24 @@ def get_available_models(
     return [*configured, *extra]
 
 
-def update_default_models_in_config(models_list: list[dict[str, Any]]) -> None:
+def update_default_models_in_config(
+    models_list: list[dict[str, Any]], *, cron_references_checked: bool = False,
+) -> None:
     def _mutate(data):
         if "models" not in data:
             data["models"] = {}
+        retained_ids = {entry.get("model_id") for entry in models_list}
+        for previous in data["models"].get("defaults") or []:
+            model_id = previous.get("model_id")
+            if model_id and model_id not in retained_ids:
+                _require_unreferenced_model(data, "model", model_id, cron_references_checked=cron_references_checked)
         for entry in models_list:
             if isinstance(entry, dict) and isinstance(entry.get("alias"), str):
                 entry["alias"] = DoubleQuotedScalarString(entry["alias"])
         data["models"]["defaults"] = models_list
         if "default" in data["models"]:
             del data["models"]["default"]
+        _validate_model_candidate(data["models"])
         return data
     update_config(_mutate)
 
@@ -2237,8 +2357,7 @@ def _normalize_external_cli_team_config(
     else:
         transformed_team.pop("external_cli_agents", None)
 
-    has_codex = any(item["cli_agent"] == "codex" for item in normalized_cli_agents)
-    if not has_codex:
+    if not _requires_external_transport(normalized_cli_agents):
         transformed_team.pop("external_transport", None)
         return
 
@@ -2251,12 +2370,12 @@ def _normalize_external_cli_team_config(
     params = external_transport.get("params")
     params = dict(params) if isinstance(params, dict) else {}
     if transport_type and transport_type != "hybrid":
-        raise ValueError(f"{field_name} includes codex but external_transport.type must be hybrid")
+        raise ValueError(f"{field_name} needs a cross-process agent but external_transport.type must be hybrid")
 
     if not params.get("external_publish_url"):
         url = str(publish_url or "").strip()
         if not url:
-            raise ValueError(f"{field_name} includes codex but external_cli_publish_url is empty")
+            raise ValueError(f"{field_name} needs a cross-process agent but external_cli_publish_url is empty")
         params["external_publish_url"] = url
 
     transformed_team["external_transport"] = {"type": "hybrid", "params": params}
@@ -2314,12 +2433,30 @@ def _normalize_builtin_models(value: Any, field_name: str) -> list[dict[str, Any
     return normalized
 
 
+def _allowed_external_cli_agents() -> tuple[str, ...]:
+    """Return Claude, Codex and every installed custom agent."""
+    from jiuwenswarm.common.custom_agent_runtime import custom_agent_names
+
+    return (*_BUILTIN_EXTERNAL_CLI_AGENTS, *custom_agent_names())
+
+
+def _requires_external_transport(agents: list[dict[str, Any]]) -> bool:
+    """Return whether an enabled agent reaches the team from another process.
+
+    Claude mounts its team tools in process. Codex and custom agents run a
+    team MCP server or messenger outside this process, which needs the hybrid
+    transport and its publish URL.
+    """
+    return any(item["cli_agent"] != "claude" for item in agents)
+
+
 def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str, Any]]:
     if value is None or value == "":
         return []
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be an array")
 
+    allowed_agents = _allowed_external_cli_agents()
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, item in enumerate(value):
@@ -2331,8 +2468,8 @@ def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str
             raise ValueError(f"{field_name}[{index}] must be an object or string")
         if not cli_agent:
             continue
-        if cli_agent not in _ALLOWED_EXTERNAL_CLI_AGENTS:
-            allowed = ", ".join(sorted(_ALLOWED_EXTERNAL_CLI_AGENTS))
+        if cli_agent not in allowed_agents:
+            allowed = ", ".join(allowed_agents)
             raise ValueError(f"{field_name}[{index}].cli_agent must be one of: {allowed}")
         if cli_agent in seen:
             continue
@@ -2449,6 +2586,27 @@ def update_swarmflow_enabled_in_config(enabled: bool) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def _set_config_path(path: tuple[str, ...], value: Any) -> None:
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    current = data
+    path_so_far: list[str] = []
+    for segment in path[:-1]:
+        path_so_far.append(segment)
+        current = _ensure_config_object(current, segment, ".".join(path_so_far))
+    current[path[-1]] = value
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
+def update_team_scheduled_dispatch_in_config(enabled: bool) -> None:
+    """Update ``modes.team.jiuwen_team.dispatch_mode`` (scheduled / autonomous)."""
+    _set_config_path(TEAM_DISPATCH_MODE_CONFIG_PATH, "scheduled" if enabled else "autonomous")
+
+
+def update_team_task_verification_in_config(enabled: bool) -> None:
+    """Update ``modes.team.jiuwen_team.enable_task_verification`` in config.yaml."""
+    _set_config_path(TEAM_TASK_VERIFICATION_CONFIG_PATH, bool(enabled))
+
+
 def _carry_over_builtin_models(agents: list[dict[str, Any]], existing: Any) -> None:
     """Keep the configured built-in model catalog of each CLI kind.
 
@@ -2492,7 +2650,7 @@ def update_external_cli_agents_in_config(agents: list[str | dict[str, Any]], pub
     else:
         current.pop(EXTERNAL_CLI_AGENTS_CONFIG_PATH[-1], None)
 
-    if any(item["cli_agent"] == "codex" for item in normalized_agents):
+    if _requires_external_transport(normalized_agents):
         external_transport = current.get(EXTERNAL_TRANSPORT_CONFIG_PATH[-1])
         if isinstance(external_transport, dict):
             transport_type = str(external_transport.get("type") or "").strip()
@@ -2502,11 +2660,15 @@ def update_external_cli_agents_in_config(agents: list[str | dict[str, Any]], pub
             transport_type = ""
             params = {}
         if transport_type and transport_type != "hybrid":
-            raise ValueError("external_cli_agents includes codex but external_transport.type must be hybrid")
+            raise ValueError(
+                "external_cli_agents needs a cross-process agent but external_transport.type must be hybrid"
+            )
         if not params.get("external_publish_url"):
             url = str(publish_url or "").strip()
             if not url:
-                raise ValueError("external_cli_agents includes codex but external_cli_publish_url is empty")
+                raise ValueError(
+                    "external_cli_agents needs a cross-process agent but external_cli_publish_url is empty"
+                )
             params["external_publish_url"] = url
         current[EXTERNAL_TRANSPORT_CONFIG_PATH[-1]] = {"type": "hybrid", "params": params}
     else:

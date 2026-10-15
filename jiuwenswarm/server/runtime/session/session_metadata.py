@@ -50,6 +50,7 @@ class _MetadataWriteOptions:
     # Inference owns only fields that have not changed since the read snapshot.
     expected_fields: dict[str, tuple[bool, Any]] | None = None
     migration_key: tuple[str, str] | None = None
+    replace_harness_checkpoint: bool = False
 
 
 # ---------- 异步写入队列(与 session_history 保持一致的模式) ----------
@@ -594,7 +595,8 @@ def _write_metadata_unfenced(
         # and friends (writes replace the whole file, they do not merge). When
         # disk has an identity and the incoming payload does not, treat it as a
         # race-induced dirty write and restore the missing fields.
-        if current and current.get("session_id") and not metadata.get("session_id"):
+        needs_identity_recovery = options.merge_fields is None and current and current.get("session_id")
+        if needs_identity_recovery and not metadata.get("session_id"):
             recovered = {k: v for k, v in current.items() if k not in metadata}
             to_write = {**current, **metadata}
             logger.warning(
@@ -603,8 +605,38 @@ def _write_metadata_unfenced(
                 session_id, len(recovered), sorted(recovered),
             )
 
+        # External Harness runtime selection is a first-binding field. Preserve
+        # the authoritative on-disk value against stale queued snapshots and
+        # later attempts to switch the session to another runtime.
+        if current is not None and isinstance(
+            current.get("session_runtime_binding"),
+            dict,
+        ):
+            to_write = to_write.copy()
+            to_write["session_runtime_binding"] = copy.deepcopy(
+                current["session_runtime_binding"]
+            )
+        if (
+            current is not None
+            and isinstance(current.get("session_harness_checkpoint"), dict)
+            and not options.replace_harness_checkpoint
+        ):
+            to_write = to_write.copy()
+            to_write["session_harness_checkpoint"] = copy.deepcopy(
+                current["session_harness_checkpoint"]
+            )
+
         if options.preserve_pin_fields and current is not None:
             to_write = _merge_pin_fields(current, to_write)
+        # Selection has its own authoritative field update. Queued history/title
+        # snapshots must not roll a newer selection back (including a clear).
+        owns_selection = options.merge_fields is not None and "model_selection" in options.merge_fields
+        if current is not None and not owns_selection:
+            to_write = dict(to_write)
+            if "model_selection" in current:
+                to_write["model_selection"] = current["model_selection"]
+            else:
+                to_write.pop("model_selection", None)
         # 权威 rebind 版本检查: 持锁后重比 gen, 判定调用方传入的快照是否已陈旧。
         # 比调用方持锁前的 pre-check 更可靠 —— 消除"gen 比较与文件写入"之间的
         # TOCTOU 窗口(P3)。rebind 自身传入的 gen 已 bump, 等于当前 gen, 不触发合并。
@@ -627,6 +659,20 @@ def _write_metadata_unfenced(
             tmp.unlink(missing_ok=True)
             raise
     return to_write
+
+
+def update_session_model_selection(
+    session_id: str, selection: dict[str, Any], *, expected_selection: tuple[bool, Any] | None = None,
+) -> None:
+    """Update only selection through the shared lifecycle/atomic-write boundary."""
+    _write_metadata_sync(
+        session_id, {"model_selection": selection},
+        _MetadataWriteOptions(
+            merge_fields=frozenset({"model_selection"}),
+            expected_fields={"model_selection": expected_selection} if expected_selection is not None else None,
+        ),
+    )
+    remove_session_metadata_cache(session_id)
 
 
 def _merge_pin_fields(current: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
@@ -782,12 +828,13 @@ def _enqueue_inference_write(
             logger.warning("failed to enqueue metadata migration: session=%s error=%s", session_id, exc)
 
 
-def _enqueue_write(
+def _enqueue_write(  # pylint: disable=too-many-arguments,huawei-too-many-arguments
     session_id: str,
     metadata: dict[str, Any],
     sync_write: bool = False,
     preserve_pin_fields: bool = False,
     merge_fields: frozenset[str] | None = None,
+    replace_harness_checkpoint: bool = False,
 ) -> None:
     """将写入操作放入异步队列,队列满时退化为同步写。
 
@@ -813,6 +860,7 @@ def _enqueue_write(
         rebind_gen_at_enqueue=rebind_gen_at_enqueue,
         lifecycle_generation=generation,
         merge_fields=merge_fields,
+        replace_harness_checkpoint=replace_harness_checkpoint,
     )
     if sync_write:
         # P2: sync_write 路径同样需要 rebind 版本检查 —— set_session_pinned 等
@@ -943,6 +991,9 @@ def update_session_metadata(
     sync_write: bool = False,
     work_mode: str | None = None,
     session_equipment: dict[str, Any] | None = None,
+    session_runtime_binding: dict[str, Any] | None = None,
+    session_harness_checkpoint: dict[str, Any] | None = None,
+    group_members: list[dict[str, Any]] | None = None,
 ) -> None:
     """更新会话元数据(异步写入,不阻塞调用方)
 
@@ -1022,6 +1073,14 @@ def update_session_metadata(
             metadata["channel_metadata"] = channel_metadata
         if session_equipment is not None:
             metadata["session_equipment"] = copy.deepcopy(session_equipment)
+        if session_runtime_binding is not None:
+            metadata["session_runtime_binding"] = copy.deepcopy(
+                session_runtime_binding
+            )
+        if session_harness_checkpoint is not None:
+            metadata["session_harness_checkpoint"] = copy.deepcopy(
+                session_harness_checkpoint
+            )
         if isinstance(team_leader_identity, dict):
             metadata["team_leader_identity"] = copy.deepcopy(team_leader_identity)
     else:
@@ -1095,17 +1154,32 @@ def update_session_metadata(
             metadata["channel_metadata"] = channel_metadata
         if session_equipment is not None:
             metadata["session_equipment"] = copy.deepcopy(session_equipment)
+        if (
+            session_runtime_binding is not None
+            and "session_runtime_binding" not in metadata
+        ):
+            metadata["session_runtime_binding"] = copy.deepcopy(
+                session_runtime_binding
+            )
+        if session_harness_checkpoint is not None:
+            metadata["session_harness_checkpoint"] = copy.deepcopy(
+                session_harness_checkpoint
+            )
 
         # 更新最后消息时间(可由 touch_last_message_at=False 关闭,供置顶重编号等
         # 非消息操作复用本函数而不腐蚀 last_message_at 语义)
         if touch_last_message_at:
             metadata["last_message_at"] = _current_timestamp()
 
+    if group_members is not None:
+        metadata["group_members"] = copy.deepcopy(group_members)
+
     _enqueue_write(
         session_id,
         metadata,
         sync_write=sync_write or sync,
         preserve_pin_fields=pinned is None and pin_order is None,
+        replace_harness_checkpoint=session_harness_checkpoint is not None,
     )
 
 
