@@ -42,7 +42,8 @@ _BROWSER_TASK_PROMPT = {
         '`"browser_agent"`, and put the complete objective in `task_description`. Do not use '
         "`subagent_spawn` for browser_agent.\n"
         "- Preserve the original goal, budget, dates and object constraints. Do not add budget tolerance, "
-        "reverse lookups, traditional widgets or independent cross-checks. Answer lookups may use direct search URLs and "
+        "reverse lookups, traditional widgets or independent cross-checks. "
+        "Answer lookups may use direct search URLs and "
         "top AI/knowledge/weather answers with attribution; preserve explicit natural-result/detail-visit requests. "
         "When asked to select one suitable object, do not invent a larger candidate survey. Preserve authorized "
         "actions and the requested stopping point, and continue the selected object/current state instead of "
