@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
-import { useChatStore, useHarnessStore, useSessionStore, useTodoStore } from '../../stores';
+import { useChatStore, useHarnessStore, useSessionStore, useTodoStore, useWorkspaceStore } from '../../stores';
 import {
   AgentMode,
   MediaItem,
@@ -675,21 +675,16 @@ function getTeamMessageIdentity(message: Message): string {
 
 function WelcomeHeading() {
   const { i18n } = useTranslation();
+  const workMode = useWorkspaceStore((state) => state.workMode);
   const isZh = i18n.language.startsWith('zh');
-
-  if (isZh) {
-    return (
-      <>
-        <span className="chat-welcome__heading-highlight">WorkSwarm</span>
-        <span>轻松解决工作每个问题！</span>
-      </>
-    );
-  }
+  const suffix = workMode === 'design'
+    ? (isZh ? '轻松解决每个设计问题！' : 'solves every design problem!')
+    : (isZh ? '轻松解决工作每个问题！' : 'makes work easier!');
 
   return (
     <>
       <span className="chat-welcome__heading-highlight">WorkSwarm</span>
-      <span>makes work easier!</span>
+      <span>{suffix}</span>
     </>
   );
 }
@@ -1781,7 +1776,9 @@ export const ChatPanel = React.memo(function ChatPanel({
     [canAcceptDesktopFileDrag, markDesktopFileDropZoneActive],
   );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Replace the consumer during the session commit, before pending native file
+    // reads can resolve. ChatPanel stays mounted when activeSessionId changes.
     // Durable bridge lives in localFilePicker; ChatPanel only registers a consumer.
     // Never delete window.__JIUWEN_INGEST_LOCAL_FILES__ — Python run_js requires it.
     const unregister = registerDesktopLocalFilesConsumer((detail, files) => {
@@ -1807,7 +1804,7 @@ export const ChatPanel = React.memo(function ChatPanel({
       window.removeEventListener(DESKTOP_LOCAL_FILES_EVENT, onDesktopLocalFiles as EventListener);
       window.removeEventListener(DESKTOP_FILE_DRAG_EVENT, onDesktopFileDrag as EventListener);
     };
-  }, [ingestDesktopLocalFiles, markDesktopFileDropZoneActive]);
+  }, [activeSessionId, ingestDesktopLocalFiles, markDesktopFileDropZoneActive]);
 
   return (
     <div

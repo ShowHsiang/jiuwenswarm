@@ -32,6 +32,7 @@ from typing import (
 from openjiuwen.agent_teams.schema.deep_agent_spec import (
     BuiltinToolSpec,
     DeepAgentSpec,
+    ProgressiveToolSpec,
     RailSpec,
     SubAgentSpec,
 )
@@ -54,6 +55,7 @@ from jiuwenswarm.agents.harness.common.cua_defaults import (
 from jiuwenswarm.common.config import (
     get_default_model_provider,
     get_evolution_auto_save_enabled,
+    get_progressive_tool_enabled,
     get_skill_evolution_enabled,
     get_symphony_evolution_enabled,
 )
@@ -71,6 +73,7 @@ from jiuwenswarm.agents.swarm.providers import tools as _tools
 from jiuwenswarm.common.mode_matrix import (
     NEW_TEAM_CODE_NORMAL,
     NEW_TEAM_CODE_PLAN,
+    NEW_TEAM_DESIGN,
     TEAM_PLAN_CODE_MODE,
     is_team_plan_mode,
 )
@@ -253,6 +256,101 @@ _REVIEWER_TOOL_NAMES: tuple[str, ...] = (
 def _is_code_mode(mode: str) -> bool:
     """Return whether *mode* routes to the code member profile."""
     return mode in _CODE_MODES
+
+
+# Design profile (team.design) capability set. The design leader is a
+# conversation surface over the design canvas and the workers are per-node
+# executors: skill/symphony/task-planning rails and the generic web/media
+# tools are out (the designer graph tools arrive via the agent_group leader
+# template, not the profile). Everything else — runtime/response prompts,
+# streaming, security, anomaly detection, heartbeat, context — stays because
+# the team runtime's session mechanics depend on them.
+_DESIGN_RAIL_NAMES: tuple[str, ...] = (
+    registry.RUNTIME_PROMPT,
+    registry.RESPONSE_PROMPT,
+    registry.STREAM_EVENT,
+    registry.SECURITY,
+    registry.MODEL_ANOMALY_DETECTION,
+    registry.HEARTBEAT,
+    registry.AVATAR_PROMPT,
+    registry.MULTIMODAL_IMAGE,
+    registry.TEAM_WORKSPACE_REPORT_PATH,
+    registry.CONTEXT_PROCESSOR,
+    registry.PERSONAL_CONTEXT,
+)
+
+_DESIGN_TOOL_NAMES: tuple[str, ...] = (
+    registry.VISION,
+    registry.AUDIO,
+)
+
+
+def _is_design_mode(mode: str) -> bool:
+    """Return whether *mode* routes to the design member profile."""
+    return mode == NEW_TEAM_DESIGN
+
+
+def _build_design_capability_specs(
+    config: dict[str, Any],
+    mode: str,
+    role: str,
+    *,
+    enable_permissions: bool = False,
+) -> tuple[list[RailSpec], list[BuiltinToolSpec]]:
+    """Build the design profile (team.design) specs for a member."""
+    rail_names = _DESIGN_RAIL_NAMES
+    if role != "leader":
+        rail_names = (*rail_names, registry.SYS_OPERATION)
+    rails_specs: list[RailSpec] = [
+        RailSpec(type=name, params=_rail_params(name, config))
+        for name in rail_names
+    ]
+    if role == "leader":
+        rails_specs.append(RailSpec(type=registry.STRUCTURED_ASK_USER))
+        # Leader authoring rail: the designer_graph_autorun tool — a fresh
+        # creative request runs the service-side Director chain that composes
+        # the execution graph (analyze → brief → review → storyboard →
+        # review → graph → validate).
+        rails_specs.append(RailSpec(type=registry.DESIGNER_AUTHORING))
+        # Leader execution rail: the designer_run_graph tool (canvas
+        # compilation/trigger from the conversation, single-node rerun,
+        # cascade rerun) + its prompt section. Graph editing
+        # (designer_graph_tools) and execution stay two tools on two rails.
+        rails_specs.append(RailSpec(type=registry.DESIGNER_EXECUTION))
+        # Surface sanitizer: subtract the capability surfaces agent-core
+        # mounts unconditionally (workspace_meta, org_* control tools,
+        # group chat) — single-repo removal instead of patching agent-core.
+        # Low rail priority => initializes after the mounting rails and
+        # sees the fully assembled surface.
+        rails_specs.append(RailSpec(type=registry.DESIGNER_SURFACE_SANITIZER))
+        if enable_permissions:
+            rails_specs.append(
+                RailSpec(
+                    type=registry.TEAM_PERMISSION_POLICY,
+                    params=_rail_params(registry.TEAM_PERMISSION_POLICY, config),
+                ),
+            )
+    if enable_permissions and role == "teammate":
+        rails_specs.append(
+            RailSpec(
+                type=registry.TEAM_PERMISSION,
+                params=_rail_params(registry.TEAM_PERMISSION, config),
+            ),
+        )
+
+    tool_names = _DESIGN_TOOL_NAMES
+    if role == "leader":
+        # The canvas tools (graph_get / graph_patch / node_run / read_upstream /
+        # model calls — the picked designer toolset) mount via the registered
+        # provider, which resolves the session's graph binding. No send_file:
+        # node outputs reach the frontend through the canvas node contract
+        # (DESIGNER_RUN_UPDATED / graph output_refs), not chat file delivery.
+        tool_names = (*tool_names, registry.DESIGNER_GRAPH_TOOLS)
+    tool_specs: list[BuiltinToolSpec] = [
+        BuiltinToolSpec(type=name, params=_tool_params(name, config))
+        for name in tool_names
+    ]
+    return rails_specs, tool_specs
 
 
 def _resolve_member_skills(config: dict[str, Any], role: str) -> list[str]:
@@ -752,6 +850,10 @@ def build_member_capability_specs(
         return _build_code_capability_specs(
             config, mode, role, enable_permissions=enable_permissions
         )
+    if _is_design_mode(mode):
+        return _build_design_capability_specs(
+            config, mode, role, enable_permissions=enable_permissions
+        )
     return _build_team_capability_specs(
         config, mode, role, enable_permissions=enable_permissions
     )
@@ -976,6 +1078,15 @@ def build_member_deep_agent_spec(
         "mcps": merged_mcps,
         "kv_cache_affinity_config": _kv_cache_affinity_config(config),
     }
+    if get_progressive_tool_enabled(config):
+        # Same top-level ``progressive_tool_enabled`` switch the single-agent
+        # adapters read: the member mounts the harness ProgressiveToolRail
+        # (``tool_search`` + deferred tools) exactly like a single agent does.
+        # Team coordination tools stay DIRECT — ``TeamToolRail`` declares
+        # their exposure — so only the long tail is discovered on demand.
+        # Written only when enabled so a disabled switch keeps the base spec
+        # byte-identical (a YAML base spec may carry its own value).
+        update["progressive_tool"] = ProgressiveToolSpec(enabled=True)
     if role == "leader":
         # Leaders use the team task board (create_task / view_task / update_task).
         # Force off agent-core's enable_task_planning auto-inject path so a YAML

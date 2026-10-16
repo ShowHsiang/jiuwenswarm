@@ -4,6 +4,9 @@
  * 管理 WebSocket 连接和消息处理
  */
 
+import { isConversationModelGroupBlocked } from '../multi-session/state/conversationModelSelection';
+import { parseModelSelection } from '../features/settings/modules/models/modelGroupAdapters';
+import { isMultiModelCollaborationEnabled } from '../features/multiModelCollaboration/featureConfig';
 import { readOutputOrder } from '../features/sessionOutput';
 import { handleTaskInputReceipt, sendQueuedTaskInput, handleSessionOutputBoundary, shouldIgnoreSessionOutput } from '../features/sessionInput';
 import {
@@ -1913,6 +1916,16 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
     const runtime = useChatStore.getState().getRuntime(sessionId);
     if (runtime?.isProcessing || runtime?.queuePaused) return;
     if (!sendMessageRef.current) return;
+    const sessionState = useSessionStore.getState();
+    const sessionMetadata = sessionState.currentSession?.session_id === sessionId
+      ? sessionState.currentSession
+      : sessionState.sessions.find((session) => session.session_id === sessionId);
+    if (isConversationModelGroupBlocked({
+      mode: currentMode,
+      cronId: sessionMetadata?.cron_id,
+      selectedModelSelection: sessionState.getRuntime(sessionId)?.selectedModelSelection,
+      collaborationEnabled: isMultiModelCollaborationEnabled(),
+    })) return;
     const nextTask = useChatStore.getState().claimQueuedTask(sessionId);
     if (nextTask) {
       sendMessageRef.current(nextTask.content, sessionId, nextTask.mediaItems ?? []);
@@ -1943,6 +1956,19 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           return false;
         }
       }
+      const sessionState = useSessionStore.getState();
+      const sessionMetadata = sessionState.currentSession?.session_id === sessionId
+        ? sessionState.currentSession
+        : sessionState.sessions.find((session) => session.session_id === sessionId);
+      if (!useChatStore.getState().getRuntime(sessionId)?.isProcessing && isConversationModelGroupBlocked({
+        mode: sessionState.getRuntime(sessionId)?.mode,
+        cronId: sessionMetadata?.cron_id,
+        selectedModelSelection: sessionState.getRuntime(sessionId)?.selectedModelSelection,
+        collaborationEnabled: isMultiModelCollaborationEnabled(),
+      })) {
+        onErrorRef.current?.(t('chat.modelSelector.collaborationDisabled'));
+        return false;
+      }
       const taskId = options?.queuedTaskId;
       if (taskId) {
         const store = useChatStore.getState();
@@ -1950,6 +1976,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         // Keep this request's ACK/errors separate from the original chat's lifecycle.
         await sendQueuedTaskInput(sessionId, taskId, request, {
           mode: resolveOutgoingMode(sessionId, 'agent'),
+          ...useSessionStore.getState().getModelSelectionPayload(sessionId),
           ...getSessionWorkContext(sessionId),
         });
         const runtime = useChatStore.getState().getRuntime(sessionId);
@@ -2183,6 +2210,10 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           ...(sessionRt?.teamDispatchMode !== undefined
             ? { team_dispatch_mode: sessionRt.teamDispatchMode }
             : {}),
+          // 调度模式的子开关「启动即建队」：同样只在显式值存在时下发。
+          ...(sessionRt?.teamBootstrapMode !== undefined
+            ? { team_bootstrap_mode: sessionRt.teamBootstrapMode }
+            : {}),
         }, {
           // 登记乐观 user 气泡的单号：runtime.accepted 到达时按单号回填服务端权威
           // 时间戳（见 optimisticUserBubblesRef 注释与 runtime.accepted 处理器）。
@@ -2242,6 +2273,19 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
 
   const sendStructuredChatContent = useCallback(
     async (content: unknown, sessionId: string) => {
+      const state = useSessionStore.getState();
+      const metadata = state.currentSession?.session_id === sessionId
+        ? state.currentSession
+        : state.sessions.find((session) => session.session_id === sessionId);
+      if (!useChatStore.getState().getRuntime(sessionId)?.isProcessing && isConversationModelGroupBlocked({
+        mode: state.getRuntime(sessionId)?.mode,
+        cronId: metadata?.cron_id,
+        selectedModelSelection: state.getRuntime(sessionId)?.selectedModelSelection,
+        collaborationEnabled: isMultiModelCollaborationEnabled(),
+      })) {
+        onErrorRef.current?.(t('chat.modelSelector.collaborationDisabled'));
+        return;
+      }
       resetContextCompressionTurn(sessionId);
       userInputVersionRef.current += 1;
       stopAllTts();
@@ -2412,8 +2456,8 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             Object.assign(params, resolvePlanEntryPayload(sessionId, outgoingMode));
           }
         }
-        if (intent === 'supplement') {
-          params.new_input = newInput ?? '';
+        if (intent === 'supplement') params.new_input = newInput ?? '';
+        if (intent === 'supplement' || intent === 'resume') {
           Object.assign(params, useSessionStore.getState().getOutgoingModelParams(sessionId));
         }
         await request('chat.interrupt', params);
@@ -2675,6 +2719,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
               session_id: sessionId,
               query: '',
               mode: resolvedResumeMode,
+              ...useSessionStore.getState().getModelSelectionPayload(sessionId),
               ...getSessionWorkContext(sessionId),
               request_id: requestId,
               answers: permissionAnswers,
@@ -4834,7 +4879,14 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           }
         }
 
-        if (typeof updates.model_name === 'string' && updates.model_name) {
+        const updatedSelection = parseModelSelection(updates.model_selection);
+        if (updatedSelection) {
+          useSessionStore.getState().setSelectedModelSelection(sessionId, updatedSelection);
+        } else if (
+          typeof updates.model_name === 'string' && updates.model_name &&
+          useSessionStore.getState().getRuntime(sessionId)?.selectedModelSelection?.type !== 'model_group'
+        ) {
+          // A resolved group member's execution name is not a new conversation selection.
           useSessionStore.getState().setSelectedModelName(sessionId, updates.model_name);
         }
       }),
@@ -5350,6 +5402,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             workflow_run_id?: string;
             agent_template?: string | null;
             display_name?: string | null;
+            target_status?: string;
           };
           if (e.member_id) markTeamConnectionStateChanged(sessionId, e.member_id);
           if (e.member_id && (e.status || e.new_status || e.execution_status)) {
@@ -5359,7 +5412,12 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           const activeSessionId = getPayloadSessionId(payload) || undefined;
           upsertHumanShareCommandFromEvent(payload, e);
           if (e.type === 'team.member.shutdown' && e.member_id) {
-            applyTeamMemberShutdown(e.member_id, activeSessionId);
+            // 休眠退场同样发 shutdown 事件，但成员仍在名册上、被点名即可唤醒；
+            // 只有终态为 shut_down（或旧后端不带 target_status）时才移出名册，
+            // 休眠成员随后由 status_changed → dormant 更新状态。
+            if (e.target_status !== 'dormant') {
+              applyTeamMemberShutdown(e.member_id, activeSessionId);
+            }
           } else if (e.type === 'team.member.status_changed' && e.member_id && e.new_status) {
             useSessionStore.getState().updateTeamMemberStatus(
               sessionId,

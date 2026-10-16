@@ -1,3 +1,9 @@
+import { isConversationModelGroupBlocked } from './multi-session/state/conversationModelSelection';
+import {
+  applyMultiModelCollaborationSnapshot,
+  getMultiModelCollaborationRevision,
+  isMultiModelCollaborationEnabled,
+} from './features/multiModelCollaboration/featureConfig';
 import { AssetPublishHost } from './components/AssetPublishDrawer';
 // Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
 
@@ -26,12 +32,12 @@ import CronPanel from './components/CronPanel';
 import HeartbeatPanel from './components/HeartbeatPanel';
 import { ToolPanel } from './components/ToolPanel';
 import { UpdatePanel } from './components/UpdatePanel';
-import { ExternalCliInstallDialog, type ExternalCliInstallStatuses } from './components/ExternalCliInstallDialog';
+import type { ExternalCliInstallStatuses } from './components/ExternalCliInstallDialog';
 import { PersonalContextPanel } from './components/PersonalContext';
 import { LoadingSpinner, ToastStack, toast } from './components/ui';
 import { SettingsPage } from './features/settings/SettingsPage';
 import type { SettingsPageDefinition } from './features/settings/registry/types';
-import type { SettingsRequest } from './features/settings/services/settingsContract';
+import { SETTINGS_CONFIG_CHANGED_EVENT, type SettingsRequest } from './features/settings/services/settingsContract';
 import {
   SETTINGS_MODULE_NAVIGATION_EVENT,
   requestSettingsModule,
@@ -39,6 +45,8 @@ import {
 } from './features/settings/settingsNavigation';
 import { ConnectorMarketPanel } from './components/ConnectorMarket';
 import { LoginDialog } from './components/LoginDialog';
+import { DesignerPage } from './features/designer/components/DesignerPage';
+import { submitDesignComposer } from './features/designer/designerEntry';
 import type { CodeReviewTarget } from './features/code-mode/types';
 
 import { FEATURE_APP_UPDATER_UI, FEATURE_PERSONAL_CONTEXT_UI } from './featureFlags';
@@ -77,6 +85,7 @@ import { useBrowserAgentActivity } from './features/browserAgentActivity';
 import {
   AgentMode,
   MediaItem,
+  type ProjectInfo,
   type ChatSendOptions,
   UserAnswer,
   ModelEntry,
@@ -95,7 +104,7 @@ import {
 import {
   loadExternalCliPendingChoices,
   persistExternalCliPendingChoices,
-} from './features/settings/modules/experimental/externalCliInstallState';
+} from './features/settings/modules/agent/externalCliInstallState';
 import {
   ensureSessionRuntimes,
   useSessionStore,
@@ -185,7 +194,9 @@ import {
 import './App.css';
 import { setTeamOrganizationUiEnabled } from './features/teamOrganization/featureConfig';
 import {
+  normalizeTeamBootstrapMode,
   normalizeTeamDispatchMode,
+  resolveNewSessionBootstrapMode,
   resolveNewSessionDispatchMode,
   setTeamScheduledDispatchEnabled,
 } from './features/teamDispatch/featureConfig';
@@ -469,7 +480,6 @@ function AppContent({
   const [proactiveToastMessage, setProactiveToastMessage] = useState('');
   const [securityAlertVisible, setSecurityAlertVisible] = useState(false);
   const [securityAlertContent, setSecurityAlertContent] = useState('');
-  const [externalCliInstallDialogOpen, setExternalCliInstallDialogOpen] = useState(false);
   const [externalCliInstallStatuses, setExternalCliInstallStatuses] = useState<ExternalCliInstallStatuses>({});
   const [hasVisitedAgents, setHasVisitedAgents] = useState(false);
   const [agentManagementNavigationRequest, setAgentManagementNavigationRequest] = useState<{
@@ -608,6 +618,7 @@ function AppContent({
   /** 为 true 表示刚从「会话列表」恢复；history 为空时在 useEffect 的 onEmpty 中提示一次 */
   const historyRestoreFromPanelHintRef = useRef(false);
   const { loadProjects, setSelectedProject } = useWorkspaceStore();
+  const workspaceWorkMode = useWorkspaceStore((state) => state.workMode);
 
   const setHistoryRetryAvailable = useCallback((sid: string, available: boolean) => {
     setHistoryRetrySessions((current) => {
@@ -688,6 +699,20 @@ function AppContent({
       sessionIdRef.current = route.sessionId;
       setSessionId(route.sessionId);
       setActiveNav('chat');
+    } else if (route.kind === 'design-project') {
+      sessionIdRef.current = NEW_CONVERSATION_ID;
+      setSessionId(NEW_CONVERSATION_ID);
+      setActiveNav('chat');
+      void useWorkspaceStore.getState().setWorkMode('design').then(() => {
+        const project = useWorkspaceStore.getState().projects.find(
+          (item) => item.project_id === route.projectId,
+        );
+        useWorkspaceStore.getState().setSelectedProject(project ?? null);
+      });
+      setConversationSidebarCollapsed(true);
+      setTeamAreaExpanded(false);
+      setSingleAgentPanelExpanded(false);
+      setToolPanelHidden(true);
     } else if (route.kind === 'chat-new') {
       if (window.location.pathname !== '/chat/new') {
         navigate({ kind: 'chat-new' }, { replace: true });
@@ -704,7 +729,7 @@ function AppContent({
       setTeamAreaExpanded(false);
       setSingleAgentPanelExpanded(false);
     }
-  }, [navigate, route, setSingleAgentPanelExpanded, setTeamAreaExpanded]);
+  }, [navigate, route, setConversationSidebarCollapsed, setSingleAgentPanelExpanded, setTeamAreaExpanded, setToolPanelHidden]);
 
   useEffect(() => {
     ensureSessionRuntimes(sessionId);
@@ -1806,6 +1831,12 @@ function AppContent({
         if (restoredDispatchMode) {
           useSessionStore.getState().setTeamDispatchMode(targetSessionId, restoredDispatchMode);
         }
+        const restoredBootstrapMode = normalizeTeamBootstrapMode(
+          (session as unknown as Record<string, unknown> | null)?.session_team_bootstrap_mode,
+        );
+        if (restoredBootstrapMode) {
+          useSessionStore.getState().setTeamBootstrapMode(targetSessionId, restoredBootstrapMode);
+        }
       }
       return session;
     } catch (error) {
@@ -1841,13 +1872,21 @@ function AppContent({
   // 获取服务端配置（通过 WS 方法）
   const fetchConfig = useCallback(async () => {
     try {
+      const collaborationRevision = getMultiModelCollaborationRevision();
       const config = await request<Record<string, unknown>>('config.get');
       setA2UIFeatureEnabled(normalizeA2UIEnabled(config.a2ui_enabled));
       setRSIFeatureEnabled(normalizeRSIEnabled(config.rsi_enabled));
       setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(config.trajectory_ui_enabled));
       setTeamOrganizationUiEnabled(config.team_organization_ui_enabled);
       setTeamScheduledDispatchEnabled(config.team_scheduled_dispatch_enabled);
-      setServerConfig(config);
+      const collaborationSnapshotApplied = applyMultiModelCollaborationSnapshot(
+        config.multi_model_collaboration_enabled,
+        collaborationRevision,
+      );
+      setServerConfig(collaborationSnapshotApplied ? config : {
+        ...config,
+        multi_model_collaboration_enabled: isMultiModelCollaborationEnabled(),
+      });
       setConfigError(null);
       if (!modelSetupGuideEvaluatedRef.current) {
         modelSetupGuideEvaluatedRef.current = true;
@@ -1952,6 +1991,7 @@ function AppContent({
   }, []);
 
   const handleConfigChanged = useCallback(() => {
+    window.dispatchEvent(new Event(SETTINGS_CONFIG_CHANGED_EVENT));
     void fetchConfig();
   }, [fetchConfig]);
 
@@ -1989,7 +2029,11 @@ function AppContent({
     };
   }, [handleModelsRefresh]);
 
-  const detectExternalCli = useCallback(async (cliAgent: ExternalCliAgentKind, cliPath?: string) => {
+  const detectExternalCli = useCallback(async (
+    cliAgent: ExternalCliAgentKind,
+    cliPath?: string,
+    useBuiltin?: boolean,
+  ) => {
     return request<{
       cli_agent: ExternalCliAgentKind;
       status: "ok" | "warning" | "missing" | "unsupported" | "unavailable";
@@ -2000,6 +2044,7 @@ function AppContent({
     }>("external_cli.detect", {
       cli_agent: cliAgent,
       cli_path: cliPath || "",
+      use_builtin: useBuiltin ? "true" : "false",
     });
   }, [request]);
 
@@ -2064,13 +2109,9 @@ function AppContent({
     };
   }, [getExternalCliDependencyInstallStatus, isConnected]);
 
-  const trackExternalCliDependencyInstalls = useCallback(
-    (statuses: ExternalCliInstallStatuses) => {
-      setExternalCliInstallStatuses(statuses);
-      setExternalCliInstallDialogOpen(true);
-    },
-    [],
-  );
+  const trackExternalCliDependencyInstalls = useCallback((statuses: ExternalCliInstallStatuses) => {
+    setExternalCliInstallStatuses(statuses);
+  }, []);
 
   const updateExternalCliInstallStatus = useCallback(
     (cliAgent: ExternalCliAgentKind, status: ExternalCliDependencyInstallStatus) => {
@@ -2201,15 +2242,19 @@ function AppContent({
     }, 8000);
   }, [clearProactiveToastTimer, proactiveNotificationMessage, setProactiveNotification]);
 
+  const configFetchedForConnectionRef = useRef(false);
   useEffect(() => {
-    if (!isConnected || initialDataLoaded) {
+    if (!isConnected) {
+      configFetchedForConnectionRef.current = false;
       return;
     }
+    if (configFetchedForConnectionRef.current) return;
+    configFetchedForConnectionRef.current = true;
     void (async () => {
       await fetchConfig();
       setInitialDataLoaded(true);
     })();
-  }, [fetchConfig, initialDataLoaded, isConnected]);
+  }, [fetchConfig, isConnected]);
 
   const initialProjectsLoadedRef = useRef(false);
 
@@ -2763,7 +2808,7 @@ function AppContent({
     // 模式，无论当前会话是什么模式、也无论有没有未发送的集群模式草稿，跳转会话都要回到单
     // agent 模式（bug003）。
     const nextMode = options.forceMode ?? resolvedEntrySettings.mode;
-    const { selectedModelName } = resolvedEntrySettings;
+    const { selectedModelName, selectedModelSelection } = resolvedEntrySettings;
     setChatWelcomeVariant(options.welcomeVariant ?? null);
     const selectedProject = options.project ?? useWorkspaceStore.getState().selectedProject;
     const projectDir = resolveNewConversationProjectDir(
@@ -2785,7 +2830,7 @@ function AppContent({
       && pendingNewRuntime?.agentGroupSelectionIntent.kind === 'select'
       ? pendingNewRuntime.agentGroupSelectionIntent
       : null;
-    resetNewConversationRuntime({ mode: nextMode, selectedModelName, projectDir });
+    resetNewConversationRuntime({ mode: nextMode, selectedModelName, selectedModelSelection, projectDir });
     if (pendingAgentSelection) {
       useSessionStore.getState().setAgentSelectionIntent(NEW_CONVERSATION_ID, pendingAgentSelection);
     }
@@ -2925,6 +2970,7 @@ function AppContent({
     const runtimeSettings = {
       mode: pendingRuntime?.mode ?? mode,
       selectedModelName: sessionStore.getEffectiveModelName(NEW_CONVERSATION_ID),
+      selectedModelSelection: pendingRuntime?.selectedModelSelection ?? null,
       projectDir: pendingRuntime?.projectDirectory ?? null,
       persistSession: false,
     };
@@ -2955,11 +3001,7 @@ function AppContent({
         createParams.previous_session_id = previousSession.sessionId;
         createParams.previous_mode = previousSession.mode;
       }
-      if (pendingRuntime?.selectedModelSelection) {
-        createParams.model_selection = pendingRuntime.selectedModelSelection;
-      } else if (runtimeSettings.selectedModelName) {
-        createParams.model_name = runtimeSettings.selectedModelName;
-      }
+      Object.assign(createParams, useSessionStore.getState().getModelSelectionPayload(NEW_CONVERSATION_ID));
       if (workContext.project_id) createParams.project_id = workContext.project_id;
       if (workContext.project_dir) createParams.project_dir = workContext.project_dir;
 
@@ -3004,6 +3046,13 @@ function AppContent({
       const pendingDispatchMode = resolveNewSessionDispatchMode(pendingRuntime?.teamDispatchMode);
       if (pendingDispatchMode) {
         sessionStore.setTeamDispatchMode(newSid, pendingDispatchMode);
+      }
+      const pendingBootstrapMode = resolveNewSessionBootstrapMode(
+        pendingDispatchMode,
+        pendingRuntime?.teamBootstrapMode,
+      );
+      if (pendingBootstrapMode) {
+        sessionStore.setTeamBootstrapMode(newSid, pendingBootstrapMode);
       }
       if (usePlanStore.getState().isActive(NEW_CONVERSATION_ID)) {
         usePlanStore.getState().setActive(newSid, true, {
@@ -3055,6 +3104,26 @@ function AppContent({
       await sendMessage(content, currentSessionId, mediaItems, options);
       return;
     }
+    const currentState = useSessionStore.getState();
+    const currentRuntime = currentState.getRuntime(currentSessionId);
+    const currentMetadata = currentState.currentSession?.session_id === currentSessionId
+      ? currentState.currentSession
+      : currentState.sessions.find((session) => session.session_id === currentSessionId);
+    const isDesignLanding = currentSessionId === NEW_CONVERSATION_ID
+      && useWorkspaceStore.getState().workMode === 'design';
+    if (
+      !isDesignLanding &&
+      !useChatStore.getState().getRuntime(currentSessionId)?.isProcessing &&
+      isConversationModelGroupBlocked({
+        mode: currentRuntime?.mode,
+        cronId: currentMetadata?.cron_id,
+        selectedModelSelection: currentRuntime?.selectedModelSelection,
+        collaborationEnabled: isMultiModelCollaborationEnabled(),
+      })
+    ) {
+      toast.open({ content: t('chat.modelSelector.collaborationDisabled'), variant: 'error' });
+      return;
+    }
     if (currentSessionId === NEW_CONVERSATION_ID) {
       const persistCommand = parsePersistSessionCommand(content);
       if (persistCommand.persistSession && !persistCommand.content) {
@@ -3065,10 +3134,52 @@ function AppContent({
       if (creatingSessionRef.current) return;
       creatingSessionRef.current = true;
       useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, true);
+      if (isDesignLanding) {
+        try {
+          const created = await submitDesignComposer({
+            prompt: messageContent,
+            mediaItems,
+          });
+          const store = useWorkspaceStore.getState();
+          if (!store.expandedProjectIds[created.projectId]) {
+            store.toggleProjectExpanded(created.projectId);
+          }
+          await store.loadProjects();
+          await store.loadProjectSessions(created.projectId);
+          const project = useWorkspaceStore.getState().projects.find(
+            (item) => item.project_id === created.projectId,
+          );
+          if (project && !project.is_default) store.setSelectedProject(project);
+          navigate({
+            kind: 'design-project',
+            projectId: created.projectId,
+            sessionId: created.sessionId,
+          });
+        } catch (error) {
+          const code = error instanceof Error ? error.message : '';
+          const referenceError = code === 'image_limit'
+            ? t('designer.chat.limitImages')
+            : code === 'video_limit'
+              ? t('designer.chat.limitVideo')
+              : code === 'audio_limit'
+                ? t('designer.chat.limitAudio')
+                : code === 'too_large'
+                  ? t('designer.chat.tooLarge')
+                  : code === 'unsupported'
+                    ? t('designer.chat.unsupported')
+                    : '';
+          window.alert(referenceError || (code && code !== 'empty' ? code : t('designer.chat.bootstrapError')));
+        } finally {
+          creatingSessionRef.current = false;
+          useChatStore.getState().setProcessing(NEW_CONVERSATION_ID, false);
+        }
+        return;
+      }
       const newRuntime = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID);
       const runtimeSettings = {
         mode: newRuntime?.mode ?? mode,
         selectedModelName: useSessionStore.getState().getEffectiveModelName(NEW_CONVERSATION_ID),
+        selectedModelSelection: newRuntime?.selectedModelSelection ?? null,
         projectDir: newRuntime?.projectDirectory ?? null,
         persistSession: persistCommand.persistSession,
       };
@@ -3110,11 +3221,7 @@ function AppContent({
           createParams.previous_session_id = previousSession.sessionId;
           createParams.previous_mode = previousSession.mode;
         }
-        if (newRuntime?.selectedModelSelection) {
-          createParams.model_selection = newRuntime.selectedModelSelection;
-        } else if (runtimeSettings.selectedModelName) {
-          createParams.model_name = runtimeSettings.selectedModelName;
-        }
+        Object.assign(createParams, useSessionStore.getState().getModelSelectionPayload(NEW_CONVERSATION_ID));
         if (workContext.project_id) {
           createParams.project_id = workContext.project_id;
         }
@@ -3190,6 +3297,13 @@ function AppContent({
         const newConvDispatchMode = resolveNewSessionDispatchMode(newConvSwarmflow?.teamDispatchMode);
         if (newConvDispatchMode) {
           useSessionStore.getState().setTeamDispatchMode(newSid, newConvDispatchMode);
+        }
+        const newConvBootstrapMode = resolveNewSessionBootstrapMode(
+          newConvDispatchMode,
+          newConvSwarmflow?.teamBootstrapMode,
+        );
+        if (newConvBootstrapMode) {
+          useSessionStore.getState().setTeamBootstrapMode(newSid, newConvBootstrapMode);
         }
         pendingNewConversationRef.current = false;
         useSessionStore.getState().removeRuntime(NEW_CONVERSATION_ID);
@@ -3612,6 +3726,31 @@ function AppContent({
     return window.confirm(t('settingsPanel.dialog.discardConfirm'));
   }, [activeNav, t]);
 
+  const handleSelectDesignSession = useCallback((project: ProjectInfo, nextSessionId: string) => {
+    if (!confirmLeaveSettings()) {
+      return;
+    }
+    setSelectedProject(project);
+    setActiveNav('chat');
+    navigate({
+      kind: 'design-project',
+      projectId: project.project_id,
+      sessionId: nextSessionId,
+    });
+  }, [confirmLeaveSettings, navigate, setSelectedProject]);
+
+  const handleProjectRemoved = useCallback((projectId: string, removedWorkMode: WorkMode) => {
+    // 目前Design功能页是唯一需要处理项目软删除的场景
+    // 打开项目的URL是 `/design/<id>`，但是回到上层是`/chat/new`
+    if (
+      removedWorkMode === 'design'
+      && route.kind === 'design-project'
+      && route.projectId === projectId
+    ) {
+      navigate({ kind: 'chat-new' });
+    }
+  }, [navigate, route]);
+
   const requestSessionNavigation = useCallback(
     (target: Session | 'new', options?: NewConversationOptions) => {
       // 会话切换同样尊重未保存守卫：非设置页恒放行，设置页（仅 peek 入口可达）弹确认框
@@ -3673,6 +3812,10 @@ function AppContent({
       if (nav === 'agents') setHasVisitedAgents(true);
       if (nav === 'skills') setHasVisitedSkills(true);
       if (nav === 'personalContext') setHasVisitedPersonalContext(true);
+      if (nav === 'design') {
+        setTeamAreaExpanded(false);
+        setToolPanelHidden(true);
+      }
       return true;
     },
     [
@@ -3928,6 +4071,9 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               activeSessionId={sessionId === NEW_CONVERSATION_ID ? null : sessionId}
               onNew={(options) => requestSessionNavigation('new', options)}
               onSelect={requestSessionNavigation}
+              onSelectDesignSession={handleSelectDesignSession}
+              activeDesignSessionId={route.kind === 'design-project' ? route.sessionId : undefined}
+              onProjectRemoved={handleProjectRemoved}
               onOpenCron={() => handleNavigate('cron')}
               isCronActive={false}
               collapsed={false}
@@ -3965,12 +4111,34 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 activeSessionId={sessionId === NEW_CONVERSATION_ID ? null : sessionId}
                 onNew={(options) => requestSessionNavigation('new', options)}
                 onSelect={requestSessionNavigation}
+                onSelectDesignSession={handleSelectDesignSession}
+                activeDesignSessionId={route.kind === 'design-project' ? route.sessionId : undefined}
+                onProjectRemoved={handleProjectRemoved}
                 onOpenCron={() => handleNavigate('cron')}
                 isCronActive={false}
                 collapsed={conversationSidebarCollapsed}
                 floating={conversationSidebarFloating}
                 onToggleCollapse={() => setConversationSidebarCollapsed((v) => !v)}
+                hideCollapseButton={
+                  workspaceWorkMode === 'design' && route.kind === 'design-project'
+                }
               />
+              {workspaceWorkMode === 'design' && route.kind === 'design-project' ? (
+                  <DesignerPage
+                    projectId={route.projectId}
+                    sessionId={route.sessionId}
+                    sidebarCollapsed={conversationSidebarCollapsed}
+                    onToggleSidebarCollapse={() =>
+                      setConversationSidebarCollapsed((v) => !v)
+                    }
+                    onOpenSession={(nextProjectId, nextSessionId, options) => {
+                      navigate(
+                        { kind: 'design-project', projectId: nextProjectId, sessionId: nextSessionId },
+                        options,
+                      );
+                    }}
+                  />
+              ) : (
               <div
                 className={`chat-workspace flex-1 flex min-h-0 overflow-hidden ${insetTrajectoryFloatingTasks ? 'chat-workspace--trajectory-floating-tools' : ''}`}
               >
@@ -4132,6 +4300,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                   <HeartbeatPanel sessionId={sessionId} onClose={() => setHeartbeatPanelOpen(false)} />
                 )}
               </div>
+              )}
             </div>
           </>
         )}
@@ -4181,6 +4350,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               activeSessionId={null}
               onNew={(options) => requestSessionNavigation('new', options)}
               onSelect={requestSessionNavigation}
+              onSelectDesignSession={handleSelectDesignSession}
               onOpenCron={() => handleNavigate('cron')}
               isCronActive
               collapsed={conversationSidebarCollapsed}
@@ -4233,7 +4403,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               externalCliInstallBusy={Object.values(externalCliInstallStatuses).some(
                 (status) => status?.status === 'running',
               )}
-              onOpenExternalCliInstallDialog={() => setExternalCliInstallDialogOpen(true)}
+              onGetExternalCliInstallStatus={getExternalCliDependencyInstallStatus}
+              onExternalCliInstallStatusChange={updateExternalCliInstallStatus}
               externalCliPendingChoices={externalCliPendingChoices}
               onExternalCliPendingChoicesChange={setExternalCliPendingChoices}
               externalCliDetectResults={externalCliDetectResults}
@@ -4413,14 +4584,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
           </div>
         </div>
       )}
-
-      <ExternalCliInstallDialog
-        open={externalCliInstallDialogOpen}
-        statuses={externalCliInstallStatuses}
-        onClose={() => setExternalCliInstallDialogOpen(false)}
-        onGetStatus={getExternalCliDependencyInstallStatus}
-        onStatusChange={updateExternalCliInstallStatus}
-      />
 
       {/* 登录弹窗：默认不显示，由 requestLogin() 等事件唤起 */}
       <LoginDialog />

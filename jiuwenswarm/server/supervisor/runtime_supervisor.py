@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
@@ -29,6 +31,7 @@ from jiuwenswarm.server.ipc.protocol import (
 from jiuwenswarm.server.ipc.stream import IpcConnection
 from jiuwenswarm.server.lifecycle import Readiness, ReadinessState
 from jiuwenswarm.server.supervisor.affinity import SessionAffinity
+from jiuwenswarm.server.supervisor.diagnostics import dump_runtime_state
 from jiuwenswarm.server.supervisor.worker_process import (
     WorkerProcess,
     default_socket_path,
@@ -50,6 +53,23 @@ def _is_server_push(payload: dict[str, Any]) -> bool:
 _HEARTBEAT_INTERVAL = 10.0
 _HEARTBEAT_TIMEOUT = 30.0
 _HELLO_TIMEOUT = 10.0
+_WATCHDOG_INTERVAL = 5.0
+_FORWARD_QUEUE_SIZE = 256
+_FORWARD_TIMEOUT = 10.0
+_FORWARD_DRAIN_TIMEOUT = 1.0
+# Transport stays alive (pongs flow) but the Worker's business loop has not
+# run: warn once it outlasts a heartbeat window, replace the Worker only when
+# the stall is sustained.
+_WORKER_STALL_WARN = 30.0
+_WORKER_STALL_RESTART = 180.0
+
+_GatewayRoute = tuple[Any, asyncio.Lock]
+_ForwardQueue = asyncio.Queue[tuple[dict[str, Any], _GatewayRoute | None]]
+
+# Worker restart + fresh Runtime import budget for the reload-driven recovery.
+# Gateway unary requests default to a 600s timeout, so blocking one reload
+# request for this long stays well inside the caller's patience.
+_RECOVERY_TIMEOUT = 90.0
 
 
 class RuntimeSupervisor:
@@ -106,7 +126,17 @@ class RuntimeSupervisor:
         self._generation = 0
         self._peer_generation: int | None = None
         self._last_rx = 0.0
+        self._worker_last_beat = 0.0
+        self._stall_warned_at = 0.0
+        self._forward_queue: _ForwardQueue | None = None
+        self._forward_started = 0.0
+        self._forward_request_id = ""
+        self._event_loop_lag = 0.0
+        self._observed_loop_lag = 0.0
+        self._last_dump_at = 0.0
+        self._last_dump_path: Path | None = None
         self._session_lock = asyncio.Lock()
+        self._recover_lock = asyncio.Lock()
 
     @property
     def socket_path(self) -> str:
@@ -157,6 +187,100 @@ class RuntimeSupervisor:
             self._gateway_lock = None
         await self._notify_gateway(attached=False, remote=remote)
 
+    async def recover_from_failed(self, timeout: float = _RECOVERY_TIMEOUT) -> bool:
+        """Restart a FAILED Worker and wait for ``AGENT_READY``.
+
+        Called by ``ExecutionAdmission`` when a config reload reaches a FAILED
+        runtime: reloading config is the operator's "dependencies are fixed,
+        try again" signal, so refusing it would leave the AgentServer dead
+        until a full process restart. The failed resident Worker is shut down
+        even when this supervisor reattached to it — a Worker whose Runtime
+        failed to load never retries on its own, so keeping it alive only
+        blocks the IPC socket a fresh Worker must claim.
+        """
+        if self._stopping:
+            return False
+        state = self._readiness.state
+        if state is ReadinessState.DRAINING:
+            return False
+        if state is not ReadinessState.FAILED:
+            return bool(self._readiness.snapshot()["agent_ready"])
+        async with self._recover_lock:
+            state = self._readiness.state
+            if state is ReadinessState.DRAINING:
+                return False
+            if state is not ReadinessState.FAILED:
+                return bool(self._readiness.snapshot()["agent_ready"])
+            logger.warning(
+                "[Supervisor] reload requested while runtime FAILED; restarting worker: %s",
+                self._fatal_reason or "unknown failure",
+            )
+            # Clear the sticky failure so the supervise loop may bring the
+            # Worker up again, then tear the broken Worker process down.
+            self._fatal = False
+            self._fatal_reason = ""
+            self._restart_count = 0
+            self._readiness.mark_recovering("reload requested after runtime failure")
+            # Hold the session lock so a background restart inside a live
+            # supervise loop cannot reattach to the dying Worker socket.
+            async with self._session_lock:
+                await self._terminate_failed_worker()
+                task = self._loop_task
+                if task is not None and not task.done():
+                    # The loop is parked in _pump/recv; closing the connection
+                    # wakes it into its own restart path.
+                    conn = self._conn
+                    if conn is not None:
+                        self._conn = None
+                        try:
+                            await conn.close()
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "[Supervisor] recovery ipc close failed", exc_info=True
+                            )
+                else:
+                    self._loop_task = asyncio.create_task(
+                        self._supervise(), name="runtime-supervisor"
+                    )
+            try:
+                return await asyncio.wait_for(
+                    self._readiness.wait_agent_ready(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Supervisor] runtime recovery did not reach AGENT_READY in %.0fs",
+                    timeout,
+                )
+                return False
+
+    async def _terminate_failed_worker(self) -> None:
+        """Shut the FAILED Worker down, including a reattached resident one."""
+        conn = self._conn
+        self._conn = None
+        process = self._process if self._owns_process else None
+        if conn is not None:
+            try:
+                await conn.send(
+                    {"kind": KIND_SHUTDOWN, "reason": "runtime-failed-recovery"}
+                )
+            except (OSError, RuntimeError):
+                logger.info("[Supervisor] worker shutdown send skipped; ipc is down")
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("[Supervisor] worker shutdown close failed", exc_info=True)
+        if process is not None:
+            if await process.wait(timeout=5.0) is None:
+                await process.stop()
+        else:
+            # A reattached Worker has no process handle; give the SHUTDOWN a
+            # moment to release the IPC socket before the supervise loop
+            # reconnects, so it spawns a fresh Worker instead of reattaching
+            # to the dying one.
+            await asyncio.sleep(0.5)
+        self._process = None
+        self._owns_process = False
+
     async def dispatch_parsed_request(
         self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock
     ) -> None:
@@ -164,7 +288,9 @@ class RuntimeSupervisor:
         worker_id = self._affinity.worker_for(request.session_id)
         slot = self._registry.get(worker_id)
         if slot is None or self._conn is None:
-            await self._emit_error(ws, request, send_lock, "runtime worker is not connected")
+            await self._emit_error(
+                ws, request, send_lock, "runtime worker is not connected"
+            )
             return
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -187,14 +313,26 @@ class RuntimeSupervisor:
                 return
             result = await future
         except Exception as exc:  # noqa: BLE001
-            await self._emit_error(ws, request, send_lock, f"runtime worker closed: {exc}")
+            await self._emit_error(
+                ws, request, send_lock, f"runtime worker closed: {exc}"
+            )
             return
         finally:
             self._pending.pop(request_id, None)
             self._routes.pop(request_id, None)
-        if request_id and not result.get("ok", False) and not result.get("delivered", False):
+        if (
+            request_id
+            and not result.get("ok", False)
+            and not result.get("delivered", False)
+        ):
             error = str(result.get("error") or "runtime worker closed")
-            await self._emit_error(ws, request, send_lock, error)
+            await self._emit_error(
+                ws,
+                request,
+                send_lock,
+                error,
+                code=str(result.get("code") or "WORKER_CLOSED"),
+            )
 
     async def stop(self, *, terminate_worker: bool = False) -> None:
         """Detach from the Worker so this Front can exit.
@@ -311,6 +449,9 @@ class RuntimeSupervisor:
         self._peer_generation = peer if isinstance(peer, int) else self._generation
         self._runtime_loaded = bool(hello.get("runtime_loaded"))
         self._last_rx = time.monotonic()
+        # The hello itself was produced by the Worker's event loop.
+        self._worker_last_beat = self._last_rx
+        self._stall_warned_at = 0.0
         pid = hello.get("pid")
         self._worker_pid = int(pid) if isinstance(pid, int) else None
         instance = hello.get("instance")
@@ -332,13 +473,139 @@ class RuntimeSupervisor:
         generation = self._generation
         if conn is None:
             return
+        queue: _ForwardQueue = asyncio.Queue(maxsize=_FORWARD_QUEUE_SIZE)
+        self._forward_queue = queue
+        writer = asyncio.create_task(
+            self._forward_messages(queue, generation), name="runtime-gateway-forward"
+        )
+        try:
+            while not self._stopping and self._generation == generation:
+                message = await conn.recv()
+                self._last_rx = time.monotonic()
+                await self._handle(message)
+        except (OSError, RuntimeError):
+            # Deliver already-received terminal frames on EOF when possible,
+            # but never hold Worker recovery behind an unavailable Gateway.
+            if not self._stopping and self._generation == generation:
+                try:
+                    await asyncio.wait_for(queue.join(), _FORWARD_DRAIN_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[Supervisor] Gateway forward drain timed out; queued=%s generation=%s",
+                        queue.qsize(),
+                        generation,
+                    )
+            raise
+        finally:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
+            if self._forward_queue is queue:
+                self._forward_queue = None
+
+    async def _forward_messages(self, queue: _ForwardQueue, generation: int) -> None:
         while not self._stopping and self._generation == generation:
-            message = await conn.recv()
-            self._last_rx = time.monotonic()
-            await self._handle(message)
+            message, route = await queue.get()
+            try:
+                if self._stopping or self._generation != generation:
+                    return
+                if message.get("kind") == KIND_REQUEST_DONE:
+                    self._finish_request(message)
+                elif route is not None and self._route_is_current(message, route):
+                    await self._forward_wire(message, route=route)
+            finally:
+                queue.task_done()
+
+    def _queue_forward(
+        self, message: dict[str, Any], route: _GatewayRoute | None
+    ) -> None:
+        queue = self._forward_queue
+        if queue is None:
+            raise RuntimeError("Gateway forwarding queue is not running")
+        try:
+            queue.put_nowait((message, route))
+        except asyncio.QueueFull:
+            request_id = str(message.get("request_id") or "")
+            error = "Gateway forwarding queue is full"
+            logger.warning(
+                "[Supervisor] %s; request_id=%s queued=%s generation=%s",
+                error,
+                request_id,
+                queue.qsize(),
+                self._generation,
+            )
+            self._fail_forwarding(request_id, error)
+
+    def _log_diagnostics(self, reason: str) -> None:
+        now = time.monotonic()
+        conn_stats = getattr(self._conn, "diagnostics", None)
+        forward_stats = getattr(self._forwarder, "diagnostics", None)
+        stderr_path = getattr(self._process, "stderr_path", None)
+        snapshot = {
+            "reason": reason,
+            "pid": self._worker_pid,
+            "generation": self._generation,
+            "last_rx_age": now - self._last_rx,
+            "ipc": conn_stats() if callable(conn_stats) else {},
+            "gateway": forward_stats() if callable(forward_stats) else {},
+            "forward_queued": self._forward_queue.qsize()
+            if self._forward_queue is not None
+            else 0,
+            "forward_request_id": self._forward_request_id,
+            "forward_seconds": now - self._forward_started
+            if self._forward_started
+            else 0.0,
+            "event_loop_lag_seconds": max(
+                self._event_loop_lag, self._observed_loop_lag
+            ),
+            "worker_loop_beat_age": now - self._worker_last_beat
+            if self._worker_last_beat
+            else None,
+            "worker_stderr": str(stderr_path) if stderr_path is not None else None,
+        }
+        logger.warning("[Supervisor] runtime diagnostics: %s", json.dumps(snapshot))
+        if now - self._last_dump_at < 10.0:
+            return
+        self._last_dump_at = now
+        try:
+            if stderr_path is not None:
+                directory = stderr_path.parent
+            else:
+                from jiuwenswarm.common.utils import get_logs_dir
+
+                directory = get_logs_dir() / "runtime_diagnostics"
+            self._last_dump_path = dump_runtime_state(directory, snapshot)
+            self._observed_loop_lag = 0.0
+            logger.warning(
+                "[Supervisor] runtime diagnostic dump=%s", self._last_dump_path
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("[Supervisor] runtime diagnostic dump failed", exc_info=True)
+
+    def _route_is_current(self, message: dict[str, Any], route: _GatewayRoute) -> bool:
+        payload = message.get("payload") or {}
+        request_id = str(message.get("request_id") or payload.get("request_id") or "")
+        current = self._routes.get(request_id)
+        if current is not None:
+            return current[0] is route[0] and current[1] is route[1]
+        return _is_server_push(payload) and self._gateway_ws is route[0]
+
+    def _fail_forwarding(self, request_id: str, error: str) -> None:
+        # Completion from the Worker cannot turn a failed Gateway delivery
+        # into success. Retire its route so queued frames cannot follow an error.
+        self._routes.pop(request_id, None)
+        self._finish_request(
+            {
+                "request_id": request_id,
+                "ok": False,
+                "delivered": False,
+                "error": error,
+                "code": "GATEWAY_FORWARD_FAILED",
+            }
+        )
 
     async def _handle(self, message: dict[str, Any]) -> None:
         kind = str(message.get("kind") or "")
+        self._note_worker_beat(message)
         if kind == KIND_WIRE:
             if not self._accepts_peer_generation(message):
                 logger.warning(
@@ -348,7 +615,9 @@ class RuntimeSupervisor:
                     self._peer_generation,
                 )
                 return
-            await self._forward_wire(message)
+            route = self._wire_route(message)
+            if route is not None:
+                self._queue_forward(message, route)
             return
         if kind == KIND_REQUEST_DONE:
             if not self._accepts_peer_generation(message):
@@ -359,7 +628,9 @@ class RuntimeSupervisor:
                     self._peer_generation,
                 )
                 return
-            self._finish_request(message)
+            self._queue_forward(
+                message, self._routes.get(str(message.get("request_id") or ""))
+            )
             return
         if kind == KIND_READINESS:
             self._apply_readiness(message)
@@ -370,10 +641,10 @@ class RuntimeSupervisor:
             return
         logger.info("[Supervisor] ignored ipc kind=%s", kind)
 
-    async def _forward_wire(self, message: dict[str, Any]) -> None:
+    def _wire_route(self, message: dict[str, Any]) -> _GatewayRoute | None:
         payload = message.get("payload")
         if not isinstance(payload, dict):
-            return
+            return None
         request_id = str(message.get("request_id") or payload.get("request_id") or "")
         route = self._routes.get(request_id) if request_id else None
         if route is not None:
@@ -386,25 +657,64 @@ class RuntimeSupervisor:
                 request_id,
                 message.get("generation"),
             )
-            return
+            return None
         if self._forwarder is None or ws is None or send_lock is None:
             logger.warning(
                 "[Supervisor] dropped worker wire; no Gateway connection request_id=%s",
                 request_id,
             )
-            return
+            return None
+        return ws, send_lock
+
+    async def _forward_wire(
+        self, message: dict[str, Any], *, route: _GatewayRoute
+    ) -> None:
+        payload = message["payload"]
+        request_id = str(message.get("request_id") or payload.get("request_id") or "")
+        ws, send_lock = route
+        self._forward_started = time.monotonic()
+        self._forward_request_id = request_id
         try:
-            await self._forwarder.send(payload, ws=ws, send_lock=send_lock)
+            async with asyncio.timeout(_FORWARD_TIMEOUT):
+                await self._forwarder.send(payload, ws=ws, send_lock=send_lock)
+        except asyncio.TimeoutError:
+            error = "Gateway forwarding timed out"
+            logger.warning(
+                "[Supervisor] %s; request_id=%s timeout=%.1fs generation=%s",
+                error,
+                request_id,
+                _FORWARD_TIMEOUT,
+                self._generation,
+            )
+            self._log_diagnostics(error)
+            self._fail_forwarding(request_id, error)
         except Exception:  # noqa: BLE001
             logger.warning(
                 "[Supervisor] dropped worker wire; Gateway forward failed request_id=%s",
                 request_id,
                 exc_info=True,
             )
+            self._fail_forwarding(request_id, "Gateway forwarding failed")
+        finally:
+            self._forward_started = 0.0
+            self._forward_request_id = ""
 
     def _accepts_peer_generation(self, message: dict[str, Any]) -> bool:
         raw = message.get("generation")
         return isinstance(raw, int) and raw == self._peer_generation
+
+    def _note_worker_beat(self, message: dict[str, Any]) -> None:
+        """Track when the Worker's event loop last provably ran.
+
+        Every frame is loop-produced except the off-loop heartbeat pong, which
+        reports its own stall age instead. A missing field (legacy Worker)
+        counts as a fresh beat, keeping old Workers outside stall detection.
+        """
+        age = message.get("loop_beat_age")
+        if isinstance(age, (int, float)) and age >= 0:
+            self._worker_last_beat = time.monotonic() - float(age)
+        else:
+            self._worker_last_beat = time.monotonic()
 
     def _finish_request(self, message: dict[str, Any]) -> None:
         request_id = str(message.get("request_id") or "")
@@ -489,18 +799,29 @@ class RuntimeSupervisor:
         request: AgentRequest,
         send_lock: asyncio.Lock,
         error: str,
+        *,
+        code: str = "WORKER_CLOSED",
     ) -> None:
         response = AgentResponse(
             request_id=request.request_id,
             channel_id=request.channel_id,
             ok=False,
-            payload={"error": error, "code": "WORKER_CLOSED"},
+            payload={"error": error, "code": code},
             metadata=request.metadata,
         )
         wire = encode_response(response, response_id=request.request_id)
         if self._forwarder is None:
             return
-        await self._forwarder.send(wire, ws=ws, send_lock=send_lock)
+        try:
+            async with asyncio.timeout(_FORWARD_TIMEOUT):
+                await self._forwarder.send(wire, ws=ws, send_lock=send_lock)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Supervisor] Gateway error delivery failed; request_id=%s error=%s",
+                request.request_id,
+                error,
+                exc_info=True,
+            )
 
     @staticmethod
     def _schedule(coro: Any) -> None:
@@ -540,16 +861,79 @@ class RuntimeSupervisor:
 
     async def _watchdog(self, generation: int) -> None:
         while not self._stopping and generation == self._generation:
-            await asyncio.sleep(5.0)
+            expected_wakeup = time.monotonic() + _WATCHDOG_INTERVAL
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            self._event_loop_lag = max(0.0, time.monotonic() - expected_wakeup)
             if generation != self._generation:
                 return
-            if time.monotonic() - self._last_rx <= _HEARTBEAT_TIMEOUT:
-                continue
-            logger.warning("[Supervisor] runtime worker heartbeat timed out")
+            now = time.monotonic()
+            if now - self._last_rx > _HEARTBEAT_TIMEOUT:
+                if self._event_loop_lag >= _WATCHDOG_INTERVAL:
+                    # This Front's own loop stalled, so pending pongs may be
+                    # sitting in resolved futures. Do not execute the Worker
+                    # for our own stall; the next cycle re-checks with fresh
+                    # evidence once the pump has drained. Keep the peak lag
+                    # so the deferred verdict still carries the evidence.
+                    self._observed_loop_lag = max(
+                        self._observed_loop_lag, self._event_loop_lag
+                    )
+                    logger.warning(
+                        "[Supervisor] supervisor event loop stalled %.1fs; "
+                        "deferring worker health verdict",
+                        self._event_loop_lag,
+                    )
+                    continue
+                logger.warning(
+                    "[Supervisor] runtime worker heartbeat timed out; last_rx_age=%.1fs "
+                    "forward_queued=%s generation=%s pid=%s",
+                    now - self._last_rx,
+                    self._forward_queue.qsize() if self._forward_queue is not None else 0,
+                    generation,
+                    self._worker_pid,
+                )
+                self._log_diagnostics("runtime worker heartbeat timed out")
+                conn = self._conn
+                if conn is not None:
+                    await conn.close()
+                return
+            if self._worker_last_beat and await self._classify_worker_stall(now):
+                return
+            continue
+
+    async def _classify_worker_stall(self, now: float) -> bool:
+        """Separate a stalled business loop from a healthy transport.
+
+        Returns True when the session was terminated and the Worker is being
+        replaced, so the caller stops checking this generation.
+        """
+        beat_age = now - self._worker_last_beat
+        if beat_age <= _WORKER_STALL_WARN:
+            self._stall_warned_at = 0.0
+            return False
+        if beat_age > _WORKER_STALL_RESTART:
+            logger.warning(
+                "[Supervisor] runtime worker business loop stalled %.1fs "
+                "(transport alive); restarting generation=%s pid=%s",
+                beat_age,
+                self._generation,
+                self._worker_pid,
+            )
+            self._log_diagnostics("worker business loop stalled")
             conn = self._conn
             if conn is not None:
                 await conn.close()
-            return
+            return True
+        if now - self._stall_warned_at >= _WATCHDOG_INTERVAL * 2:
+            self._stall_warned_at = now
+            logger.warning(
+                "[Supervisor] runtime worker loop unresponsive %.1fs "
+                "(transport alive, waiting up to %.0fs); pid=%s",
+                beat_age,
+                _WORKER_STALL_RESTART,
+                self._worker_pid,
+            )
+            self._log_diagnostics("worker loop unresponsive")
+        return False
 
     async def _watch_process(self, generation: int) -> None:
         process = self._process if self._owns_process else None
@@ -561,7 +945,11 @@ class RuntimeSupervisor:
                 continue
             if self._stopping or generation != self._generation:
                 return
-            logger.warning("[Supervisor] runtime worker exited: code=%s", code)
+            logger.warning(
+                "[Supervisor] runtime worker exited: code=%s stderr=%s",
+                code,
+                process.stderr_path,
+            )
             conn = self._conn
             if conn is not None:
                 await conn.close()
