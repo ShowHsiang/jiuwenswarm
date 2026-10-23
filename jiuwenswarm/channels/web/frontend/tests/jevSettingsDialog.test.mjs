@@ -47,7 +47,7 @@ await build({
         contents: path === 'react-i18next'
           ? 'const t = key => key; export const useTranslation = () => ({ t });'
           : path === './ExperimentalSettings'
-            ? ['A2UISetting', 'ExternalCliCustomAgentsItem', 'ProactiveLimitsSetting', 'RSISetting', 'TrajectoryUiSetting']
+            ? ['A2UISetting', 'ExternalCliCustomAgentsItem', 'ProactiveLimitsSetting', 'RSISetting', 'TrajectoryDiagnosisSetting', 'TrajectoryUiSetting']
               .map(name => `export const ${name} = () => null;`).join('\n')
           : path === './A4PSettings' ? 'export const A4PSettings = () => null;'
           : path.endsWith('SettingsServicesProvider')
