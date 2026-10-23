@@ -16,6 +16,7 @@ import secrets
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
@@ -148,6 +149,8 @@ _WEB_FULL_PAYLOAD_EVENT_TYPES = frozenset(
         "rsi.training.status.changed",
         "rsi.training.progress",
         "rsi.training.tree.delta",
+        # The suggestion names the request it follows and its own id for the page's outcome events.
+        "prompt_suggestion.ready",
     }
 )
 
@@ -721,7 +724,17 @@ class WebChannel(BaseWsChannel):
             http=guarded_http_protocol(),
             ws=guarded_websockets_protocol(),
         )
-        self._uvicorn_server = uvicorn.Server(uv_cfg)
+
+        class EmbeddedUvicornServer(uvicorn.Server):
+            @contextmanager
+            def capture_signals(self):
+                # The Gateway owns process signals and coordinates all of its
+                # component shutdowns. Re-raising a captured signal from this
+                # nested server would interrupt that cleanup and leave its task
+                # with an unobserved KeyboardInterrupt.
+                yield
+
+        self._uvicorn_server = EmbeddedUvicornServer(uv_cfg)
         self._running = True
         logger.info(
             "WebChannel 已启动: ws://%s:%s%s (HTTP+WS same port)",
