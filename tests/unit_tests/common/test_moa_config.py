@@ -76,6 +76,28 @@ def test_shared_connection_works_while_browser_policy_is_off(monkeypatch, provid
     assert raw["browser"]["decision"]["mode"] == "llm"
 
 
+@pytest.mark.parametrize("field", ["api_base", "model", "api_key_env"])
+@pytest.mark.parametrize("value", [None, "", "  ", 123])
+def test_shared_connection_rejects_invalid_required_values(field, value):
+    raw = {"browser": {"decision": {"provider": "typesafe", field: value}}}
+    with pytest.raises(ValueError, match=f"Jev {field} is required"):
+        resolve_jev_connection(raw)
+
+
+def test_shared_connection_normalizes_validated_values_without_mutating_config(monkeypatch):
+    monkeypatch.setenv("CUSTOM_JEV_API_KEY", " shared-key ")
+    raw = {"browser": {"decision": {
+        "provider": "custom", "api_base": " https://jev.example.test/v1/ ",
+        "model": " jev-custom ", "api_key_env": " CUSTOM_JEV_API_KEY ",
+    }}}
+    before = deepcopy(raw)
+    assert resolve_jev_connection(raw) == {
+        "api_base": "https://jev.example.test/v1", "model_name": "jev-custom",
+        "api_key": "shared-key", "endpoint_path": "/systemone",
+    }
+    assert raw == before
+
+
 @pytest.mark.parametrize("base", ["", "ftp://example.com", "https://user:secret@example.com", "https://", "https://host/?key=secret"])
 def test_invalid_shared_endpoint_cannot_enable_jev(monkeypatch, base):
     monkeypatch.setenv("JEV_CUSTOM_API_KEY", "shared-key")
