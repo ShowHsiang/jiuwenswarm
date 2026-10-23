@@ -33,12 +33,6 @@ def panel_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_YAML_PATH", path)
     monkeypatch.setattr(handlers, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(handlers, "_get_crypto_provider", lambda: None)
-    a2ui = SimpleNamespace(
-        get_a2ui_config_payload=lambda raw: {},
-        get_default_a2ui_config_payload=lambda: {},
-    )
-    original_provider = handlers.provider
-    monkeypatch.setattr(handlers, "provider", lambda domain: a2ui if domain == "a2ui" else original_provider(domain))
     return path
 
 
