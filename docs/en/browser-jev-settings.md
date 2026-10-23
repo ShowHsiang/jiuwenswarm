@@ -35,8 +35,6 @@ Jev `/decisions` API.
 - Enabling Shadow / Hybrid without a key shows an error in the UI language and retains the
   previous mode. Leaving Browser settings clears the error; returning does not restore it.
 
-![Missing-key feedback in English](../assets/images/jev-missing-key-en.png)
-
 Both consumers select `/decisions` or `/systemone` from the shared provider. Collaboration
 reads the latest settings when its runtime is rebuilt. Browser path, display mode, cookies
 and browser lifecycle are unchanged.
