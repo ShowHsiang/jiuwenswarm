@@ -18,6 +18,7 @@ import { FreeModelsSettings } from './FreeModelsSettings';
 import { ModelDialog } from './ModelDialog';
 import { ModelGroupDialog } from './ModelGroupDialog';
 import { ModelGroupsSettings } from './ModelGroupsSettings';
+import { JevSettings } from './JevSettings';
 import { getVendorLabel } from './ModelProviderSelect';
 import { displayModelProtocol, parseVendorCatalog, withoutGenerationOnlyPresets } from './modelAdapters';
 import {
@@ -112,11 +113,12 @@ export function buildModelResourcePayload(model: ModelEntry): Record<string, unk
   };
 }
 
-export type ModelSettingsTabId = 'models' | 'groups';
+export type ModelSettingsTabId = 'models' | 'groups' | 'jev';
 
 type ModelsSettingsProps = {
   tabs: readonly SettingsTabDefinition<ModelSettingsTabId>[];
   defaultTab: ModelSettingsTabId;
+  disabled?: boolean;
 };
 
 function modelIdentity(model: ModelEntry, index: number): string {
@@ -157,7 +159,7 @@ export function parseModelsPayload(payload: unknown): {
   return { models: normalizedModels, modelGroups, activeModel };
 }
 
-export function ModelsSettings({ tabs, defaultTab }: ModelsSettingsProps) {
+export function ModelsSettings({ tabs, defaultTab, disabled = false }: ModelsSettingsProps) {
   const { t } = useTranslation();
   const { isConnected, request, saveQueue } = useSettingsServices();
   const setAvailableModels = useSessionStore((state) => state.setAvailableModels);
@@ -658,6 +660,8 @@ export function ModelsSettings({ tabs, defaultTab }: ModelsSettingsProps) {
             </div>
           </SettingsSection>
         </div>
+        ) : activeTab === 'jev' ? (
+        <JevSettings disabled={disabled} />
         ) : (
         <ModelGroupsSettings
           models={models}

@@ -63,6 +63,7 @@ const desktopApi = Object.freeze({
     stop: sessionId => invoke('browser:stop', sessionId),
     setBounds: (bounds, sessionId) => invoke('browser:set-bounds', bounds, sessionId),
     setVisible: (visible, sessionId, focus) => invoke('browser:set-visible', visible, sessionId, focus !== false),
+    setHeadless: headless => invoke('browser:set-headless', headless),
     getState: sessionId => invoke('browser:get-state', sessionId),
     listPanels: sessionId => invoke('browser:list-panels', sessionId),
     onPanelsChanged: callback => {

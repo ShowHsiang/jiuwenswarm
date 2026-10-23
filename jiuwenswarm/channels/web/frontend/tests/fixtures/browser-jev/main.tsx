@@ -17,6 +17,9 @@ const config: Record<string, unknown> = {
   jev_openrouter_api_key: 'synthetic-openrouter-key',
   jev_typesafe_api_key: 'synthetic-typesafe-key',
   jev_custom_api_key: '',
+  multi_model_collaboration_enabled: 'false',
+  moa_jev_enabled: 'false',
+  moa_verifier_interval: '3',
 };
 const request: SettingsRequest = async (method, params) => {
   if (method === 'config.get') return { ...config } as never;
@@ -37,8 +40,16 @@ const request: SettingsRequest = async (method, params) => {
 };
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
+  new URLSearchParams(location.search).has('narrow') ? (
+    <iframe
+      title="Jev settings narrow viewport"
+      src={`./index.html?lang=${i18n.language}`}
+      style={{ width: 584, height: 844, border: 0 }}
+    />
+  ) : (
   <SettingsPage
-    definition={openSourceSettingsPageDefinition} initialModuleId="browser"
+    definition={openSourceSettingsPageDefinition} initialModuleId="models"
     isConnected connectionState="ready" request={request}
-  />,
+  />
+  ),
 );
