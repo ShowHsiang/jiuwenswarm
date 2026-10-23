@@ -32,6 +32,8 @@ Jev `/decisions` API.
   even when browser decisions remain in LLM-only mode.
 - Clearing the active key returns browser decisions to LLM only and disables collaboration's
   JEV decision, without deleting other providers' credentials.
+- Enabling Shadow / Hybrid without a key shows an error in the UI language and retains the
+  previous mode. Leaving Browser settings clears the error; returning does not restore it.
 
 Both consumers select `/decisions` or `/systemone` from the shared provider. Collaboration
 reads the latest settings when its runtime is rebuilt. Browser path, display mode, cookies

@@ -104,6 +104,9 @@ export function SettingsPageLayout({
     saveQueue.getSnapshot,
     saveQueue.getSnapshot,
   );
+  const missingJevKey =
+    /^Jev API key is not configured(?: \([A-Za-z_][A-Za-z0-9_]*\))?$/.test(saveStatus.error ?? '') ||
+    saveStatus.error === 'Jev API key is required in Models > Jev settings';
   const availableModules = useMemo(
     () =>
       definition.modules
@@ -120,9 +123,10 @@ export function SettingsPageLayout({
         setPendingModuleId(nextId);
         return;
       }
+      saveQueue.clear();
       setActiveModuleId(nextId);
     },
-    [active?.module.id, saveStatus.status, unsavedChanges],
+    [active?.module.id, saveQueue, saveStatus.status, unsavedChanges],
   );
   if (!active) return null;
   return (
@@ -170,7 +174,9 @@ export function SettingsPageLayout({
             ) : saveStatus.status === 'error' ? (
               <span className="settings-page__status settings-page__status--error" role="alert" data-testid="settings-save-status" data-variant="error">
                 <CircleAlert size={14} aria-hidden />
-                {saveStatus.error || t('settingsPanel.feedback.saveFailed')}
+                {missingJevKey
+                  ? t('settingsPanel.browser.jevKeyMissing')
+                  : saveStatus.error || t('settingsPanel.feedback.saveFailed')}
               </span>
             ) : null}
           </header>
@@ -198,7 +204,10 @@ export function SettingsPageLayout({
         message={t('settingsPanel.dialog.discardConfirm')}
         onCancel={() => setPendingModuleId(null)}
         onConfirm={() => {
-          if (pendingModuleId) setActiveModuleId(pendingModuleId);
+          if (pendingModuleId) {
+            saveQueue.clear();
+            setActiveModuleId(pendingModuleId);
+          }
           setPendingModuleId(null);
         }}
       />
