@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getApiBase } from '../utils/env';
 import { useChatStore } from '../stores/chatStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { openSingleAgentPanel } from './singleAgentPanelState';
 import { openTeamPanel } from './teamPanelState';
-import { isDesktopBrowserHeadless } from './desktopBrowserDisplay';
+import { isDesktopBrowserHeadless, useDesktopBrowserHeadless } from './desktopBrowserDisplay';
 
 const DESKTOP_BROWSER_TAB_EVENT = 'jiuwenclaw-desktop-browser-tab-change';
 const DESKTOP_BROWSER_TAB_FLAGS_KEY = 'jiuwenclaw_desktop_browser_tab_flags';
@@ -13,7 +13,7 @@ const DESKTOP_BROWSER_FILE_EXTENSIONS = new Set(['html', 'htm', 'md', 'markdown'
 
 /** browser 页签的出现/关闭标志，按会话隔离避免跨会话互相污染。 */
 interface DesktopBrowserTabFlags {
-  /** 本会话用内置浏览器打开过聊天文件 */
+  /** A file preview or live browser task requested this session's pane. */
   requested: boolean;
   /** 用户点关闭按钮显式关掉了 browser 页签 */
   closed: boolean;
@@ -109,9 +109,71 @@ export function closeDesktopBrowserTab(): void {
   persistDesktopBrowserTabFlags(activeSessionId(), { closed: true });
 }
 
+/** Reopen on a new MCP task binding, not on retained subagent history or navigation. */
+export function useDesktopBrowserAutoOpen(sessionId: string, onOpen: () => void): void {
+  const desktop = window.jiuwenDesktop;
+  const headless = useDesktopBrowserHeadless();
+  const current = useRef({ sessionId, onOpen });
+  current.current = { sessionId, onOpen };
+  const busyPanels = useRef(new Map<string, string>());
+  const pendingSessions = useRef(new Set<string>());
+  const eventRevision = useRef(0);
+
+  const revealPending = useCallback(() => {
+    const currentSession = current.current.sessionId;
+    if (isDesktopBrowserHeadless() || !pendingSessions.current.has(currentSession)) return;
+    pendingSessions.current.delete(currentSession);
+    persistDesktopBrowserTabFlags(currentSession, { requested: true, closed: false });
+    current.current.onOpen();
+  }, []);
+
+  useEffect(() => {
+    if (!desktop?.isElectron) return;
+    return desktop.browser.onPanelsChanged((panels) => {
+      eventRevision.current += 1;
+      const nextBusy = new Map<string, string>();
+      for (const panel of panels) {
+        if (!panel.busy) continue;
+        nextBusy.set(panel.panelId, panel.sessionId);
+        if (!busyPanels.current.has(panel.panelId)) pendingSessions.current.add(panel.sessionId);
+      }
+      busyPanels.current = nextBusy;
+      const busySessions = new Set(nextBusy.values());
+      for (const pending of pendingSessions.current) {
+        if (!busySessions.has(pending)) pendingSessions.current.delete(pending);
+      }
+      revealPending();
+    });
+  }, [desktop, revealPending]);
+
+  useEffect(() => {
+    if (!desktop?.isElectron) return;
+    let active = true;
+    const revision = eventRevision.current;
+    // A restored busy panel is a baseline, not evidence of a new task. An IPC
+    // event received during this read is newer and must not be overwritten.
+    void desktop.browser.listPanels(sessionId).then((panels) => {
+      if (!active || eventRevision.current !== revision) return;
+      for (const [panelId, owner] of busyPanels.current) {
+        if (owner === sessionId) busyPanels.current.delete(panelId);
+      }
+      for (const panel of panels) {
+        if (panel.sessionId === sessionId && panel.busy) {
+          busyPanels.current.set(panel.panelId, sessionId);
+        }
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [desktop, sessionId]);
+
+  useEffect(() => {
+    revealPending();
+  }, [headless, sessionId, revealPending]);
+}
+
 /**
- * browser 页签可见性标志：文件打开请求过即保持可见，显式关闭后隐藏；
- * 状态持久化，ToolPanel 卸载重建（面板隐藏/切换会话）后仍能恢复。
+ * Persist visibility across ToolPanel remounts. An explicit close hides the
+ * tab until a new headed task or file preview requests it again.
  */
 export function useDesktopBrowserTabFlags(sessionId: string): DesktopBrowserTabFlags {
   const [flags, setFlags] = useState<DesktopBrowserTabFlags>(() => loadDesktopBrowserTabFlags(sessionId));
