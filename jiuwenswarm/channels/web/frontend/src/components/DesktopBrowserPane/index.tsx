@@ -68,7 +68,11 @@ export function DesktopBrowserPane({ sessionId }: { sessionId: string }) {
     // Resolve an existing page before setVisible can create the default page.
     void desktop.browser.listPanels(sessionId).then((allPanels) => {
       if (!receivedEvent) update(allPanels);
-    }).catch(() => {});
+    }).catch((error) => {
+      if (!active) return;
+      console.warn('[desktop.browser] list panels failed:', error);
+      if (!receivedEvent) update([]);
+    });
     return () => {
       active = false;
       unsubscribe();

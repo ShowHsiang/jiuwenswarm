@@ -5,6 +5,7 @@ import { useSessionStore } from '../stores/sessionStore';
 import { openSingleAgentPanel } from './singleAgentPanelState';
 import { openTeamPanel } from './teamPanelState';
 import { isDesktopBrowserHeadless, useDesktopBrowserHeadless } from './desktopBrowserDisplay';
+import type { ElectronBrowserState } from '../types/electron';
 
 const DESKTOP_BROWSER_TAB_EVENT = 'jiuwenclaw-desktop-browser-tab-change';
 const DESKTOP_BROWSER_TAB_FLAGS_KEY = 'jiuwenclaw_desktop_browser_tab_flags';
@@ -17,6 +18,13 @@ interface DesktopBrowserTabFlags {
   requested: boolean;
   /** 用户点关闭按钮显式关掉了 browser 页签 */
   closed: boolean;
+}
+
+interface DesktopBrowserSessionActivity {
+  /** Unknown after a failed read until the first observation establishes a baseline. */
+  busy: Set<string> | null;
+  /** Distinct busy snapshots received before the initial IPC reply. */
+  pending: Set<string>[] | null;
 }
 
 const EMPTY_TAB_FLAGS: DesktopBrowserTabFlags = { requested: false, closed: false };
@@ -115,9 +123,8 @@ export function useDesktopBrowserAutoOpen(sessionId: string, onOpen: () => void)
   const headless = useDesktopBrowserHeadless();
   const current = useRef({ sessionId, onOpen });
   current.current = { sessionId, onOpen };
-  const busyPanels = useRef(new Map<string, string>());
-  const pendingSessions = useRef(new Set<string>());
-  const eventRevision = useRef(0);
+  const sessions = useRef(new Map<string, DesktopBrowserSessionActivity>());
+  const pendingSessions = useRef(new Map<string, Set<string>>());
 
   const revealPending = useCallback(() => {
     const currentSession = current.current.sessionId;
@@ -127,44 +134,99 @@ export function useDesktopBrowserAutoOpen(sessionId: string, onOpen: () => void)
     current.current.onOpen();
   }, []);
 
-  useEffect(() => {
-    if (!desktop?.isElectron) return;
-    return desktop.browser.onPanelsChanged((panels) => {
-      eventRevision.current += 1;
-      const nextBusy = new Map<string, string>();
-      for (const panel of panels) {
-        if (!panel.busy) continue;
-        nextBusy.set(panel.panelId, panel.sessionId);
-        if (!busyPanels.current.has(panel.panelId)) pendingSessions.current.add(panel.sessionId);
+  const observe = useCallback((owner: string, nextBusy: Set<string>) => {
+    const state = sessions.current.get(owner);
+    if (!state) return;
+    if (state.pending) {
+      const previous = state.pending.at(-1);
+      // Navigation/title updates do not add observations while the IPC read is pending.
+      if (!previous || previous.size !== nextBusy.size || [...nextBusy].some((id) => !previous.has(id))) {
+        state.pending.push(nextBusy);
       }
-      busyPanels.current = nextBusy;
-      const busySessions = new Set(nextBusy.values());
-      for (const pending of pendingSessions.current) {
-        if (!busySessions.has(pending)) pendingSessions.current.delete(pending);
+      return;
+    }
+    const previous = state.busy;
+    const pending = pendingSessions.current.get(owner) ?? new Set<string>();
+    if (previous) {
+      for (const id of nextBusy) {
+        if (!previous.has(id)) pending.add(id);
       }
+    }
+    for (const id of pending) {
+      if (!nextBusy.has(id)) pending.delete(id);
+    }
+    if (pending.size) pendingSessions.current.set(owner, pending);
+    else pendingSessions.current.delete(owner);
+    state.busy = nextBusy;
+  }, []);
+
+  const ensureBaseline = useCallback((owner: string) => {
+    if (!desktop?.isElectron || sessions.current.has(owner)) return;
+    const state: DesktopBrowserSessionActivity = { busy: null, pending: [] };
+    sessions.current.set(owner, state);
+    const finish = (panels?: ElectronBrowserState[]) => {
+      if (sessions.current.get(owner) !== state || !state.pending) return;
+      if (panels) {
+        state.busy = new Set(panels.filter((panel) => panel.sessionId === owner && panel.busy)
+          .map((panel) => panel.panelId));
+      }
+      const pending = state.pending ?? [];
+      state.pending = null;
+      for (const nextBusy of pending) observe(owner, nextBusy);
+      // Reveal only the final live state, never a task that already finished during the read.
       revealPending();
+    };
+    void desktop.browser.listPanels(owner).then(finish).catch((error) => {
+      if (sessions.current.get(owner) !== state) return;
+      console.warn('[desktop.browser] activity baseline failed:', error);
+      // With no snapshot, the first observed state is a baseline, not a new task.
+      finish();
     });
-  }, [desktop, revealPending]);
+  }, [desktop, observe, revealPending]);
 
   useEffect(() => {
     if (!desktop?.isElectron) return;
-    let active = true;
-    const revision = eventRevision.current;
-    // A restored busy panel is a baseline, not evidence of a new task. An IPC
-    // event received during this read is newer and must not be overwritten.
-    void desktop.browser.listPanels(sessionId).then((panels) => {
-      if (!active || eventRevision.current !== revision) return;
-      for (const [panelId, owner] of busyPanels.current) {
-        if (owner === sessionId) busyPanels.current.delete(panelId);
+    const acknowledgeClose = () => {
+      const owner = activeSessionId();
+      if (!loadDesktopBrowserTabFlags(owner).closed) return;
+      pendingSessions.current.delete(owner);
+      const state = sessions.current.get(owner);
+      const latest = state?.pending?.at(-1);
+      if (state && latest) {
+        // A manual close acknowledges events already seen, even before the IPC reply.
+        state.busy = latest;
+        state.pending = null;
       }
+    };
+    window.addEventListener(DESKTOP_BROWSER_TAB_EVENT, acknowledgeClose);
+    const unsubscribe = desktop.browser.onPanelsChanged((panels) => {
+      const bySession = new Map<string, Set<string>>();
+      for (const owner of sessions.current.keys()) bySession.set(owner, new Set());
       for (const panel of panels) {
-        if (panel.sessionId === sessionId && panel.busy) {
-          busyPanels.current.set(panel.panelId, sessionId);
+        let busy = bySession.get(panel.sessionId);
+        if (!busy) {
+          busy = new Set();
+          bySession.set(panel.sessionId, busy);
         }
+        if (panel.busy) busy.add(panel.panelId);
       }
-    }).catch(() => {});
-    return () => { active = false; };
-  }, [desktop, sessionId]);
+      for (const [owner, busy] of bySession) {
+        ensureBaseline(owner);
+        observe(owner, busy);
+      }
+      revealPending();
+    });
+    return () => {
+      unsubscribe();
+      window.removeEventListener(DESKTOP_BROWSER_TAB_EVENT, acknowledgeClose);
+      sessions.current.clear();
+      pendingSessions.current.clear();
+    };
+  }, [desktop, ensureBaseline, observe, revealPending]);
+
+  useEffect(() => {
+    ensureBaseline(sessionId);
+  }, [sessionId, ensureBaseline]);
 
   useEffect(() => {
     revealPending();
