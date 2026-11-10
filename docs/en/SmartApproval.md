@@ -32,6 +32,8 @@ The permission menu next to the Web message box offers these profiles:
 
 Profile changes take effect on the **next conversation turn**.
 
+Exception: delegating a task to the desktop automation subagent `cua_agent` shows a confirmation card under every profile, including Full Access, unless `react.subagents.cua_agent.require_approval` is `false`. See [Desktop Automation](DesktopAutomation.md).
+
 ## How to use it
 
 ### Enable it in the WebUI
@@ -155,6 +157,8 @@ AutoReviewer uses the configured model service, so an eligible request may incur
 JSON mode constrains response syntax, not the correctness of the approval decision. An unsupported format or invalid response uses the existing manual-review fallback without retrying.
 
 The reviewer returns only `outcome`, `reason_code`, and `rationale`. Manual display details are derived by the existing Host path; complete legacy manual details remain accepted. The generated `confidence` score is no longer requested or used as a threshold: an otherwise valid low-score allow can now allow, and a low-score deny retains its reason. Legacy `confidence` response values and `reviewer_min_confidence` configuration are ignored. JSON syntax, allowed outcomes, explicit manual/deny reasons, and final Host validation remain enforced.
+
+Validated approval reasons are preserved in full, without masking paths or secret values or truncating the text, and displayed as plain text. Session history and denial feedback that share these fields also retain the complete reason. Audit records continue to use their existing independent redaction rules.
 
 Complete normalized call arguments and trusted user intent share a 64 KiB UTF-8 JSON budget, checked before and after secret-value redaction. Oversized evidence requires manual review without truncation. This budget does not increase the retained intent window; longer accepted requests can add model cost and latency.
 

@@ -206,26 +206,55 @@ def _seed_valid_agent_group(
     return package
 
 
+def test_uninstall_snapshot_survives_previously_queued_metadata(
+    extension_workspace: Path,
+) -> None:
+    from jiuwenswarm.server.runtime.session import session_metadata as metadata
+
+    group_name = "queued-display-group"
+    _seed_valid_agent_group(extension_workspace, group_name, under="local")
+    catalog.install_agent_group({"id": group_name})
+    sid = "queued-legacy-group"
+    queued = {
+        "session_id": sid,
+        "agent_group_name": group_name,
+        "message_count": 7,
+    }
+    metadata._write_metadata_sync(sid, queued)
+    identity = catalog.resolve_agent_group_display_identity(group_name)
+
+    catalog.uninstall_agent_group({"id": group_name})
+    metadata._write_metadata_sync(
+        sid,
+        {**queued, "message_count": 8},
+        metadata._MetadataWriteOptions(preserve_pin_fields=True),
+    )
+
+    restored = metadata.get_session_metadata(sid, cache_bust=True)
+    assert restored["team_group_identity"] == identity
+    assert restored["message_count"] == 8
+
+
 class TestPrepareWorkspaceAndMarketplace:
     """Lazy-install disk: prepare does not seed; marketplace is installed source of truth."""
 
     def test_prepare_creates_dirs_without_seeding(self, tmp_path: Path) -> None:
         result = utils.prepare_workspace(overwrite=True, workspace_dir=tmp_path)
         assert result is not None
-        plugins = tmp_path / "agent" / "workspace" / "plugins"
+        plugins = tmp_path / "domain" / "agent" / "workspace" / "plugins"
         for kind in _KINDS:
             assert (plugins / kind / "built_in").is_dir()
             assert (plugins / kind / "local").is_dir()
             assert not (plugins / kind / "marketplace.json").exists()
             assert not any((plugins / kind / "built_in").iterdir())
             assert not any((plugins / kind / "local").iterdir())
-        groups = tmp_path / ".agent_teams" / AGENT_GROUPS
+        groups = tmp_path / "domain" / ".agent_teams" / AGENT_GROUPS
         assert (groups / "built_in").is_dir()
         assert (groups / "local").is_dir()
 
     def test_prepare_overwrite_true_resets_false_keeps_built_in(self, tmp_path: Path) -> None:
         utils.prepare_workspace(overwrite=True, workspace_dir=tmp_path)
-        kind_root = tmp_path / "agent" / "workspace" / "plugins" / AGENT_TEMPLATES
+        kind_root = tmp_path / "domain" / "agent" / "workspace" / "plugins" / AGENT_TEMPLATES
         built_in = kind_root / "built_in" / "kept"
         built_in.mkdir(parents=True)
         (built_in / "manifest.json").write_text(

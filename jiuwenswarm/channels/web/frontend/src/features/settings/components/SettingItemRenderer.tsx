@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useContext, useEffect, useId, useState, useSyncExternalStore } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Input, Select, Switch } from '../../../components/ui';
 import type { SettingItemDefinition } from '../registry/types';
 import { parseConfigBoolean } from '../services/settingsContract';
 import { useSettingsServices } from '../services/SettingsServicesProvider';
+import { formatSettingsSaveError, InlineSaveFeedbackContext } from '../services/settingsSaveFeedback';
 import { SettingsSourceProvider, useSettingsSource } from '../services/SettingsSourceProvider';
 import { useUnsavedChanges } from '../services/useUnsavedChanges';
 import { SettingRow } from './SettingRow';
 
 type EditingChange = (id: string, editing: boolean) => void;
 
-function settingFieldKey(key: string, suffix: 'title' | 'description' | 'placeholder'): string {
+function settingFieldKey(key: string, suffix: 'title' | 'description' | 'placeholder' | 'unavailableDescription'): string {
   return `settingsPanel.fields.${key}.${suffix}`;
 }
 
@@ -91,10 +92,12 @@ function SimpleSettingItem({
   item,
   disabled,
   onEditingChange,
+  error,
 }: {
   item: Exclude<SettingItemDefinition, { component: 'custom' }>;
   disabled: boolean;
   onEditingChange?: EditingChange;
+  error?: { id: string; message: string };
 }) {
   const { t } = useTranslation();
   const { isConnected } = useSettingsServices();
@@ -126,6 +129,8 @@ function SimpleSettingItem({
   if (item.component === 'switch') {
     const Configuration = item.configure;
     const checked = parseConfigBoolean(source.values[item.key]);
+    const unavailable = item.availableWhen !== undefined && !parseConfigBoolean(source.values[item.availableWhen]);
+    const switchDescription = unavailable ? t(settingFieldKey(item.key, 'unavailableDescription')) : description;
     const buildSwitchUpdates = (next: boolean): Record<string, boolean> => {
       const updates: Record<string, boolean> = { [item.key]: next };
       if (!next && item.subItems?.uncheckWithParent) {
@@ -138,8 +143,9 @@ function SimpleSettingItem({
     control = (
       <Switch
         aria-label={title}
+        aria-describedby={error?.id}
         checked={checked}
-        disabled={controlDisabled || configuring || editingSubItems.size > 0}
+        disabled={controlDisabled || configuring || editingSubItems.size > 0 || (unavailable && !checked)}
         onChange={(next) => {
           if (next && Configuration) setConfiguring(true);
           else void source.save(buildSwitchUpdates(next), item.id).catch(() => undefined);
@@ -155,7 +161,7 @@ function SimpleSettingItem({
         <SettingRow
           className={item.rowClassName}
           title={title}
-          description={description}
+          description={<>{switchDescription}{error && <span className="setting-row__error" id={error.id} role="alert" data-testid="settings-item-error" data-variant={item.id}>{error.message}</span>}</>}
           subSettings={
             item.subItems && showSubItems
               ? item.subItems.items.map((subItem) => (
@@ -211,6 +217,28 @@ function SimpleSettingItem({
   );
 }
 
+function InlineFeedbackSettingItem({
+  item,
+  disabled,
+  onEditingChange,
+}: {
+  item: Extract<SettingItemDefinition, { component: 'switch' }>;
+  disabled: boolean;
+  onEditingChange?: EditingChange;
+}) {
+  const { t } = useTranslation();
+  const { saveQueue } = useSettingsServices();
+  const registerInlineFeedback = useContext(InlineSaveFeedbackContext);
+  const errorId = useId();
+  const subscribe = useCallback((listener: () => void) => saveQueue.subscribe(listener), [saveQueue]);
+  const saveStatus = useSyncExternalStore(subscribe, saveQueue.getSnapshot, saveQueue.getSnapshot);
+  useEffect(() => registerInlineFeedback(item.id), [item.id, registerInlineFeedback]);
+  const error = saveStatus.status === 'error' && saveStatus.operation === item.id
+    ? { id: errorId, message: formatSettingsSaveError(saveStatus.error, t) }
+    : undefined;
+  return <SimpleSettingItem item={item} disabled={disabled} onEditingChange={onEditingChange} error={error} />;
+}
+
 export function SettingItemRenderer({
   item,
   disabled = false,
@@ -240,6 +268,9 @@ export function SettingItemRenderer({
   if (item.component === 'custom') {
     const CustomItem = item.render;
     return <CustomItem disabled={disabled} onEditingChange={reportCustomEditing} />;
+  }
+  if (item.component === 'switch' && item.errorDisplay === 'inline') {
+    return <InlineFeedbackSettingItem item={item} disabled={disabled} onEditingChange={onEditingChange} />;
   }
   return <SimpleSettingItem item={item} disabled={disabled} onEditingChange={onEditingChange} />;
 }

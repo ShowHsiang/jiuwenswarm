@@ -1171,6 +1171,7 @@ test('every visible Settings control maps to an exact persistence field or RPC',
   assert.deepEqual(
     findSettingDefinitionKeys(parseTsx('src/features/settings/modules/experimental/definition.ts')).sort(),
     [
+      'cua_agent_enabled',
       'moa_jev_enabled',
       'multi_model_collaboration_enabled',
       'symphony_evolution_enabled',
@@ -1191,6 +1192,7 @@ test('every visible Settings control maps to an exact persistence field or RPC',
     'asr_api_key',
     'asr_model',
     'comfyui_workflow_enabled',
+    'cua_agent_enabled',
     'external_cli_agent_claude_cli_path',
     'external_cli_agent_claude_enabled',
     'external_cli_agent_claude_path_histories',
@@ -1203,6 +1205,12 @@ test('every visible Settings control maps to an exact persistence field or RPC',
     'moa_jev_enabled',
     'moa_verifier_interval',
     'multi_model_collaboration_enabled',
+    'music_gen_api_base',
+    'music_gen_api_key',
+    'music_gen_enabled',
+    'music_gen_model',
+    'music_gen_protocol',
+    'music_gen_provider',
     'proactive_recommendation_enabled',
     'proactive_recommendation_max_recommend_per_day',
     'proactive_recommendation_max_rounds_per_tick',
@@ -1248,7 +1256,7 @@ test('every visible Settings control maps to an exact persistence field or RPC',
       'name',
       'is_default',
     ],
-    buildDingtalkFormPayload: ['enabled', 'client_id', 'client_secret', 'allow_from'],
+    buildDingtalkApp: ['name', 'enabled', 'client_id', 'client_secret', 'robot_code', 'allow_from'],
     buildTelegramFormPayload: ['enabled', 'bot_token', 'allow_from', 'parse_mode', 'group_chat_mode'],
     buildDiscordFormPayload: [
       'enabled',
@@ -1438,9 +1446,10 @@ test('search credential fields are optional so keys can be cleared', () => {
   assert.match(agentSettings, /<Form form=\{form\} items=\{items\}/);
 });
 
-test('multimodal dialogs reuse provider-first model configuration without model testing or account login', () => {
+test('multimodal dialogs reuse provider-first model configuration; topic probes like chat models', () => {
   const agentSettings = source('src/features/settings/modules/agent/AgentSettings.tsx');
   const dialog = source('src/features/settings/modules/agent/MediaModelConfigDialog.tsx');
+  const mediaConfig = source('src/features/settings/modules/agent/mediaModelConfig.ts');
   assert.match(agentSettings, /<MediaModelConfigDialog/);
   assert.match(dialog, /<ModelProviderSelect/);
   assert.match(dialog, /includeOpenAIAccount=\{false\}/);
@@ -1448,7 +1457,11 @@ test('multimodal dialogs reuse provider-first model configuration without model 
   assert.match(dialog, /'vendors\.list'/);
   assert.match(dialog, /'vendors\.fetch_models'/);
   assert.match(dialog, /showOptional=\{false\}/);
-  assert.doesNotMatch(dialog, /config\.validate_model|OpenAIAccountSettings|reasoning_level|settingsActionIcons\.delete/);
+  // Vision/audio/video stay form-only; topic chat LLMs reuse config.validate_model.
+  assert.match(dialog, /probeBeforeSave = modality === 'topic'/);
+  assert.match(dialog, /'config\.validate_model'/);
+  assert.match(mediaConfig, /buildMediaModelValidationPayload/);
+  assert.doesNotMatch(dialog, /OpenAIAccountSettings|reasoning_level|settingsActionIcons\.delete/);
 });
 
 test('legacy multimodal configuration remains custom while provider selections persist exact catalog identity', () => {
@@ -1701,7 +1714,7 @@ test('Settings high-fidelity visual contract remains wired to exact assets and s
   assert.doesNotMatch(generalDefinition, /groupedRows|separatedRows/);
   assert.match(modelsDefinition, /id: 'model-manager',[\s\S]{0,80}separatedRows: true/);
   assert.doesNotMatch(modelsDefinition, /id: 'limited-free-models'|id: 'free-models'/);
-  assert.match(modelsSettings, /<FreeModelsSettings\s*\/>/);
+  assert.match(modelsSettings, /<FreeModelsSettings\b/);
   assert.match(modelsSettings, /settingsPanel\.models\.customModels/);
   assert.ok(
     modelsSettings.indexOf('<FreeModelsSettings') < modelsSettings.indexOf("settingsPanel.models.customModels"),

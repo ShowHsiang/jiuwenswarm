@@ -178,7 +178,7 @@ export function DesignerChatPanel() {
     return () => {
       cancelled = true;
     };
-  }, [sessionId, availableModelCount, configRevision]);
+  }, [sessionId, availableModelCount, configRevision, selectedModelName]);
 
   useEffect(() => {
     const el = bodyRef.current;
@@ -300,7 +300,7 @@ export function DesignerChatPanel() {
       .finally(() => {
         setSending(false);
       });
-  }, [attachments, blockedProblem, chatBusy, domainGraph, draft, sessionId, t]);
+  }, [attachments, blockedProblem, chatBusy, domainGraph, draft, selectedModelName, sessionId, t]);
 
   const handleStop = useCallback(() => {
     if (!sessionId) return;
@@ -479,44 +479,42 @@ export function DesignerChatPanel() {
                 stop: t('chat.taskFullDuplexStop'),
               }}
               fallback={
-                <>
-            {isProcessing ? (
-              <button
-                type="button"
-                className="designer-chat-panel__send"
-                onClick={handleStop}
-                aria-label={t('designer.chat.stop')}
-                title={t('designer.chat.stop')}
-                data-testid="designer-chat-panel-stop"
-              >
-                <Square className="designer-chat-panel__stop-icon" fill="currentColor" aria-hidden />
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="designer-chat-panel__send"
-                disabled={chatBusy || !canSend}
-                onClick={handleSend}
-                aria-label={chatBusy ? t('designer.chat.running') : t('designer.chat.send')}
-                aria-busy={chatBusy}
-                title={blockedProblem || (chatBusy ? t('designer.chat.running') : undefined)}
-                data-testid="designer-chat-panel-send"
-                data-variant={chatBusy ? 'running' : 'idle'}
-              >
-                {/* A leader round can run for minutes (graph autorun); the button
-                    must read as "working", never as the idle send plane (#5410). */}
-                {chatBusy ? (
-                  <LoaderCircle
-                    className="designer-chat-panel__send-spinner animate-spin"
-                    size={18}
-                    aria-hidden
-                  />
+                isProcessing ? (
+                  <button
+                    type="button"
+                    className="designer-chat-panel__send"
+                    onClick={handleStop}
+                    aria-label={t('designer.chat.stop')}
+                    title={t('designer.chat.stop')}
+                    data-testid="designer-chat-panel-stop"
+                  >
+                    <Square className="designer-chat-panel__stop-icon" fill="currentColor" aria-hidden />
+                  </button>
                 ) : (
-                  <SendPlaneIcon className="designer-chat-panel__send-icon" aria-hidden />
-                )}
-              </button>
-            )}
-                </>
+                  <button
+                    type="button"
+                    className="designer-chat-panel__send"
+                    disabled={chatBusy || !canSend}
+                    onClick={handleSend}
+                    aria-label={chatBusy ? t('designer.chat.running') : t('designer.chat.send')}
+                    aria-busy={chatBusy}
+                    title={blockedProblem || (chatBusy ? t('designer.chat.running') : undefined)}
+                    data-testid="designer-chat-panel-send"
+                    data-variant={chatBusy ? 'running' : 'idle'}
+                  >
+                    {/* A leader round can run for minutes (graph autorun); the button
+                        must read as "working", never as the idle send plane (#5410). */}
+                    {chatBusy ? (
+                      <LoaderCircle
+                        className="designer-chat-panel__send-spinner animate-spin"
+                        size={18}
+                        aria-hidden
+                      />
+                    ) : (
+                      <SendPlaneIcon className="designer-chat-panel__send-icon" aria-hidden />
+                    )}
+                  </button>
+                )
               }
             />
           </div>

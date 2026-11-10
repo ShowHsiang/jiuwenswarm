@@ -84,7 +84,7 @@ def _get_user_workspace_dir() -> Path:
 
 
 def _get_agent_root_dir() -> Path:
-    return _get_user_workspace_dir() / "agent"
+    return (_get_user_workspace_dir() / "domain" / "agent").resolve()
 
 
 def _get_agent_sessions_dir() -> Path:
@@ -92,7 +92,9 @@ def _get_agent_sessions_dir() -> Path:
 
 
 def _get_logs_dir() -> Path:
-    return _get_agent_root_dir() / ".logs"
+    from jiuwenswarm.common.utils import get_logs_dir
+
+    return (get_logs_dir() / "agent").resolve()
 
 
 def _get_ssl_verify() -> bool:
@@ -162,12 +164,12 @@ def _parse_single_byte_range(
 def _get_agent_teams_root(project_root: Path) -> Path:
     """Return the team state root without importing the agent runtime.
 
-    ``configure_agent_teams_home(project_root)`` in AgentServer resolves this
-    exact directory.  The static server only performs bounded file operations
+    ``configure_agent_teams_home`` in AgentServer resolves this exact
+    directory.  The static server only performs bounded file operations
     under it, so importing OpenJiuwen solely to calculate the same path adds
     startup work without providing any Web-side behaviour.
     """
-    return (project_root / ".agent_teams").resolve()
+    return (project_root / "domain" / ".agent_teams").resolve()
 
 
 def _get_package_dir() -> Path:
@@ -211,9 +213,9 @@ def _normalize_lang_suffix(name: str) -> str:
     return f"{stem}.{suffix}" if stem else name
 
 
-def _generate_agent_data(project_root: Path) -> None:
+def _generate_agent_data() -> None:
     """Generate agent/workspace/agent-data.json from agent tree."""
-    agent_root = (project_root / "agent").resolve()
+    agent_root = _get_agent_root_dir()
     workspace_root = (agent_root / "workspace").resolve()
     output_path = (workspace_root / "agent-data.json").resolve()
     root_folder_key = "__root__"
@@ -340,7 +342,11 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     workspace_root = _get_agent_root_dir()
     agent_teams_root = _get_agent_teams_root(project_root)
     logs_root = _get_logs_dir()
-    auto_harness_root = project_root / "auto-harness"
+    auto_harness_root = project_root / "infra" / "auto-harness"
+    # Team-organization summaries live under <home>/.organizations, outside
+    # .agent_teams. Without this root, a delivered group attachment 403s and
+    # the chat card labels the existing file expired.
+    organizations_root = project_root / "domain" / ".organizations"
     # Projectless tasks (no bound project_dir) write their generated media under
     # <Documents>/JiuwenSwarm/<date>/chat-<n>/outputs/, outside workspace_root —
     # without this, any @-referenced or inline-rendered media from a projectless
@@ -1059,6 +1065,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             or cls._is_path_under(Path(cls.agent_teams_root), target_resolved)
             or cls._is_path_under(Path(cls.logs_root), target_resolved)
             or cls._is_path_under(Path(cls.auto_harness_root), target_resolved)
+            or cls._is_path_under(Path(cls.organizations_root), target_resolved)
             or cls._is_path_under(Path(cls.projectless_tasks_root), target_resolved)
             or any(cls._is_path_under(root, target_resolved) for root in cls._registered_project_dirs())
         )
@@ -1076,6 +1083,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         """
         if "\x00" in rel_path:
             raise _BadRequestError("invalid_path")
+        # 前端 file-api 契约沿用平铺相对路径（agent/...）；分区后 agent 树落 domain/agent
+        normalized = rel_path.replace("\\", "/")
+        if normalized == "agent" or normalized.startswith("agent/"):
+            rel_path = f"domain/{normalized}"
         try:
             return (self.project_root / rel_path).resolve()
         except (OSError, ValueError) as exc:
@@ -1553,7 +1564,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not full_path.exists():
                 if file_arg.replace("\\", "/") == "agent/workspace/agent-data.json":
                     try:
-                        _generate_agent_data(self.project_root)
+                        _generate_agent_data()
                     except Exception as exc:  # noqa: BLE001
                         self._write_json(500, {"error": "generate_failed", "detail": str(exc)})
                         return
@@ -2109,7 +2120,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path == "/file-api/rebuild-agent-data":
             try:
-                _generate_agent_data(self.project_root)
+                _generate_agent_data()
             except Exception as exc:  # noqa: BLE001
                 self._write_json(500, {"error": "rebuild_failed", "detail": str(exc)})
                 return
@@ -2118,7 +2129,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/file-api/upload":
-            self._handle_file_upload_proxy(parsed)
+            if self._is_designer_upload(parsed):
+                self._handle_designer_upload()
+            else:
+                self._handle_file_upload_proxy(parsed)
             return
 
         if parsed.path == "/file-api/file-content":
@@ -2221,6 +2235,45 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         status, payload = handle_custom_agent_upload_http(
             content_type=self.headers.get("Content-Type", ""),
             body=self._read_request_body(),
+        )
+        self._write_json(status, payload)
+
+    def _is_designer_upload(self, parsed) -> bool:
+        if parse_qs(parsed.query).get("token"):
+            return False
+        return "multipart/form-data" in self.headers.get("Content-Type", "").lower()
+
+    def _discard_request_body(self, length: int) -> None:
+        # Answering before the body is consumed resets the connection, which
+        # the browser reports as "Failed to fetch" instead of the JSON error.
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _handle_designer_upload(self) -> None:
+        from jiuwenswarm.channels.web.designer_upload_http import (
+            MAX_DESIGNER_UPLOAD_REQUEST_BYTES,
+            handle_designer_upload_http,
+        )
+
+        length = self._parse_content_length()
+        # A routed AgentServer keeps uploads in a per-user sandbox this process cannot write.
+        if _uses_agentos_routing():
+            self._discard_request_body(length)
+            self._write_json(503, {"error": "agentserver_file_rpc_required"})
+            return
+        if length > MAX_DESIGNER_UPLOAD_REQUEST_BYTES:
+            self._discard_request_body(length)
+            self._write_json(413, {"error": "file_too_large", "files": [], "errors": [{"error": "file_too_large"}]})
+            return
+        status, payload = handle_designer_upload_http(
+            content_type=self.headers.get("Content-Type", ""),
+            body=self.rfile,
+            length=length,
+            workspace_root=Path(self.workspace_root),
         )
         self._write_json(status, payload)
 
@@ -2697,7 +2750,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     project_root = _get_user_workspace_dir()
-    workspace_root = (project_root / "agent").resolve()
+    workspace_root = _get_agent_root_dir()
     agent_teams_root = _get_agent_teams_root(project_root)
     logs_root = _get_logs_dir().resolve()
     # Start with the process logger.  The file handler and diagnostic hook are
@@ -2758,7 +2811,9 @@ def main() -> None:
         )
         logger.info("[jiuwenswarm-web] /file-api roots -> %s, %s, %s", workspace_root, agent_teams_root, logs_root)
 
-        _web_info_path = (_get_user_workspace_dir() / ".updates").resolve()
+        from jiuwenswarm.common.utils import get_infra_data_dir
+
+        _web_info_path = (get_infra_data_dir() / ".updates").resolve()
         _web_info_path.mkdir(parents=True, exist_ok=True)
         _web_info_file = _web_info_path / "web_process.json"
         try:

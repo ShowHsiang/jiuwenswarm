@@ -18,9 +18,11 @@ functions, hence this hook.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -51,7 +53,7 @@ _EXTERNAL_MEMORY_BASENAMES = frozenset(
 
 
 @pytest.fixture(autouse=True)
-def _isolate_user_workspace(tmp_path):
+def _isolate_user_workspace(tmp_path_factory):
     """Keep data written by unit tests (sessions, etc.) out of the real ~/.jiuwenswarm."""
     from jiuwenswarm.server.runtime.session import session_metadata
 
@@ -59,9 +61,27 @@ def _isolate_user_workspace(tmp_path):
     # so the drain below uses the real queue/clock instead of a test's stubs.
     flush_pending_writes = session_metadata.flush_pending_writes
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(_utils, "_workspace_base_dir", tmp_path / ".jiuwenswarm")
+        data = tmp_path_factory.mktemp("unit_workspace") / ".jiuwenswarm"
+        config_dir = data / "infra" / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(
+            Path(__file__).resolve().parents[2] / "jiuwenswarm/resources/config.yaml",
+            config_dir / "config.yaml",
+        )
+        mp.setattr(_utils, "_workspace_base_dir", data)
+        mp.setattr(_utils, "_initialized", False)
+        for name in ("_config_dir", "_workspace_dir", "_root_dir"):
+            mp.setattr(_utils, name, None)
+        mp.setenv("JIUWENSWARM_CONFIG_DIR", str(config_dir))
+        # A Gateway operation can resolve either package's cached config path.
+        for name in ("agent_gateway.common.config", "jiuwenswarm.common.config"):
+            module = sys.modules.get(name)
+            if module:
+                for attr in ("CONFIG_YAML_PATH", "_CONFIG_YAML_PATH"):
+                    if hasattr(module, attr):
+                        mp.setattr(module, attr, config_dir / "config.yaml")
         # Subprocesses spawned by tests resolve the workspace from the environment.
-        mp.setenv("JIUWENSWARM_DATA_DIR", str(tmp_path / ".jiuwenswarm"))
+        mp.setenv("JIUWENSWARM_DATA_DIR", str(data))
         yield
         # Metadata is written by a background thread; drain it before the patch is undone.
         flush_pending_writes()
@@ -113,6 +133,36 @@ def _is_external_memory_patched_module(node_path) -> bool:
     return base in _EXTERNAL_MEMORY_BASENAMES
 
 
+def _ensure_agent_checkpointer() -> None:
+    """Put back a checkpointer that implements the agent and team hooks.
+
+    ``CheckpointerFactory`` is process-wide. A test can leave its default as a
+    bare ``object()``. The next session then dies in ``pre_run`` with
+    ``'object' object has no attribute 'pre_agent_execute'`` or
+    ``'pre_agent_team_execute'``, and ``Runner.release`` fails the same way on
+    ``release``.
+    """
+    from openjiuwen.core.session.checkpointer import CheckpointerFactory
+    from openjiuwen.core.session.checkpointer.inmemory import InMemoryCheckpointer
+
+    try:
+        current = CheckpointerFactory.get_checkpointer()
+    except Exception:
+        current = None
+    if current is not None and all(
+        hasattr(current, name)
+        for name in ("pre_agent_execute", "pre_agent_team_execute", "release")
+    ):
+        return
+    CheckpointerFactory.set_default_checkpointer(InMemoryCheckpointer())
+
+
+@pytest.fixture(autouse=True)
+def _restore_inmemory_checkpointer():
+    _ensure_agent_checkpointer()
+    yield
+
+
 def pytest_runtest_setup(item) -> None:
     path = getattr(item, "path", None) or getattr(item, "fspath", None)
     p = str(path) if path is not None else ""
@@ -122,3 +172,24 @@ def pytest_runtest_setup(item) -> None:
     else:
         _utils.get_config_file = _REAL_GET_CONFIG_FILE
         _utils.get_agent_workspace_dir = _REAL_GET_AGENT_WORKSPACE_DIR
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy(
+    event_loop_policy: asyncio.AbstractEventLoopPolicy,
+) -> Iterator[asyncio.AbstractEventLoopPolicy]:
+    """Prevent implicit loop creation before pytest-asyncio enters its runner."""
+    if sys.version_info >= (3, 14):
+        yield event_loop_policy
+        return
+
+    # pytest-asyncio looks up the current loop before installing its runner.
+    # On older Python versions, a fresh policy may create an unowned loop on
+    # that lookup. Explicitly start with no current loop in an isolated policy.
+    policy = asyncio.DefaultEventLoopPolicy()
+    policy.set_event_loop(None)
+    asyncio.set_event_loop_policy(policy)
+    try:
+        yield policy
+    finally:
+        asyncio.set_event_loop_policy(event_loop_policy)

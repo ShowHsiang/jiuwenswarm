@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -54,6 +54,36 @@ from jiuwenswarm.runtime.session_provisioner import (
 )
 
 test_logger = logging.getLogger("tests.runtime_service")
+
+
+def _reset_checkpointer_globals() -> None:
+    from jiuwenswarm.runtime import checkpointer
+
+    checkpointer._shared_checkpointer = None
+    checkpointer._PERSISTENT_CHECKPOINTER_READY = False
+    checkpointer._shared_engine = None
+    checkpointer._shared_engine_kind = None
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_checkpointer_state():
+    """Reset runtime.checkpointer module globals leaked by per-test stubs.
+
+    ``ensure_persistent_checkpointer()`` stores ``CheckpointerFactory.create()``'s
+    return value into the module-level ``_shared_checkpointer``. Tests that patch
+    ``create`` with a plain-object stub leak that stub past monkeypatch teardown
+    (plain module-global writes are not tracked by monkeypatch), and any later
+    ``ensure`` call while ``_PERSISTENT_CHECKPOINTER_READY`` is still truthy
+    installs the stub via ``set_default_checkpointer`` — cascading
+    ``'object' object has no attribute 'pre_agent_execute'`` into unrelated
+    tests sharing the same xdist worker. Earlier files (e.g.
+    ``test_checkpoint_journal.py``) leak the same way, so the reset runs on
+    both setup and teardown: every test in this file starts from a clean state
+    regardless of what previous files left behind on the worker.
+    """
+    _reset_checkpointer_globals()
+    yield
+    _reset_checkpointer_globals()
 
 
 async def _collect_events(stream) -> list[RuntimeEvent]:
@@ -359,6 +389,27 @@ async def test_team_attach_only_registers_persistent_waiter_kind() -> None:
     assert details.waiter_kind is TeamWaiterKind.PERSISTENT
     assert details.observation_only is True
     assert details.session_message_id is None
+
+
+@pytest.mark.parametrize("browser_attached", [False, True])
+@pytest.mark.parametrize("managed_design", [False, True])
+def test_managed_design_request_keeps_its_own_result_waiter(monkeypatch, browser_attached, managed_design):
+    from jiuwenswarm.agents.harness import team
+
+    monkeypatch.setattr(team, "get_team_manager", lambda _: SimpleNamespace(
+        has_interactive_waiter=lambda _: browser_attached,
+    ))
+    runtime = AgentRuntime(agent_manager=FakeAgentManager())
+    request = AgentRequest(
+        request_id="voice-task", channel_id="video_tool", session_id="design-chat",
+        req_method=ReqMethod.CHAT_SEND,
+        params={"mode": "team.design", **({"managed_task_binding": {"endpoint": "gateway", "task_id": "task"}}
+                                         if managed_design else {})},
+    )
+    kind = runtime._team_waiter_kind(request, work_kind=SessionWorkKind.TEAM_REQUEST, background=False)
+    expected = (TeamWaiterKind.REQUEST if managed_design else
+                TeamWaiterKind.NONE if browser_attached else TeamWaiterKind.PERSISTENT)
+    assert kind is expected
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -1204,6 +1255,99 @@ async def test_prepare_chat_turn_requires_atomic_manager_admission() -> None:
         )
 
     manager.get_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_agent_pause_keeps_stream_execution_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #6163: 单 Agent pause 只挂起 ReAct 循环，不取消协调器执行。"""
+    cancel_execution = AsyncMock()
+    coordinator = SimpleNamespace(
+        snapshot_session=lambda session_id: SimpleNamespace(
+            session_id=session_id,
+            generation=2,
+            state=RuntimeSessionState.READY,
+            executions=(),
+        ),
+        cancel_execution=cancel_execution,
+    )
+    runtime = AgentRuntime(
+        agent_manager=FakeAgentManager(),
+        initializer=AsyncMock(),
+        session_coordinator=coordinator,
+    )
+    adapter_interrupt = AsyncMock(
+        return_value=AgentResponse(
+            request_id="pause-request",
+            channel_id="web",
+            payload={"success": True},
+        )
+    )
+    request = AgentRequest(
+        request_id="pause-request",
+        channel_id="web",
+        session_id="session-a",
+        req_method=ReqMethod.CHAT_CANCEL,
+        params={"mode": "agent", "intent": "pause"},
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.runtime.request.cancel_request", adapter_interrupt,
+    )
+
+    response = await runtime.cancel_request(request)
+
+    assert response.ok is True
+    adapter_interrupt.assert_awaited_once()
+    cancel_execution.assert_not_awaited()
+    test_logger.info("Single-agent pause kept the stream execution alive")
+
+
+@pytest.mark.asyncio
+async def test_single_agent_cancel_still_cancels_coordinator_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cancel 仍要取消协调器执行，pause 的豁免不能扩散。"""
+    cancel_execution = AsyncMock(
+        return_value=CancelExecutionResult(matched=1, cancelled=1, timed_out=())
+    )
+    coordinator = SimpleNamespace(
+        snapshot_session=lambda session_id: SimpleNamespace(
+            session_id=session_id,
+            generation=2,
+            state=RuntimeSessionState.READY,
+            executions=(),
+        ),
+        cancel_execution=cancel_execution,
+    )
+    runtime = AgentRuntime(
+        agent_manager=FakeAgentManager(),
+        initializer=AsyncMock(),
+        session_coordinator=coordinator,
+    )
+    adapter_interrupt = AsyncMock(
+        return_value=AgentResponse(
+            request_id="cancel-request",
+            channel_id="web",
+            payload={"success": True},
+        )
+    )
+    request = AgentRequest(
+        request_id="cancel-request",
+        channel_id="web",
+        session_id="session-a",
+        req_method=ReqMethod.CHAT_CANCEL,
+        params={"mode": "agent", "intent": "cancel"},
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.runtime.request.cancel_request", adapter_interrupt,
+    )
+
+    response = await runtime.cancel_request(request)
+
+    assert response.ok is True
+    adapter_interrupt.assert_awaited_once()
+    cancel_execution.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3210,6 +3354,32 @@ async def test_runtime_context_is_inherited_by_child_tasks_and_isolated() -> Non
 
 
 @pytest.mark.asyncio
+async def test_unary_receipt_cleanup_failure_still_resets_runtime_context(monkeypatch) -> None:
+    from jiuwenswarm.extensions.video_duplex.backend import session_receipts
+
+    async def initialize() -> None:
+        return None
+
+    runtime = AgentRuntime(
+        agent_manager=FakeAgentManager(), initializer=initialize,
+        plan_controller=FakePlanController(),
+    )
+    monkeypatch.setattr(runtime, "_is_session_input_request", lambda _: False)
+    monkeypatch.setattr(runtime, "session_work_kind", lambda _: None)
+    monkeypatch.setattr(runtime, "_invoke_started", AsyncMock(return_value=[]))
+
+    def fail_cleanup(_):
+        assert get_current_runtime() is runtime
+        raise RuntimeError("receipt cleanup failed")
+
+    monkeypatch.setattr(session_receipts, "finish_request", fail_cleanup)
+    previous = get_runtime_context()
+    with pytest.raises(RuntimeError, match="receipt cleanup failed"):
+        await runtime.invoke(_chat_request("cleanup-failure"))
+    assert get_runtime_context() is previous
+
+
+@pytest.mark.asyncio
 async def test_runtime_context_is_available_during_early_stream_close() -> None:
     manager = FakeAgentManager()
     observed: list[tuple[object, object]] = []
@@ -3317,6 +3487,7 @@ async def test_runtime_owned_extensions_are_reference_counted(monkeypatch) -> No
     from agent_gateway.extensions.registry import ExtensionRegistry
     from jiuwenswarm.runtime import checkpointer
 
+    monkeypatch.setattr("agent_gateway.extensions.manager.get_config", lambda: {})
     ExtensionRegistry.reset_instance()
     load_extensions = AsyncMock()
     shutdown_extensions = AsyncMock()
@@ -3570,10 +3741,14 @@ async def test_dispose_error_resets_checkpointer_state_and_reinitializes(
         _kv_store=SimpleNamespace(engine=SimpleNamespace(dispose=dispose))
     )
     replacement_checkpointer = object()
+    monkeypatch.setattr(checkpointer, "_shared_checkpointer", None, raising=False)
     create_checkpointer = AsyncMock(return_value=replacement_checkpointer)
     installed: list[object | None] = []
 
     monkeypatch.setattr(checkpointer, "_PERSISTENT_CHECKPOINTER_READY", True)
+    for name in ("_shared_checkpointer", "_shared_engine", "_shared_engine_kind"):
+        if hasattr(checkpointer, name):
+            monkeypatch.setattr(checkpointer, name, None)
     monkeypatch.setattr(
         checkpointer,
         "PersistenceCheckpointerProvider",
@@ -3741,6 +3916,7 @@ async def test_extension_load_error_survives_shutdown_error_and_retries(
     from agent_gateway.extensions.manager import ExtensionManager
     from agent_gateway.extensions.registry import ExtensionRegistry
 
+    monkeypatch.setattr("agent_gateway.extensions.manager.get_config", lambda: {})
     ExtensionRegistry.reset_instance()
     load_extensions = AsyncMock(
         side_effect=[ValueError("extension load failed"), None],
@@ -4158,6 +4334,69 @@ async def test_agent_server_stop_replaces_runtime_after_closed_cleanup_error(
     assert previous_runtime.closed is True
     assert server.get_runtime() is not previous_runtime
     assert server.get_runtime().agent_manager is server.get_agent_manager()
+
+
+@pytest.mark.asyncio
+async def test_agent_server_stop_joins_startup_before_closing_preparation(
+    monkeypatch,
+) -> None:
+    from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
+
+    server = AgentWebSocketServer()
+    runtime = server.get_runtime()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def start_runtime() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            order.append("startup_finished")
+
+    runtime.start = AsyncMock(side_effect=start_runtime)
+    server._heartbeat_runtime.start = AsyncMock()
+    server._on_runtime_ready = MagicMock()
+    server._bootstrap_internal_jiuwenbox = AsyncMock()
+    await server.start()
+    warmup = server._checkpointer_warmup_task
+    await asyncio.wait_for(entered.wait(), 1)
+    preparation = server._preparation_registry
+    close_preparation = preparation.close
+
+    async def close_and_release() -> None:
+        await close_preparation()
+        order.append("preparation_closed")
+        release.set()
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(preparation, "close", close_and_release)
+    await server.stop()
+
+    assert order == ["startup_finished", "preparation_closed"]
+    assert warmup.cancelled()
+    assert server._checkpointer_warmup_task is None
+    server._on_runtime_ready.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_server_stop_retrieves_completed_startup_failure(caplog) -> None:
+    from jiuwenswarm.server.agent_ws_server import AgentWebSocketServer
+
+    server = AgentWebSocketServer()
+
+    async def fail_startup() -> None:
+        raise RuntimeError("startup failed before stop")
+
+    warmup = asyncio.create_task(fail_startup(), name="runtime-start")
+    server._checkpointer_warmup_task = warmup
+    await asyncio.wait({warmup})
+    with caplog.at_level(logging.WARNING):
+        await server.stop()
+
+    assert "checkpointer warmup stop failed: startup failed before stop" in caplog.text
+    assert server._checkpointer_warmup_task is None
 
 
 @pytest.mark.asyncio
@@ -4803,3 +5042,188 @@ async def test_runtime_close_does_not_clear_another_runtime_managers() -> None:
     await second.start()
     await second.close()
     assert second_manager.cleanup_calls == 1
+
+
+@pytest.mark.parametrize("browser_attached", [False, True])
+@pytest.mark.parametrize("managed_design", [False, True])
+def test_managed_design_request_keeps_its_own_result_waiter(monkeypatch, browser_attached, managed_design):
+    from jiuwenswarm.agents.harness import team
+
+    monkeypatch.setattr(team, "get_team_manager", lambda _: SimpleNamespace(
+        has_interactive_waiter=lambda _: browser_attached,
+    ))
+    runtime = AgentRuntime(agent_manager=FakeAgentManager())
+    request = AgentRequest(
+        request_id="voice-task", channel_id="video_tool", session_id="design-chat",
+        req_method=ReqMethod.CHAT_SEND,
+        params={"mode": "team.design", **({"managed_task_binding": {"endpoint": "gateway", "task_id": "task"}}
+                                         if managed_design else {})},
+    )
+    kind = runtime._team_waiter_kind(request, work_kind=SessionWorkKind.TEAM_REQUEST, background=False)
+    expected = (TeamWaiterKind.REQUEST if managed_design else
+                TeamWaiterKind.NONE if browser_attached else TeamWaiterKind.PERSISTENT)
+    assert kind is expected
+
+def _session_waiting_on_card() -> SimpleNamespace:
+    waiting = SimpleNamespace(state=SessionExecutionState.WAITING_FOR_CONTROL)
+    return SimpleNamespace(
+        _session_coordinator=SimpleNamespace(
+            snapshot_session=lambda _sid: SimpleNamespace(executions=(waiting,))
+        )
+    )
+
+
+async def test_voice_task_is_refused_before_admission_and_the_card_stays_clickable() -> None:
+    """#5487: admitting a voice turn cancels the execution that waits on a card,
+    so the card could no longer be clicked. The refusal must happen before
+    admission and be a terminal chat.error, so the voice task fails instead of
+    becoming unknown and holding the voice queue."""
+    seen: list[str] = []
+
+    class CardAgent(FakeAgent):
+        async def process_message_stream(self, request: AgentRequest):
+            seen.append(request.request_id)
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={
+                    "event_type": "chat.ask_user_question",
+                    "request_id": "call_cua",
+                    "source": "confirm_interrupt",
+                    "questions": [],
+                },
+            )
+
+        async def deliver_control_input(self, request: AgentRequest):
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={"event_type": "chat.final", "content": "approved"},
+                is_complete=True,
+            )
+
+    class CardManager(FakeAgentManager):
+        def get_agent_for_session_nowait(self, channel_id: str, session_id: str) -> object:
+            return self.agent
+
+    manager = CardManager()
+    manager.agent = CardAgent()
+    runtime = AgentRuntime(
+        agent_manager=manager,
+        initializer=AsyncMock(),
+        plan_controller=FakePlanController(),
+    )
+    runtime._trigger_before_chat_request_hook = AsyncMock()
+    session_id = "voice-card-session"
+    params = {"mode": "agent", "work_mode": "work"}
+    typed = AgentRequest(
+        request_id="typed", channel_id="web", session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND, is_stream=True, params={**params, "query": "open notepad"},
+    )
+    await _collect_events(runtime.stream(typed, trigger_hook=False))
+
+    voice = AgentRequest(
+        request_id="task-voice", channel_id="video_tool", session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND, is_stream=True, params={**params, "query": "append a line"},
+    )
+    events = await _collect_events(runtime.stream(voice, trigger_hook=False))
+
+    assert [(event.event_type, event.ok, event.is_complete) for event in events] == [
+        ("chat.error", False, True)
+    ]
+    assert seen == ["typed"]
+    snapshot = runtime._session_coordinator.snapshot_session(session_id)
+    assert snapshot is not None
+    assert [item.state.value for item in snapshot.executions] == ["waiting_for_control"]
+
+    click = AgentRequest(
+        request_id="click", channel_id="web", session_id=session_id,
+        req_method=ReqMethod.CHAT_SEND, is_stream=True,
+        params={
+            **params, "query": "", "request_id": "call_cua", "source": "confirm_interrupt",
+            "answers": [{"question": "", "selected_options": ["allow_once"]}],
+        },
+    )
+    clicked = await asyncio.wait_for(_collect_events(runtime.stream(click, trigger_hook=False)), timeout=0.5)
+    assert [event.event_type for event in clicked] == ["chat.final"]
+
+
+def test_typed_input_still_supersedes_a_waiting_card() -> None:
+    request = AgentRequest(
+        request_id="r1", channel_id="web", session_id="chat-1",
+        req_method=ReqMethod.CHAT_SEND, params={"mode": "agent.code.normal"},
+    )
+
+    assert AgentRuntime._voice_task_card_refusal(_session_waiting_on_card(), request) == []
+
+
+async def test_voice_task_approval_resume_reaches_the_chat_agent_that_owns_it() -> None:
+    """#5885: a voice task runs on its chat's agent (#9603), so the approval it
+    raises waits there. The resume arrives on ``video_tool``; looking the agent
+    up by that ingress channel found nothing, the resumed turn produced no final
+    and the task became unknown, blocking every later voice task in the chat."""
+    seen: list[tuple[str, str]] = []
+
+    class ChatAgent(FakeAgent):
+        async def process_message_stream(self, request: AgentRequest):
+            seen.append(("stream", request.request_id))
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={
+                    "event_type": "chat.ask_user_question",
+                    "request_id": "call_notepad",
+                    "source": "permission_interrupt",
+                    "questions": [],
+                },
+            )
+
+        async def deliver_control_input(self, request: AgentRequest):
+            seen.append(("control", request.request_id))
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload={"event_type": "chat.final", "content": "notepad typed"},
+                is_complete=True,
+            )
+
+    class ChatOwnedManager(FakeAgentManager):
+        def get_agent_for_session_nowait(self, channel_id: str, session_id: str) -> object:
+            return self.agent if channel_id == "web" else None
+
+    manager = ChatOwnedManager()
+    manager.agent = ChatAgent()
+    runtime = AgentRuntime(
+        agent_manager=manager,
+        initializer=AsyncMock(),
+        plan_controller=FakePlanController(),
+    )
+    runtime._trigger_before_chat_request_hook = AsyncMock()
+    session_id = "voice-task-chat"
+    params = {"mode": "agent", "work_mode": "work"}
+    with patch(
+        "jiuwenswarm.runtime.request.resolve_request_owner_channel",
+        side_effect=lambda request: "web" if request.channel_id == "video_tool" else request.channel_id,
+    ):
+        task = AgentRequest(
+            request_id="task-1", channel_id="video_tool", session_id=session_id,
+            req_method=ReqMethod.CHAT_SEND, is_stream=True,
+            params={**params, "query": "open notepad and type hello"},
+        )
+        await _collect_events(runtime.stream(task, trigger_hook=False))
+
+        resume = AgentRequest(
+            request_id="task-1", channel_id="video_tool", session_id=session_id,
+            req_method=ReqMethod.CHAT_SEND, is_stream=True,
+            params={
+                **params, "query": "", "request_id": "call_notepad",
+                "source": "permission_interrupt",
+                "answers": [{"question": "", "selected_options": ["allow_once"]}],
+            },
+        )
+        resumed = await asyncio.wait_for(
+            _collect_events(runtime.stream(resume, trigger_hook=False)), timeout=0.5,
+        )
+
+    assert [event.event_type for event in resumed] == ["chat.final"]
+    assert seen == [("stream", "task-1"), ("control", "task-1")]

@@ -6,9 +6,65 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Callable
 import logging
 from os import _exit as exit_process
 import signal
+import sys
+
+
+def _install_stop_handlers(loop: asyncio.AbstractEventLoop, task: asyncio.Task) -> Callable[[], None]:
+    """Turn console signals into one cancellation while keeping cleanup alive."""
+    previous = {}
+    loop_signals = set()
+    stopping = False
+    console_interrupted = False
+
+    def stop() -> None:
+        nonlocal stopping
+        if not stopping and not task.done():
+            stopping = True
+            task.cancel()
+
+    def console_signal(_signum: int, _frame: object) -> None:
+        nonlocal console_interrupted
+        console_interrupted = True
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(stop)
+
+    def restore() -> None:
+        for signum, handler in previous.items():
+            if signum in loop_signals and not loop.is_closed():
+                loop.remove_signal_handler(signum)
+            if console_interrupted and sys.platform == "win32" and signum == signal.SIGINT:
+                # This process is exiting. Keep repeated Ctrl+C ignored during
+                # interpreter teardown, after the event loop no longer exists.
+                handler = signal.SIG_IGN
+            signal.signal(signum, handler)
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            try:
+                loop.add_signal_handler(signum, stop)
+            except (NotImplementedError, OSError):
+                # Windows event loops have no add_signal_handler support.
+                signal.signal(signum, console_signal)
+            else:
+                loop_signals.add(signum)
+    except BaseException:
+        restore()
+        raise
+    return restore
+
+
+async def _wait_for_worker(task: asyncio.Task) -> None:
+    await task
+
+from jiuwenswarm.common.utils import (
+    configure_openjiuwen_core_logging,
+    configure_openjiuwen_runtime_logging,
+)
 
 
 def _activate_managed_external_cli_paths() -> None:
@@ -34,6 +90,11 @@ def _activate_managed_external_cli_paths() -> None:
 
 
 def main() -> None:
+    # 日志引导：须先于任何可能创建 openjiwen logger 的导入执行。
+    # 置于 main() 而非模块级：front/supervisor 进程也会 import 本模块，
+    # 模块级调用会在导入期加载 openjiuwen，破坏 front 侧导入隔离契约。
+    configure_openjiuwen_runtime_logging()
+    configure_openjiuwen_core_logging()
     logging.basicConfig(level=logging.INFO)
     from jiuwenswarm.common.background_logging import (
         enable_background_logging,
@@ -106,37 +167,50 @@ def main() -> None:
     _activate_managed_external_cli_paths()
     from jiuwenswarm.server.worker.service import WorkerForceExit, serve_worker
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    runner = asyncio.Runner()
+    loop = runner.get_loop()
     task = loop.create_task(serve_worker(args.socket or "", host=args.host, port=args.port,
                                        code_identity_value=code_identity_value,
                                        session_source=session_source))
-
-    def _stop() -> None:
-        task.cancel()
-
-    try:
-        loop.add_signal_handler(signal.SIGINT, _stop)
-        loop.add_signal_handler(signal.SIGTERM, _stop)
-    except (NotImplementedError, OSError):
-        pass
+    restore_handlers: Callable[[], None] | None = None
     exit_code = 1
     try:
-        loop.run_until_complete(task)
+        restore_handlers = _install_stop_handlers(loop, task)
+        runner.run(_wait_for_worker(task))
+        exit_code = 0
+    except asyncio.CancelledError:
+        # A signal may arrive before serve_worker enters its cancellation guard.
         exit_code = 0
     except WorkerForceExit as exc:
         logging.getLogger(__name__).exception("[Worker] fatal exit with unfinished shutdown steps: %s", exc)
+        # The parent owns stderr; file-only logging must not hide fatal diagnostics.
+        if sys.stderr is not None:
+            stderr_handler = logging.StreamHandler(sys.stderr)
+            fatal_record = logging.LogRecord(
+                __name__, logging.CRITICAL, __file__, 0,
+                "[Worker] fatal exit with unfinished shutdown steps: %s", (exc,),
+                sys.exc_info(),
+            )
+            stderr_handler.handle(fatal_record)
         if stop_background_logging():
             logging.shutdown()
         # A cancelled to_thread load may still own non-daemon executor threads.
         # SystemExit waits for those threads and can exceed the shared deadline.
         exit_process(1)
     finally:
-        loop.close()
-        # logging.shutdown acquires every sink's lock at interpreter exit.
-        # A stuck disk must not make an otherwise drained Worker immortal.
-        if not stop_background_logging():
-            exit_process(exit_code)
+        try:
+            # Also drain SDK-owned tasks, async generators and the executor.
+            # Closing the loop directly abandons their asynchronous cleanup.
+            runner.close()
+        finally:
+            try:
+                # logging.shutdown acquires every sink's lock at interpreter exit.
+                # A stuck disk must not make an otherwise drained Worker immortal.
+                if not stop_background_logging():
+                    exit_process(exit_code)
+            finally:
+                if restore_handlers is not None:
+                    restore_handlers()
 
 
 if __name__ == "__main__":

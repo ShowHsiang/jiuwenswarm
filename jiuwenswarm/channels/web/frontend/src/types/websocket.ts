@@ -29,11 +29,14 @@ export interface WsEvent {
   payload: Record<string, unknown>;
   seq?: number;
   stream_id?: string;
+  /** Gateway request id. SSE carries it on the frame id, not only inside payload. */
+  request_id?: string;
 }
 
 export type WebMessage = WsRequest | WsResponse | WsEvent;
 
 export interface WebRequestOptions {
+  /** Zero disables the request deadline; abort and connection errors still reject. */
   timeoutMs?: number;
   signal?: AbortSignal;
   /** 对应协议里请求消息的顶层 is_stream 字段（如 command.goal 的 set/resume） */
@@ -56,6 +59,8 @@ export interface WebError extends Error {
   code?: string;
   requestId?: string;
   retriable?: boolean;
+  /** The HTTP client could not map this method to a local REST route. */
+  httpRouteMissing?: true;
   /**
    * 失败响应的 payload 原样透传（此前 webClient.resolvePending 只取 message.error 拼成
    * Error，payload 整个丢弃）。专家与插件装备-前端接口_v2.md §1.6.3 的 install 两阶段流程

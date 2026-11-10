@@ -7,6 +7,7 @@ import inspect
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -57,10 +58,35 @@ def _runtime(desktop_app, tmp_path: Path, monkeypatch):
     return runtime
 
 
+def test_quit_before_first_service_still_retires_historical_worker(desktop_app, tmp_path, monkeypatch):
+    from jiuwenswarm.server.supervisor import shutdown
+
+    runtime = _runtime(desktop_app, tmp_path, monkeypatch)
+    lifecycle = AsyncMock(return_value={"ok": True, "pid": 123})
+    monkeypatch.setattr(shutdown, "shutdown_resident_worker", lifecycle)
+    assert not runtime.processes
+    runtime.shutdown()
+    lifecycle.assert_awaited_once()
+    assert lifecycle.await_args.kwargs["include_legacy"] is True
+
+
+def test_pre_service_shutdown_failure_cannot_complete_update(desktop_app, tmp_path, monkeypatch):
+    from jiuwenswarm.common.update_shutdown import create_shutdown_receipt
+    from jiuwenswarm.server.supervisor import shutdown
+
+    runtime = _runtime(desktop_app, tmp_path, monkeypatch)
+    receipt = create_shutdown_receipt(tmp_path / "updates")
+    runtime._update_shutdown_receipt = receipt
+    lifecycle = AsyncMock(side_effect=RuntimeError("Worker exit not observed"))
+    monkeypatch.setattr(shutdown, "shutdown_resident_worker", lifecycle)
+    runtime.shutdown()
+    assert receipt.read_text(encoding="utf-8") == "failed\n"
+
+
 def test_close_action_preference_round_trip(
     desktop_app, tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr(desktop_app, "get_user_workspace_dir", lambda: tmp_path)
+    monkeypatch.setattr(desktop_app, "get_config_dir", lambda: tmp_path / "config")
 
     assert desktop_app._load_close_action() is None
     assert desktop_app._save_close_action(desktop_app.CLOSE_ACTION_HIDE) is True
@@ -77,7 +103,7 @@ def test_window_api_reads_and_updates_close_action(
     desktop_app, tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(desktop_app, "_is_windows_desktop", lambda: True)
-    monkeypatch.setattr(desktop_app, "get_user_workspace_dir", lambda: tmp_path)
+    monkeypatch.setattr(desktop_app, "get_config_dir", lambda: tmp_path / "config")
     runtime = _runtime(desktop_app, tmp_path, monkeypatch)
     api = desktop_app._WindowApi(runtime)
 

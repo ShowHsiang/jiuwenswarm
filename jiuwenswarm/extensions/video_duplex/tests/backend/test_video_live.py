@@ -13,14 +13,18 @@ import struct
 from types import SimpleNamespace
 import wave
 
-from agent_gateway.channel_manager.web.media.normalizer import (
-    normalize_chat_media_attachments,
-)
 import openai
 import pytest
 import websockets
+from agent_gateway.channel_manager.web.media.normalizer import (
+    normalize_chat_media_attachments,
+)
 from websockets.exceptions import ConnectionClosedOK
 from websockets.frames import Close
+
+from agent_gateway.channel_manager.web.media.normalizer import (
+    normalize_chat_media_attachments,
+)
 
 
 from jiuwenswarm.extensions.video_duplex.tests.backend.task_bridge_support import (
@@ -263,7 +267,13 @@ async def test_video_runtime_remains_available_when_plugin_page_is_disabled(monk
 async def test_full_duplex_conversation_events_append_visible_session_history(monkeypatch) -> None:
     channel = _video_channel()
     records = []
-    monkeypatch.setattr(video_live, "append_history_record", lambda **record: records.append(record))
+
+    async def capture(_client, method, params, session_id, _owner, **_kwargs):
+        assert method.value == "video.conversation.append"
+        records.append({"session_id": session_id, **params})
+        return {}
+
+    monkeypatch.setattr(video_live, "task_agent_query", capture)
 
     await channel.handlers["video.conversation.append"](
         object(),
@@ -284,14 +294,12 @@ async def test_full_duplex_conversation_events_append_visible_session_history(mo
     }
     assert records == [{
         "session_id": "visible-session",
-        "request_id": "video-duplex-event-1",
-        "channel_id": "video_duplex",
+        "event_id": "event-1",
         "role": "assistant",
         "content": "这是全双工回答。",
         "timestamp": 1_700_000_000.25,
         "event_type": "chat.final",
         "extra": None,
-        "mode": "agent",
     }]
 
 
@@ -300,8 +308,8 @@ async def test_full_duplex_history_rejects_new_session_placeholder(monkeypatch) 
     channel = _video_channel()
     monkeypatch.setattr(
         video_live,
-        "append_history_record",
-        lambda **_record: pytest.fail("placeholder session must not be persisted"),
+        "task_agent_query",
+        lambda *_args, **_kwargs: pytest.fail("placeholder session must not be persisted"),
     )
 
     await channel.handlers["video.conversation.append"](
@@ -324,7 +332,13 @@ async def test_full_duplex_history_rejects_new_session_placeholder(monkeypatch) 
 async def test_full_duplex_tool_answer_persists_its_presentation(monkeypatch) -> None:
     channel = _video_channel()
     records = []
-    monkeypatch.setattr(video_live, "append_history_record", lambda **record: records.append(record))
+
+    async def capture(_client, method, params, session_id, _owner, **_kwargs):
+        assert method.value == "video.conversation.append"
+        records.append({"session_id": session_id, **params})
+        return {}
+
+    monkeypatch.setattr(video_live, "task_agent_query", capture)
     for presentation in ("tool_result", "unknown", None):
         await channel.handlers["video.conversation.append"](
             object(), "history-request",
@@ -1422,6 +1436,8 @@ async def test_request_joyai_frame_uses_stateful_chat_completion(monkeypatch) ->
     assert "memory" not in result
 
 
+
+
 @pytest.mark.asyncio
 async def test_request_joyai_frame_without_instruction_sends_image_and_action_protocol(
     monkeypatch,
@@ -1509,7 +1525,11 @@ async def test_joyai_voice_only_support_still_rejects_empty_polling_and_invalid_
 def test_joyai_raw_content_log_keeps_model_output_and_skips_silence(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setattr(video_live.Path, "home", lambda: tmp_path)
+    from jiuwenswarm.common import utils as common_utils
+
+    # 隔离 utils 的路径缓存（get_infra_data_dir 经缓存解析，不走 Path.home）
+    monkeypatch.setattr(common_utils, "_workspace_base_dir", tmp_path / ".jiuwenswarm")
+    monkeypatch.setattr(common_utils, "_user_home", tmp_path)
 
     video_live._append_joyai_log({
         "request_id": "request-response",
@@ -1533,7 +1553,7 @@ def test_joyai_raw_content_log_keeps_model_output_and_skips_silence(
         "model_raw_content": "</silence>",
     })
 
-    log_path = tmp_path / ".jiuwenswarm" / "logs" / "joyai-raw-content.jsonl"
+    log_path = tmp_path / ".jiuwenswarm" / "infra" / "logs" / "video" / "joyai-raw-content.jsonl"
     records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert records == [
         {
@@ -1548,7 +1568,7 @@ def test_joyai_raw_content_log_keeps_model_output_and_skips_silence(
             "adapter_content": "</response> 我来搜索。",
         }
     ]
-    main_log = tmp_path / ".jiuwenswarm" / "logs" / "joyai-video.jsonl"
+    main_log = tmp_path / ".jiuwenswarm" / "infra" / "logs" / "video" / "joyai-video.jsonl"
     main_records = [
         json.loads(line) for line in main_log.read_text(encoding="utf-8").splitlines()
     ]
@@ -3412,6 +3432,8 @@ def test_core_answer_and_receipt_use_tool_language(monkeypatch, app_language, ex
     )
 
 
+
+
 @pytest.mark.parametrize(
     "app_language,question,expected",
     [
@@ -3478,6 +3500,21 @@ async def test_core_agent_full_answer_follows_tool_language(monkeypatch) -> None
     assert "must be written in English" in prompt
     assert "必须使用简体中文" not in prompt
     assert "Speak to the user in English" in prompt
+
+
+def test_file_revision_prompt_uses_delivered_file_receipt():
+    context = video_search._delegation_context_text([{
+        "question": "Save the introduction as a PDF",
+        "query": "Save the introduction as a PDF",
+        "files": [{"name": "intro.pdf", "path": "/work/intro.pdf"}],
+        "result": "The file is ready.",
+    }])
+    prompt = video_search.build_execution_prompt(
+        "Where was the PDF saved?", "Where was the PDF saved?", "", context,
+    )
+    assert "/work/intro.pdf" in prompt
+    assert "send_file_to_user" in prompt
+    assert "Never invent a location or claim delivery without a file receipt" in prompt
 
 
 @pytest.mark.parametrize("answer", [

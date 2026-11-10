@@ -32,7 +32,7 @@ await build({
       'export * from "./src/features/settings/modules/experimental/multiModelCollaborationSettingsState";',
       'export * from "./src/features/multiModelCollaboration/featureConfig";',
       'export const experimentalSectionIds = experimentalModule.sections.map(section => section.id);',
-      'export const SettingsFixture = () => createElement(SettingsSourceProvider, {source:"config"}, createElement(SettingItemRenderer, {item:experimentalModule.sections.find(section => section.id === "multi-model-collaboration").items[0], disabled:globalThis.collaborationFixture.disabled}));',
+      'export const SettingsFixture = () => { const section = experimentalModule.sections.find(section => section.id === (globalThis.collaborationFixture.section ?? "multi-model-collaboration")); return createElement(SettingsSourceProvider, {source:"config"}, createElement(SettingItemRenderer, {item:section.items[0], disabled:globalThis.collaborationFixture.disabled})); };',
     ].join('\n'),
     resolveDir: process.cwd(),
     loader: 'ts',
@@ -88,7 +88,15 @@ await build({
             .map((name) => `export const ${name} = () => null;`)
             .join('\n'),
           './A4PSettings': 'export const A4PSettings = () => null;',
-          '../../../../assets/settings': 'export const settingsNavigationIcons = {experimental: () => null};',
+          '../../../../assets/providers': [
+            'export const getProviderLogoUrl = () => undefined;',
+            'export const getVendorLogoUrl = () => undefined;',
+          ].join('\n'),
+          '../../../../assets/settings': [
+            'export const settingsNavigationIcons = {experimental: () => null};',
+            'export const settingsActionIcons = {};',
+            'export const settingsCustomModelIcon = () => null;',
+          ].join('\n'),
           'react-i18next':
             'export const useTranslation = () => ({ t: (key) => key, i18n:{resolvedLanguage:"zh",language:"zh"} });',
         };
@@ -165,7 +173,7 @@ async function mount(options, run) {
       throw new Error(`Unexpected RPC: ${method}`);
     },
   };
-  globalThis.collaborationFixture = { services, disabled: options.disabled ?? false };
+  globalThis.collaborationFixture = { services, disabled: options.disabled ?? false, section: options.section };
   setMultiModelCollaborationEnabled(false);
   const root = createRoot(document.getElementById('root'));
   const render = () => act(async () => root.render(createElement(options.probe ? ConfigFixture : SettingsFixture)));
@@ -229,6 +237,30 @@ const configured = {
   jev_typesafe_api_key: 'shared-synthetic-key',
 };
 
+for (const available of [undefined, 'false', false, 'true', true]) {
+  test(`computer control remains visible and respects backend availability: ${available}`, async () => {
+    await mount(
+      { section: 'computer-control', config: { cua_backend_available: available, cua_agent_enabled: 'true' } },
+      async ({ get, saves, click }) => {
+        const toggle = get('settings-switch', 'cua-agent-enabled');
+        assert.equal(toggle.getAttribute('aria-checked'), 'true');
+        await click('settings-switch', 'cua-agent-enabled');
+        assert.equal(toggle.getAttribute('aria-checked'), 'false');
+        if (available !== true && available !== 'true') {
+          assert.equal(toggle.disabled, true);
+          assert.match(document.body.textContent, /cua_agent_enabled\.unavailableDescription/);
+          assert.deepEqual(saves, [{ cua_agent_enabled: 'false' }]);
+          return;
+        }
+        assert.equal(toggle.disabled, false);
+        await click('settings-switch', 'cua-agent-enabled');
+        assert.equal(toggle.getAttribute('aria-checked'), 'true');
+        assert.deepEqual(saves, [{ cua_agent_enabled: 'false' }, { cua_agent_enabled: 'true' }]);
+      },
+    );
+  });
+}
+
 test('feature flag defaults off and accepts backend booleans', () => {
   setMultiModelCollaborationEnabled(undefined);
   assert.equal(isMultiModelCollaborationEnabled(), false);
@@ -238,8 +270,10 @@ test('feature flag defaults off and accepts backend booleans', () => {
   assert.equal(isMultiModelCollaborationEnabled(), false);
 });
 
-test('collaboration is the last experimental section and other sections retain their order', () => {
+test('experimental sections retain their order with a single computer control section', () => {
   assert.deepEqual(experimentalSectionIds, [
+    'asr',
+    'task-full-duplex',
     'external-cli-custom-agents',
     'rsi',
     'a2ui',
@@ -252,6 +286,7 @@ test('collaboration is the last experimental section and other sections retain t
     'proactive-recommendation',
     'multi-model-collaboration',
     'tool-optimize',
+    'computer-control',
     'design-mode',
   ]);
 });

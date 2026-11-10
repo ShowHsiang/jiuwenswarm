@@ -24,7 +24,10 @@ import type { ModelEntry } from '../../types';
  * chat model is missing, and fail open when the re-check cannot complete.
  */
 export async function findDesignChatModelProblem(): Promise<string | null> {
-  if (designChatModelReady(useSessionStore.getState().chatAvailableModels)) return null;
+  const loaded = useSessionStore.getState().chatAvailableModels;
+  if (designChatModelReady(loaded)) {
+    return null;
+  }
   try {
     const resp = await webRequest<{ models?: ModelEntry[]; active_model?: string }>('models.list');
     const models = Array.isArray(resp?.models) ? resp.models : [];
@@ -44,12 +47,8 @@ export async function findDesignChatModelProblem(): Promise<string | null> {
  * Only the media kinds those nodes actually generate with are checked, so a
  * text-only graph is not blocked by an image slot it would never call, and the
  * chat model keeps its existing handling (see `findDesignModelsProblem`).
- * `graph` lets a concat-only video node (no video model call) be told apart.
  */
-export async function findDesignRunProblem(
-  nodes: readonly MaybeNode[],
-  graph?: DesignerExecutionGraph | null,
-): Promise<string | null> {
+export async function findDesignRunProblem(nodes: readonly MaybeNode[], graph?: DesignerExecutionGraph | null): Promise<string | null> {
   const kinds = new Set<GenerationKind>();
   for (const node of nodes) {
     const kind = nodeGenerationKind(node, graph);

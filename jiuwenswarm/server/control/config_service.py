@@ -20,7 +20,9 @@ from typing import Any
 import yaml
 from dotenv import dotenv_values
 
+from jiuwenswarm.common.cua_config import is_cua_agent_enabled, is_cua_backend_available
 from jiuwenswarm.common.browser_settings import project_browser_decision
+from jiuwenswarm.common.cua_config import is_cua_agent_enabled, is_cua_backend_available
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.common.utils import get_config_file, get_env_file
@@ -63,6 +65,12 @@ _CONFIG_SET_ENV_MAP = {
     "visual_gen_provider": "VISUAL_GEN_PROVIDER",
     "visual_gen_protocol": "VISUAL_GEN_PROTOCOL",
     "visual_gen_enabled": "VISUAL_GEN_ENABLED",
+    "music_gen_api_base": "MUSIC_GEN_API_BASE",
+    "music_gen_api_key": "MUSIC_GEN_API_KEY",
+    "music_gen_model": "MUSIC_GEN_MODEL_NAME",
+    "music_gen_provider": "MUSIC_GEN_PROVIDER",
+    "music_gen_protocol": "MUSIC_GEN_PROTOCOL",
+    "music_gen_enabled": "MUSIC_GEN_ENABLED",
     "audio_api_base": "AUDIO_API_BASE",
     "audio_api_key": "AUDIO_API_KEY",
     "audio_model": "AUDIO_MODEL_NAME",
@@ -416,6 +424,7 @@ def get_panel() -> dict[str, Any]:
     )
     payload["runtime_platform"] = runtime_platform
     payload["external_cli_agents_supported"] = "false" if runtime_platform == "harmony" else "true"
+    payload["cua_backend_available"] = "true" if is_cua_backend_available() else "false"
     try:
         raw = _read_raw_config()
         setup_guide_cfg = raw.get("setup_guide") or {}
@@ -423,6 +432,9 @@ def get_panel() -> dict[str, Any]:
             setup_guide_cfg.get("enabled", True), True
         )
         react_cfg = raw.get("react") or {}
+        payload["cua_agent_enabled"] = (
+            "true" if is_cua_agent_enabled(_nested(raw, ("react", "subagents", "cua_agent"), {})) else "false"
+        )
         ctx_cfg = react_cfg.get("context_engine_config") or {}
         payload["context_engine_enabled"] = _bool_text(ctx_cfg.get("enabled"), False)
         payload["kv_cache_affinity_enabled"] = (
@@ -449,6 +461,12 @@ def get_panel() -> dict[str, Any]:
             trajectory_cfg.get("diagnosis_enabled"), False
         )
         experimental_cfg = raw.get("experimental") or {}
+        payload["task_full_duplex_enabled"] = _bool_text(
+            experimental_cfg.get("task_full_duplex_enabled"), False
+        )
+        payload["task_asr_enabled"] = _bool_text(
+            experimental_cfg.get("task_asr_enabled"), False
+        )
         payload["team_organization_ui_enabled"] = _bool_text(
             experimental_cfg.get("team_organization_ui_enabled"), False
         )
@@ -501,6 +519,7 @@ def get_panel() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("[config_service] panel yaml merge failed: %s", exc)
         payload.setdefault("context_engine_enabled", "false")
+        payload.setdefault("cua_agent_enabled", "true" if is_cua_agent_enabled(None) else "false")
         payload.setdefault("kv_cache_affinity_enabled", "false")
         payload.setdefault("permissions_enabled", "false")
         payload.setdefault("setup_guide_enabled", "true")
@@ -511,6 +530,8 @@ def get_panel() -> dict[str, Any]:
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("trajectory_ui_diagnosis_enabled", "false")
         payload.setdefault("team_organization_ui_enabled", "false")
+        payload.setdefault("task_full_duplex_enabled", "false")
+        payload.setdefault("task_asr_enabled", "false")
         payload.setdefault("comfyui_workflow_enabled", "false")
         payload.setdefault("progressive_tool_optimize", "false")
         payload.setdefault("swarmflow_enabled", "false")

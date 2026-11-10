@@ -31,8 +31,92 @@ def test_default_team_spec_accessor_preserves_loader_result(monkeypatch):
         return spec
 
     monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(load))
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.get_session_metadata",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(TeamManager, "_stored_model_selection", staticmethod(lambda *_args: None))
     assert TeamManager.load_default_team_spec("session") is spec
     assert sessions == ["session"]
+
+
+def test_default_team_spec_follows_session_model_selection(monkeypatch):
+    calls = []
+    selection = {"type": "model", "id": "mdl_glm"}
+
+    def load(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        return object()
+
+    def stored(session_id, team_name):
+        calls.append(("stored", session_id, team_name))
+        return selection
+
+    monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(load))
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.get_session_metadata",
+        lambda *_args, **_kwargs: {"team_name": "jiuwen_team_group"},
+    )
+    monkeypatch.setattr(TeamManager, "_stored_model_selection", staticmethod(stored))
+    monkeypatch.setattr(TeamManager, "_default_if_deleted", staticmethod(lambda item: item))
+
+    TeamManager.load_default_team_spec("group")
+
+    assert calls == [
+        ("stored", "group", "jiuwen_team_group"),
+        ("group", {"model_selection": selection}),
+    ]
+
+
+def test_default_team_spec_falls_back_when_selection_cannot_be_restored(monkeypatch):
+    from jiuwenswarm.common.model_errors import TEAM_MODEL_SELECTION_STALE, ModelSelectionError
+
+    calls = []
+    default_spec = object()
+
+    def load(session_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("model_selection") is not None:
+            raise ModelSelectionError(TEAM_MODEL_SELECTION_STALE, "stale")
+        return default_spec
+
+    monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(load))
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.team.team_manager.get_session_metadata",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        TeamManager,
+        "_stored_model_selection",
+        staticmethod(lambda *_args: {"type": "model", "id": "mdl_stale"}),
+    )
+    monkeypatch.setattr(TeamManager, "_default_if_deleted", staticmethod(lambda item: item))
+
+    assert TeamManager.load_default_team_spec("group") is default_spec
+    assert calls == [{"model_selection": {"type": "model", "id": "mdl_stale"}}, {}]
+
+
+def test_stored_model_selection_prefers_team_binding_then_session(monkeypatch):
+    from jiuwenswarm.server.runtime import team_binding_store
+    from jiuwenswarm.server.runtime.session import model_selection_store
+
+    team_selection = {"type": "model", "id": "mdl_team"}
+    store = SimpleNamespace(get_team_selection=lambda name: team_selection if name == "bound" else None)
+    monkeypatch.setattr(team_binding_store, "get_team_binding_store", lambda: store)
+    monkeypatch.setattr(
+        model_selection_store,
+        "get_session_model_selection",
+        lambda _sid: SimpleNamespace(model_dump=lambda **_kw: {"type": "model", "id": "mdl_session"}),
+    )
+
+    assert TeamManager._stored_model_selection("s", "bound") == team_selection
+    assert TeamManager._stored_model_selection("s", "unbound") == {"type": "model", "id": "mdl_session"}
+
+    def invalid(_sid):
+        raise ValueError("bad selection")
+
+    monkeypatch.setattr(model_selection_store, "get_session_model_selection", invalid)
+    assert TeamManager._stored_model_selection("s", "") is None
 
 
 class _TeamManagerHarness(TeamManager):
@@ -227,6 +311,31 @@ async def test_full_waiter_does_not_block_delivery_to_other_waiters() -> None:
 
     manager.remove_waiter("sess-multi", "req-slow")
     await asyncio.wait_for(broadcast, timeout=1.0)
+
+
+def test_has_interactive_waiter_ignores_attach_only_and_exclusive() -> None:
+    """Attach-only observers and exclusive automation must not count as
+    interactive consumers. When the owning stream is torn down (interrupt,
+    cancel, pause) only the attach subscription survives; counting it left
+    the next round without a waiter of its own and all broadcasts died in
+    the dead attach queue."""
+    manager = TeamManager()
+
+    manager.add_waiter("sess-attach", "attach-1", asyncio.Queue(), attach_only=True)
+    assert manager.has_interactive_waiter("sess-attach") is False
+
+    manager.add_waiter("sess-attach", "user-1", asyncio.Queue())
+    assert manager.has_interactive_waiter("sess-attach") is True
+
+    manager.add_waiter("sess-exclusive", "hb-1", asyncio.Queue(), exclusive=True)
+    assert manager.has_interactive_waiter("sess-exclusive") is False
+
+    manager.add_waiter("sess-mixed", "hb-1", asyncio.Queue(), exclusive=True)
+    manager.add_waiter("sess-mixed", "attach-1", asyncio.Queue(), attach_only=True)
+    assert manager.has_interactive_waiter("sess-mixed") is False
+
+    manager.add_waiter("sess-mixed", "user-1", asyncio.Queue())
+    assert manager.has_interactive_waiter("sess-mixed") is True
 
 
 @pytest.mark.asyncio
@@ -687,7 +796,7 @@ async def test_team_manager_keeps_single_session_per_channel(monkeypatch: pytest
     class _FakeWorkspace:
         root_path = None
 
-    def fake_load_team_spec(session_id: str):
+    def fake_load_team_spec(session_id: str, **_kwargs: object):
         class _Spec:
             team_name = f"team-{session_id}"
             workspace = _FakeWorkspace()
@@ -727,7 +836,7 @@ async def test_create_team_does_not_run_global_runtime_cleanup(monkeypatch: pyte
     class _FakeWorkspace:
         root_path = None
 
-    def fake_load_team_spec(_session_id: str):
+    def fake_load_team_spec(_session_id: str, **_kwargs: object):
         class _Spec:
             team_name = "demo-team"
             workspace = _FakeWorkspace()
@@ -777,7 +886,11 @@ async def test_create_team_appends_session_id_to_team_name(monkeypatch: pytest.M
             created_team_names.append(self.team_name)
             return SimpleNamespace()
 
-    monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
+    monkeypatch.setattr(
+        TeamManager,
+        "_load_team_spec",
+        staticmethod(lambda _session_id, **_kwargs: _Spec()),
+    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -808,7 +921,11 @@ async def test_create_team_appends_session_id_to_web_team_name(monkeypatch: pyte
             created_team_names.append(self.team_name)
             return SimpleNamespace()
 
-    monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
+    monkeypatch.setattr(
+        TeamManager,
+        "_load_team_spec",
+        staticmethod(lambda _session_id, **_kwargs: _Spec()),
+    )
     # Provider assembly is covered by the swarm suite; stub it so this
     # session-management test runs on the minimal fake spec.
     monkeypatch.setattr(
@@ -2050,6 +2167,7 @@ async def test_get_swarm_enriched_team_spec_uses_bound_stable_team_name(
             "session_id": "sess-bound",
             "template_id": "beta_template",
             "strict_template": True,
+            "config_base": {},
         }
     ]
     assert enrich_calls[0]["team_name"] == "custom_team"
@@ -2121,6 +2239,7 @@ async def test_get_swarm_enriched_team_spec_uses_bound_team_entity_snapshot(
                 "team_name": "template_team",
                 "leader": {"member_name": "snapshot_leader"},
             },
+            "config_base": {},
         }
     ]
 
@@ -2147,7 +2266,11 @@ async def test_get_swarm_enriched_team_spec_keeps_legacy_session_scoped_team_nam
         lambda _session_id, cache_bust=False: {},
     )
     monkeypatch.setattr(TeamManager, "_ensure_postgresql_for_leader", fake_ensure_postgresql)
-    monkeypatch.setattr(TeamManager, "_load_team_spec", staticmethod(lambda _session_id: _Spec()))
+    monkeypatch.setattr(
+        TeamManager,
+        "_load_team_spec",
+        staticmethod(lambda _session_id, **_kwargs: _Spec()),
+    )
     monkeypatch.setattr(
         "jiuwenswarm.agents.swarm.enrich_team_spec_for_swarm",
         lambda spec, **kwargs: None,

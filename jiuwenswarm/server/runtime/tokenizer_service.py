@@ -23,7 +23,7 @@ from typing import Any
 from urllib.parse import urlunsplit
 
 from jiuwenswarm.common.config import get_config, get_default_models
-from jiuwenswarm.common.utils import get_user_workspace_dir
+from jiuwenswarm.common.utils import get_infra_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,13 @@ _DEFAULT_TOKENIZER_REPOSITORIES: tuple[_DefaultTokenizerRepository, ...] = (
     ),
     _DefaultTokenizerRepository(
         "deepseek-v4-flash",
+        "deepseek-ai/DeepSeek-V4-Flash",
+    ),
+    # ``deepseek-flash`` is the API name, not a delimited variant of
+    # ``deepseek-v4-flash``. An exact entry is required because a family match
+    # is not a trusted token count.
+    _DefaultTokenizerRepository(
+        "deepseek-flash",
         "deepseek-ai/DeepSeek-V4-Flash",
     ),
     _DefaultTokenizerRepository(
@@ -630,12 +637,13 @@ def resolve_tokenizer_cache_dir(config: dict[str, Any] | None = None) -> Path:
     if raw_dir in (None, ""):
         raw_dir = os.getenv("JIUWENSWARM_TOKENIZER_CACHE_DIR")
 
+    # tokenizer 缓存为可重建的 Pod 本地数据，默认落 infra/
     if raw_dir in (None, ""):
-        return get_user_workspace_dir() / _DEFAULT_CACHE_DIR
+        return get_infra_data_dir() / _DEFAULT_CACHE_DIR
 
     path = Path(str(raw_dir)).expanduser()
     if not path.is_absolute():
-        path = get_user_workspace_dir() / path
+        path = get_infra_data_dir() / path
     return path
 
 

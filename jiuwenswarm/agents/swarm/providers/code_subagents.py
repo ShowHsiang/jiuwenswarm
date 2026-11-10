@@ -40,11 +40,11 @@ from openjiuwen.agent_teams.harness.manifest import (
 from openjiuwen.harness.schema.build_context import parent_sys_operation
 from openjiuwen.harness.subagents.browser_agent import build_browser_agent_config
 from openjiuwen.harness.subagents.code_agent import build_code_agent_config
-from openjiuwen.harness.subagents.cua_agent import build_cua_agent_config
 
 from jiuwenswarm.agents.harness.common.browser_defaults import (
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
 )
+from jiuwenswarm.agents.harness.common.cua_factory import build_cua_agent_config
 from jiuwenswarm.agents.swarm.browser_runtime import apply_swarm_browser_settings
 from jiuwenswarm.agents.harness.common.cua_defaults import (
     DEFAULT_CUA_AGENT_MAX_ITERATIONS,
@@ -315,6 +315,8 @@ def build_swarm_cua_agent(factory_kwargs: dict[str, Any], ctx: SwarmBuildContext
         cua_snapshot_keep_last_k=inp.snapshot_keep_last_k,
         cua_pause_on_user_input=inp.pause_on_user_input,
     )
+    if spec is None:
+        return None
     # Preserve the cua_* factory kwargs baked in by agent-core; only add the
     # workspace flag.
     spec.factory_kwargs = {**(spec.factory_kwargs or {}), "auto_create_workspace": False}

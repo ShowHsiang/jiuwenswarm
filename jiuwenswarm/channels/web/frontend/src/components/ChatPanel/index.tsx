@@ -46,6 +46,7 @@ import type { AgentGroupIdentity } from '../../features/agentManagement';
 import { useAgentGroupVisualIdentity } from '../../features/agentManagement/useAgentGroupAvatars';
 import { MessageList } from './MessageList';
 import { ContextCompressionLines } from './MessageItem';
+import { activeMoaPhase, MoaProgress } from './MoaProgress';
 import { InputArea, type InputAreaHandle } from './InputArea';
 import ChatOverviewIcon from '../../assets/chat-overview.svg?react';
 import PanelCollapseIcon from '../../assets/panel-collapse.svg?react';
@@ -89,6 +90,7 @@ import {
 } from '../../features/workspace/localFilePicker';
 import { useDesktopLocalFilePickerReady, useWelcomeBubblePosition } from '../../hooks';
 import { flushApplicationConversationHistory } from '../../applicationPlugins/ApplicationPluginOutlet';
+import { toast } from '../ui/Toast/toastStore';
 import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
 import { useOrganizationProcessing } from '../../features/teamOrganization/processing';
 import { requestLogin, useAuthStore } from '../../stores/authStore';
@@ -102,7 +104,6 @@ import {
   buildSessionBoundEvent,
   buildTopicClickEvent,
   buildTopicStarterRequest,
-  topicStarterShowsSettingsAction,
   topicStarterShowsStatus,
   topicStarterStatusMessageKey,
   type TopicStarterEvent,
@@ -239,10 +240,14 @@ const HUMAN_SHARE_IDENTITY: TeamMemberIdentity = { role: 'human_agent' };
 function SuggestionCard({
   topic,
   onClick,
+  onMouseEnter,
+  onMouseLeave,
   disabled = false,
 }: {
   topic: TopicStarterTopic;
   onClick: () => void;
+  onMouseEnter?: () => void;
+  onMouseLeave?: () => void;
   disabled?: boolean;
 }) {
   const { t } = useTranslation();
@@ -259,17 +264,22 @@ function SuggestionCard({
   const sourceText = typeof source?.source_text === 'string' ? source.source_text : '';
   const searchUrl = safeHttpUrl(typeof source?.search_url === 'string' ? source.search_url : sourceUrl);
   const listedAt = typeof source?.listed_at === 'string' ? new Date(source.listed_at) : null;
+  const listedAtLabel =
+    listedAt && !Number.isNaN(listedAt.getTime())
+      ? [
+          listedAt.getFullYear(),
+          String(listedAt.getMonth() + 1).padStart(2, '0'),
+          String(listedAt.getDate()).padStart(2, '0'),
+        ].join('-') +
+        ` ${String(listedAt.getHours()).padStart(2, '0')}:${String(listedAt.getMinutes()).padStart(2, '0')}`
+      : '';
   const sourceBadge = !sourceSite
     ? null
     : hotList
       ? [
           t(source?.publisher === 'weibo.com' ? 'chat.topicStarter.weiboHotList' : 'chat.topicStarter.baiduHotList'),
           t('chat.topicStarter.hotListRank', { rank: source?.hot_list_rank }),
-          listedAt && !Number.isNaN(listedAt.getTime())
-            ? t('chat.topicStarter.hotListListedAt', {
-                time: `${String(listedAt.getHours()).padStart(2, '0')}:${String(listedAt.getMinutes()).padStart(2, '0')}`,
-              })
-            : '',
+          listedAtLabel ? t('chat.topicStarter.hotListListedAt', { time: listedAtLabel }) : '',
         ].filter(Boolean).join(' · ')
       : [
           source?.source_kind === 'news_report' ? '资讯' : '近期',
@@ -281,6 +291,8 @@ function SuggestionCard({
       className={`chat-suggestion-card${sourceBadge ? ' chat-suggestion-card--sourced' : ''}${hotList ? ' chat-suggestion-card--hot-list' : ''}`}
       data-testid="chat-panel-welcome-suggestion"
       data-variant={topic.title}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
     >
       {sourceBadge && (
         <div data-testid="chat-panel-topic-sources" data-variant={topic.title} className="chat-suggestion-card__sources">
@@ -1099,9 +1111,6 @@ function HumanShareCard({ commands, onShare }: { commands: HumanShareCommand[]; 
 
 // The dismissal notice stays long enough to use its buttons, fades out over its last second
 // (ChatPanel.css) and then leaves the page.
-// An open global new page asks for the hot-list check every 30 minutes. The gateway runs one only
-// 30 minutes after the last one ended, so the page asks a minute later to land past that mark.
-const NEWS_CHECK_INTERVAL_MS = 31 * 60 * 1000;
 const SCROLL_BOTTOM_THRESHOLD_PX = 40;
 const LOAD_OLDER_THRESHOLD_PX = 8;
 const VISIBILITY_RESTORE_SCROLL_SUPPRESS_MS = 300;
@@ -1223,6 +1232,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   onToggleDiagnosis,
 }: ChatPanelProps) {
   const { t } = useTranslation();
+  const workMode = useWorkspaceStore((state) => state.workMode);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const conversationId = useOrganizationConversationKey(activeSessionId);
   const expertIsProcessing = useChatStore((s) => s.runtimes[conversationId]?.isProcessing ?? false);
@@ -1238,6 +1248,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   const toolExecutionOrder = useChatStore((s) => s.runtimes[conversationId]?.toolExecutionOrder ?? []);
   const contextCompressionRuntime = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.contextCompressionRuntime);
   const contextCompressionSummary = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.contextCompressionSummary);
+  const moaPhase = useChatStore((s) => activeMoaPhase(s.runtimes[activeSessionId ?? '']?.moaOperations));
   const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
   const storedTeamGroupIdentity = useSessionStore(
     (s) => s.runtimes[conversationId]?.teamGroupIdentity ?? null,
@@ -1315,7 +1326,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     : 'chat-content chat-content--welcome';
   const topicStarterVisitId = useMemo(
     () => newTopicStarterVisitId(),
-    [activeSessionId, autoFocusKey, topicStarterProjectId],
+    [activeSessionId, autoFocusKey, topicStarterProjectId, workMode],
   );
   const [dynamicSlate, setDynamicSlate] = useState<{
     visitId: string;
@@ -1396,16 +1407,18 @@ export const ChatPanel = React.memo(function ChatPanel({
   const [humanShareOpen, setHumanShareOpen] = React.useState(false);
   const isAuthorized = useAuthStore((state) => state.islogin);
   const [bubbleVisible, setBubbleVisible] = useState(false);
+  const [topicBubbleActive, setTopicBubbleActive] = useState(false);
+  const showTopicBubble = topicBubbleActive && recommendationState === 'disabled';
   const [freeModelsPromptDismissed, setFreeModelsPromptDismissed] = useState(false);
   const bubbleHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleBubbleShow = useCallback(() => {
-    if (!isAuthorized && freeModelsPromptDismissed) return;
+    if (!isAuthorized && freeModelsPromptDismissed && !showTopicBubble) return;
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
       bubbleHideTimerRef.current = null;
     }
     setBubbleVisible(true);
-  }, [freeModelsPromptDismissed, isAuthorized]);
+  }, [freeModelsPromptDismissed, isAuthorized, showTopicBubble]);
   const handleBubbleLeave = useCallback(() => {
     if (bubbleHideTimerRef.current) {
       clearTimeout(bubbleHideTimerRef.current);
@@ -1413,6 +1426,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     bubbleHideTimerRef.current = setTimeout(() => {
       bubbleHideTimerRef.current = null;
       setBubbleVisible(false);
+      setTopicBubbleActive(false);
     }, WELCOME_BUBBLE_HIDE_DELAY);
   }, []);
   const handleFreeModelsPromptClose = useCallback(() => {
@@ -1708,30 +1722,6 @@ export const ChatPanel = React.memo(function ChatPanel({
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [activeSessionId, rememberSessionScrollTop, restoreSessionScrollTop]);
 
-  // 空白全局新建页回到前台、以及开在前台时每 30 分钟：让后台检查资讯，页面本身不等待结果。
-  useEffect(() => {
-    if (!isConnected || hasConversation || topicStarterProjectId) return;
-    const checkNews = () => {
-      if (document.hidden || !acceptingDynamicRef.current) return;
-      void webRequest('topic_starters.foreground', { context_scope: 'global_new_chat', visit_id: topicStarterVisitIdRef.current }).catch(() => undefined);
-    };
-    let timer: number | null = null;
-    const keepChecking = () => {
-      if (timer !== null) window.clearInterval(timer);
-      timer = document.hidden ? null : window.setInterval(checkNews, NEWS_CHECK_INTERVAL_MS);
-    };
-    const handleVisibility = () => {
-      checkNews();
-      keepChecking();
-    };
-    keepChecking();
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibility);
-      if (timer !== null) window.clearInterval(timer);
-    };
-  }, [hasConversation, isConnected, topicStarterProjectId]);
-
   useEffect(() => {
     const handleTopicPageVisibility = () => {
       const visible = document.visibilityState === 'visible';
@@ -1821,6 +1811,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     isThinking,
     contextCompressionRuntime,
     contextCompressionSummary,
+    moaPhase,
     historyPublishedBatchSeq,
     historyLoadingMore,
     historyPrepending,
@@ -1876,11 +1867,16 @@ export const ChatPanel = React.memo(function ChatPanel({
       return;
     }
     const requestSessionId = activeSessionId;
-    const requestParams = buildTopicStarterRequest(requestSessionId, topicStarterProjectId);
+    const requestParams = buildTopicStarterRequest(requestSessionId, topicStarterProjectId, workMode);
     let active = true;
     let receivedScopeState = false;
-    const unsubscribeReady = webClient.on<{ visit_id?: string; context_scope: string; state: string; pool_written?: boolean }>("topic_starters.ready", ({ payload }) => {
-      if (!active || (payload.visit_id && payload.visit_id !== topicStarterVisitId) || payload.context_scope !== requestParams.context_scope) return;
+    const unsubscribeReady = webClient.on<{ visit_id?: string; context_scope: string; work_mode?: string; state: string; pool_written?: boolean }>("topic_starters.ready", ({ payload }) => {
+      if (
+        !active
+        || (payload.visit_id && payload.visit_id !== topicStarterVisitId)
+        || payload.context_scope !== requestParams.context_scope
+        || (payload.work_mode || 'work') !== requestParams.work_mode
+      ) return;
       receivedScopeState = true;
       setRecommendationState(payload.state);
       // Preparation that wrote no pool leaves the cards on screen as the pool still serves them.
@@ -1924,7 +1920,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     // This read also serves a pool that became ready while the page was in the background.
     readyWhileHiddenRef.current = false;
     void webRequest<TopicStarterResponse>('topic_starters.get', {
-      ...requestParams, visit_id: topicStarterVisitId, manual_retry: false,
+      ...requestParams, visit_id: topicStarterVisitId,
       ...(refillSlateId ? { slate_id: refillSlateId } : {}),
     }, { timeoutMs: 60_000 })
       .then(response => {
@@ -1962,7 +1958,7 @@ export const ChatPanel = React.memo(function ChatPanel({
       unsubscribeReady();
       unsubscribeControl();
     };
-  }, [activeSessionId, hasConversation, isConnected, topicStarterProjectId, topicStarterVisitId, recommendationRefresh]);
+  }, [activeSessionId, hasConversation, isConnected, topicStarterProjectId, topicStarterVisitId, recommendationRefresh, workMode]);
 
 
   useEffect(() => {
@@ -2042,15 +2038,21 @@ export const ChatPanel = React.memo(function ChatPanel({
 
   const handleSendMessage = useCallback(
     async (content: string, mediaItems?: MediaItem[], options?: ChatSendOptions | ChatInputProvenance) => {
-      if (options && 'queuedTaskId' in options) {
+      const queued = options && 'queuedTaskId' in options;
+      // Capture submission provenance before awaiting the history flush.
+      const nextInput = queued ? null : takeNextInputSubmission(content);
+      try {
         if (activeSessionId) await flushApplicationConversationHistory(activeSessionId);
+      } catch (error) {
+        nextInput?.settle(false);
+        toast.open({ content: error instanceof Error ? error.message : t('network.requestFailed'), variant: 'error' });
+        return;
+      }
+      if (queued || !nextInput) {
         setIsSending(true);
         onSendMessage(content, mediaItems, options);
         return;
       }
-      // Capture before the composer clears the draft; InputArea submits then empties the store.
-      const nextInput = takeNextInputSubmission(content);
-      if (activeSessionId) await flushApplicationConversationHistory(activeSessionId);
       const slate = visibleTopicSlateRef.current;
       acceptingDynamicRef.current = false;
       const directInputRecorded =
@@ -2070,7 +2072,7 @@ export const ChatPanel = React.memo(function ChatPanel({
         console.error('topic_starters direct-input lineage was not recorded:', error);
       });
     },
-    [activeSessionId, ensureTopicStarterExposureAcknowledged, onSendMessage, sendTopicStarterEvent, takeNextInputSubmission],
+    [activeSessionId, ensureTopicStarterExposureAcknowledged, onSendMessage, sendTopicStarterEvent, takeNextInputSubmission, t],
   );
 
   const handleEmptyComposerTab = useCallback(() => acceptNextInputSuggestion('tab'), [acceptNextInputSuggestion]);
@@ -2474,6 +2476,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                   {/* 内联审批卡片（演进审批 & 权限审批共用） */}
                   <InlineQuestionCard onSubmit={onUserAnswer} />
                   <ContextCompressionLines runtime={contextCompressionRuntime} summary={contextCompressionSummary} />
+                  <MoaProgress phase={moaPhase} />
                 </>
               ) : isHistoryRestoring ? (
                 <div
@@ -2508,12 +2511,24 @@ export const ChatPanel = React.memo(function ChatPanel({
                   <>
                     <div
                       ref={bubbleRef}
-                      className={`chat-welcome__banner chat-welcome__banner--bubble${!isAuthorized ? ' chat-welcome__banner--bubble--campaign' : ''}${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
+                      className={`chat-welcome__banner chat-welcome__banner--bubble${showTopicBubble || !isAuthorized ? ' chat-welcome__banner--bubble--campaign' : ''}${bubbleVisible ? ' chat-welcome__banner--bubble--visible' : ''}`}
                       data-testid="chat-panel-welcome-banner-bubble"
                       onMouseEnter={handleBubbleShow}
                       onMouseLeave={handleBubbleLeave}
                     >
-                      {isAuthorized ? (
+                      {showTopicBubble ? (
+                        <>
+                          <p data-testid="chat-panel-topic-disabled-hint">{t('chat.topicStarter.disabledHintWithCards')}</p>
+                          <button
+                            type="button"
+                            className="chat-welcome__campaign-claim"
+                            data-testid="chat-panel-topic-general-settings"
+                            onClick={() => onOpenGeneralSettings?.()}
+                          >
+                            {t('chat.topicStarter.trySettings')}
+                          </button>
+                        </>
+                      ) : isAuthorized ? (
                         t('chat.welcomeBubbleText')
                       ) : (
                         <>
@@ -2547,7 +2562,10 @@ export const ChatPanel = React.memo(function ChatPanel({
                     <BeeBanner
                       className="chat-welcome__banner chat-welcome__banner--bee"
                       altText={t('chat.welcomeLogoAlt')}
-                      onTrigger={handleBubbleShow}
+                      onTrigger={() => {
+                        setTopicBubbleActive(false);
+                        handleBubbleShow();
+                      }}
                       onLeave={handleBubbleLeave}
                     />
                   </>
@@ -2583,14 +2601,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                 />
               </div>
               <div className="chat-suggestions" data-testid="chat-panel-welcome-suggestions">
-                {recommendationState === 'disabled' && visibleTopicSlate?.topics.length ? (
-                  <p className="chat-suggestions__title w-full" data-testid="chat-panel-topic-disabled-hint">
-                    {t('chat.topicStarter.disabledHintWithCards')}
-                    <button type="button" className="ml-2 text-text-link underline" data-testid="chat-panel-topic-general-settings" onClick={() => onOpenGeneralSettings?.()}>
-                      {t('chat.topicStarter.openSettings')}
-                    </button>
-                  </p>
-                ) : recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
+                {recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
                   <div
                     className="chat-suggestions__title"
                     role="status"
@@ -2601,16 +2612,6 @@ export const ChatPanel = React.memo(function ChatPanel({
                     }
                   >
                     {t(topicStarterStatusMessageKey(recommendationState, Boolean(visibleTopicSlate)))}
-                    {topicStarterShowsSettingsAction(recommendationState) ? (
-                      <button
-                        type="button"
-                        className="ml-2 text-text-link underline"
-                        data-testid="chat-panel-topic-settings"
-                        onClick={() => onOpenGeneralSettings?.()}
-                      >
-                        {t('chat.topicStarter.openSettings')}
-                      </button>
-                    ) : null}
                   </div>
                 ) : null}
                 {recommendationState !== 'disabled' && topicStarterErrorKey && topicStarterErrorKey !== 'network.requestFailed' && (
@@ -2630,6 +2631,15 @@ export const ChatPanel = React.memo(function ChatPanel({
                       topic={topic}
                       onClick={() => handleSuggestion(topic)}
                       disabled={topicStarterSuggestionsDisabled}
+                      onMouseEnter={recommendationState === 'disabled' ? () => {
+                        if (bubbleHideTimerRef.current) {
+                          clearTimeout(bubbleHideTimerRef.current);
+                          bubbleHideTimerRef.current = null;
+                        }
+                        setTopicBubbleActive(true);
+                        setBubbleVisible(true);
+                      } : undefined}
+                      onMouseLeave={recommendationState === 'disabled' ? handleBubbleLeave : undefined}
                     />
                   );
                 })}

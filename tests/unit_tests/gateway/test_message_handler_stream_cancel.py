@@ -136,7 +136,6 @@ async def test_permission_resume_releases_hold_independently_of_session_prefix(m
     monkeypatch.setattr("agent_gateway.cron.live_bus.cron_live_bus.clear_session", Mock())
     mark = Mock(wraps=scheduler.mark_permission_resume_succeeded)
     handler.set_cron_controller(SimpleNamespace(mark_permission_resume_succeeded=mark))
-    monkeypatch.setattr(handler, "_sync_agentos_cron_jobs", AsyncMock())
     monkeypatch.setattr(handler, "_apply_session_login_owner", AsyncMock())
     monkeypatch.setattr(handler, "publish_stream_chunk", AsyncMock(return_value=True))
     monkeypatch.setattr(handler, "_publish_stream_error", AsyncMock())
@@ -1464,6 +1463,25 @@ def test_is_team_chat_send_recognizes_all_team_modes(mode: str, expected: bool) 
     _is_team_chat_send = getattr(MessageHandler, "_is_team_chat_send")
     msg = _chat_send_message(channel_id="web", session_id="sess", mode=mode)
     assert _is_team_chat_send(msg) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["", "agent.plan", "team"])
+async def test_group_chat_send_preserves_running_expert_stream(mode: str) -> None:
+    handler = _TestMessageHandler.create()
+    travel_task = _seed_stream_task(
+        handler, rid="rid-travel", channel_id="web", session_id="group-trip",
+    )
+    msg = _chat_send_message(channel_id="web", session_id="group-trip", mode=mode)
+    msg.params.update({"group_id": "group-trip", "mentions": ["essay-expert"]})
+
+    should_cancel = getattr(handler, "_should_cancel_existing_stream_before_chat_send")
+    if should_cancel(msg):
+        await handler.cancel_stream_tasks_for_channel(msg)
+
+    assert not travel_task.cancelled()
+    await asyncio.sleep(0)
+    assert not _FakeAgentClient.sent_requests
 
 
 @pytest.mark.asyncio

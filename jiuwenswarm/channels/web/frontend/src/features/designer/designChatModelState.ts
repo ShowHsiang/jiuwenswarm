@@ -13,3 +13,4 @@ export function designChatModelReady(models: ModelEntry[] | null | undefined): b
   if (!Array.isArray(models)) return false;
   return models.some((model) => String(model?.model_name ?? '').trim() !== '');
 }
+
