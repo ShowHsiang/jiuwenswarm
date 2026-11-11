@@ -33,7 +33,6 @@ class BrowserTaskPromptRail(SubagentRail):
         self._cua_backend_available = cua_agent_enabled and is_cua_backend_available()
         self._channel: str | None = None
         self._deep_agent: object | None = None
-        self._channel: str | None = None
         super().__init__(
             enable_async_subagent=enable_async_subagent,
             enable_subagent_runtime=enable_subagent_runtime,
