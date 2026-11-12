@@ -152,6 +152,11 @@ def _has_persistable_assistant_payload(
         return isinstance(payload.get("context_window"), dict) and isinstance(
             payload.get("parts"), dict
         )
+    if et == "chat.runtime_monitor":
+        # Bounded diagnostics have no assistant prose, but must survive replay.
+        return (payload.get("schema_version") == "runtime-monitor.v1"
+                and isinstance(payload.get("window"), dict)
+                and bool(payload.get("task_id")) and bool(payload.get("generation")))
     if et == "chat.usage_summary" and isinstance(payload.get("usage"), dict):
         return bool(payload["usage"])
     if et == "chat.file" and payload.get("files"):

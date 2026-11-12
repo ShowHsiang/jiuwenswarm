@@ -1,3 +1,4 @@
+import { runtimeMonitorNoticeId } from './runtimeMonitorNotices';
 import { Message, MessageRole, UsageSummary, FileDownloadItem, MediaItem, WsEvent, ToolExecution } from '../types';
 import { webClient } from '../services/webClient';
 import { normalizeFinalContent } from '../utils/finalContent';
@@ -40,6 +41,7 @@ const HISTORY_RESTORE_TIMEOUT_MS = 30_000;
 
 /** 助手侧仅恢复这些事件；用户消息无 event_type，单独保留 */
 const ALLOWED_ASSISTANT_EVENT_TYPES = new Set([
+  'chat.notice',
   'chat.final',
   'chat.tool_call',
   'chat.tool_result',
@@ -1087,6 +1089,16 @@ function parseHistoryTimelineEntry(
 
   const payload = buildEventPayloadForRecord(record);
 
+  if (eventType === 'chat.notice') {
+    const id = runtimeMonitorNoticeId(payload);
+    const content = typeof payload.content === 'string' ? payload.content : '';
+    if (!id || !content.trim()) return null;
+    return {
+      kind: 'message',
+      message: { id, role: 'system', content, timestamp: at },
+    };
+  }
+
   if (eventType === 'chat.subtask_update') {
     return { kind: 'subagent_update', at, payload };
   }
@@ -1416,6 +1428,13 @@ function materializeHistoryTimeline(
 
   for (const e of entries) {
     if (e.kind === 'message') {
+      if (e.message.id.startsWith('runtime-monitor-notice-')) {
+        const index = messages.findIndex((message) => message.id === e.message.id);
+        if (index >= 0) {
+          messages[index] = e.message;
+          continue;
+        }
+      }
       messages.push(e.message);
       continue;
     }

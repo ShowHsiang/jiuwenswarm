@@ -1,3 +1,4 @@
+import { runtimeMonitorNoticeId } from '../features/runtimeMonitorNotices';
 /**
  * WebSocket Hook
  *
@@ -4125,7 +4126,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (!content) return;
         const noticeType = pickString(payload.notice_type, payload.type) || 'notice';
         const requestId = getPayloadRequestId(payload) || generateUuidV4();
-        const messageId = `notice-${noticeType}-${requestId}`;
+        const messageId = runtimeMonitorNoticeId(payload) || `notice-${noticeType}-${requestId}`;
         const chatState = useChatStore.getState();
         const existing = chatState.getRuntime(sessionId)?.messages.find((message) => message.id === messageId);
         if (existing) {

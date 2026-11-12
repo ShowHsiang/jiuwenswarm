@@ -28,6 +28,18 @@ export function makeEventDedupKey(eventName: string, payload: Record<string, unk
     typeof payload.event_type === 'string' ? payload.event_type : '';
   const payloadRequestId =
     typeof payload.request_id === 'string' ? payload.request_id : '';
+  // One request may produce several advice items and several outcomes per item.
+  // Keep lifecycle updates distinct while suppressing identical retransmissions.
+  if (
+    eventName === 'chat.notice' &&
+    payload.notice_type === 'runtime_intervention' &&
+    typeof payload.notice_id === 'string'
+  ) {
+    const monitor = payload.runtime_monitor as Record<string, unknown> | undefined;
+    return JSON.stringify([
+      eventName, payloadSessionId, payload.notice_id, payload.content, monitor?.advice,
+    ]);
+  }
   const nestedToolCall =
     eventName === 'chat.tool_call' &&
     payload.tool_call &&

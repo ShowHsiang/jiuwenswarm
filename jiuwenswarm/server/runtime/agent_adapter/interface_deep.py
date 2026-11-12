@@ -1825,6 +1825,7 @@ class JiuWenSwarmDeepAdapter:
         # any DeepAgent/TaskTool is created below.
         apply_task_tool_event_patch()
         self._instance: DeepAgent | None = None
+        self._runtime_monitor_binding = None
         self._interaction_output_handoff: OutputHandoff | None = None
         self._session_input_guard: SessionInputGuard | None = None
         self._project_dir: str | None = None
@@ -10436,6 +10437,7 @@ class JiuWenSwarmDeepAdapter:
             ).get("enabled", False),
             completion_timeout=resolve_task_loop_completion_timeout(config),
         )
+        await self._sync_runtime_monitor(config_base, model)
 
         # The code- and team-mode adapters have their own prompt policies. Opt
         # only canonical single-agent modes into the centralized registry,
@@ -10851,6 +10853,7 @@ class JiuWenSwarmDeepAdapter:
         finally:
             self._restore_omitted_reload_fields(deep_cfg, omitted_fields)
         self._commit_reload_fingerprints(reload_fingerprints)
+        await self._sync_runtime_monitor(config_base, model)
         # Issue #4059: configure() above moved _permission_rail (if any) into
         # _pending_rails. The persistent interaction loop never re-runs
         # ensure_initialized(), so we live-register it here — same pattern
@@ -12088,6 +12091,19 @@ class JiuWenSwarmDeepAdapter:
             return
         await self._instance.stop()
 
+    async def _sync_runtime_monitor(self, config_base: dict, model) -> None:
+        from jiuwenswarm.server.runtime.agent_adapter.runtime_monitor import configure_runtime_monitor
+
+        current = getattr(self, "_runtime_monitor_binding", None)
+        try:
+            self._runtime_monitor_binding = await configure_runtime_monitor(
+                self._instance, config_base, current=current, chat_model=model,
+                language=self._resolve_prompt_language(),
+            )
+        except Exception as exc:
+            # Monitoring setup cannot prevent normal requests; retain a valid old binding on reload.
+            logger.warning("[RuntimeMonitor] setup failed; previous configuration retained: %s", type(exc).__name__)
+
     async def cleanup(self) -> None:
         """Release adapter-owned external runtime resources."""
         await self._cleanup_evolution_background_tasks()
@@ -12160,6 +12176,12 @@ class JiuWenSwarmDeepAdapter:
             self._mcp_prewarm_task.cancel()
         self._mcp_prewarm_task = None
         await self._close_a2x_client()
+        monitor_binding = getattr(self, "_runtime_monitor_binding", None)
+        if monitor_binding is not None:
+            if self._instance is not None:
+                self._instance.set_runtime_monitor(None)
+            await monitor_binding.aclose()
+            self._runtime_monitor_binding = None
 
     async def _cleanup_evolution_background_tasks(self) -> None:
         """Drain detached evolution work before adapter-owned state is released."""
@@ -17423,6 +17445,11 @@ class JiuWenSwarmDeepAdapter:
                         persist_projection["parent_session_id"] = parent_session_id
                     JiuWenSwarmDeepAdapter._persist_subagent_activity(persist_projection)
                     return {"event_type": "chat.subagent_activity", **projection}
+
+                if chunk_type in {"chat.runtime_monitor", "chat.notice"}:
+                    if isinstance(payload, dict):
+                        return {**payload, "event_type": chunk_type}
+                    return None
 
                 if chunk_type == "context.usage":
                     usage_payload = normalize_context_usage_payload(payload)

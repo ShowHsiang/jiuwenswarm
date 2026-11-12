@@ -884,6 +884,24 @@ execution_guard:
       consecutive_threshold: 4             # 工具名+入参+返回值连续相同几轮触发压缩
       bailout_threshold: 3                 # 第几次命中时抛异常（默认最多压缩 2 次）
 
+  # 原生单 Agent 的进展监控：SDK 负责窗口与建议，应用展示干预原因/效果。
+  # off: enabled=false；observe 只记录；active 将建议送入主模型。
+  runtime_monitor:
+    enabled: false
+    mode: observe
+    backend: jev                     # jev（默认）或 llm（复用当前主模型接口）
+    jev:
+      api_key: "${JEV_API_KEY:-}"      # 不填写明文；缺少凭据不启用监控
+      api_base: https://api.typesafe.ai
+      model_name: jev-latest
+    parameters:
+      window_size: 5
+      warmup_steps: 2
+      low_gain_steps: 3
+      conflict_threshold: 2
+      assessment_timeout: 1.5
+      review_timeout: 1.5
+
   # 断路器：检测工具重复/交替/无进展循环，critical 级会强制结束当次回答
   circuit_breaker:
     # 总开关。断路器会主动中断 agent（force-finish），默认关闭，需显式开启
