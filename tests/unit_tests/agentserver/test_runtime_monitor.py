@@ -317,13 +317,17 @@ async def test_failed_projection_can_retry_without_duplicate_snapshot(fake_jev):
     await binding.aclose()
 
 
-def test_snapshots_and_notices_survive_actual_history_writer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_snapshots_and_notices_survive_actual_history_writer(tmp_path, monkeypatch, legacy):
     from openjiuwen.core.single_agent.runtime_monitor import RuntimeMonitorConfig
     from openjiuwen.core.single_agent.runtime_monitor.memory import RuntimeMemory
     from openjiuwen.core.single_agent.runtime_monitor.schema import RuntimeGoal
     from jiuwenswarm.server.runtime.session import session_history, session_metadata
+    from jiuwenswarm.server.control.history_service import load_history_cursor_page, load_history_page
+    from jiuwenswarm.server.runtime.session.history_replay import is_context_record
     from tests.unit_tests.test_session_history_empty_filter import _wait_history
 
+    monkeypatch.setenv("JIUWENSWARM_USE_LEGACY_HISTORY_JSON", "1" if legacy else "0")
     monkeypatch.setattr(session_history, "get_agent_sessions_dir", lambda: tmp_path)
     monkeypatch.setattr(session_metadata, "update_session_metadata", lambda **kwargs: None)
     monkeypatch.setattr(session_metadata, "set_session_delivery_context", lambda **kwargs: None)
@@ -332,12 +336,24 @@ def test_snapshots_and_notices_survive_actual_history_writer(tmp_path, monkeypat
     for event, content, extra in [
         ("chat.runtime_monitor", "", {"schema_version": "invalid"}),
         ("chat.runtime_monitor", "", snapshot),
+        ("chat.notice", "Suggestion delivered", {
+            **notice, "runtime_monitor": {"advice": {"state": "applied"}},
+        }),
         ("chat.notice", "Observed progress", notice),
     ]:
         session_history.append_history_record(session_id="runtime-history", request_id="r1", channel_id="web",
             role="assistant", event_type=event, content=content, timestamp=1.0, extra=extra)
-    rows = _wait_history("runtime-history", min_count=2)
-    assert [row["event_type"] for row in rows] == ["chat.runtime_monitor", "chat.notice"]
+    rows = _wait_history("runtime-history", min_count=3)
+    assert [row["event_type"] for row in rows] == ["chat.runtime_monitor", "chat.notice", "chat.notice"]
     assert rows[0]["window"] == snapshot["window"]
-    assert rows[1]["notice_id"] == "gen:advice-1"
-    assert rows[1]["runtime_monitor"]["advice"]["state"] == "improved"
+    assert rows[-1]["notice_id"] == "gen:advice-1"
+    assert rows[-1]["runtime_monitor"]["advice"]["state"] == "improved"
+    assert not any(is_context_record(row) for row in rows)
+    pages = [load_history_page("runtime-history", 1)]
+    if not legacy:
+        pages.append(load_history_cursor_page("runtime-history", None))
+    for page in pages:
+        restored = page["messages"]
+        assert [row["event_type"] for row in restored] == ["chat.notice", "chat.notice"]
+        assert {row["notice_id"] for row in restored} == {"gen:advice-1"}
+        assert [row["runtime_monitor"]["advice"]["state"] for row in restored] == ["improved", "applied"]

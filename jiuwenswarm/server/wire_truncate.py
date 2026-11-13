@@ -77,6 +77,7 @@ _HISTORY_RESTORABLE_ASSISTANT_EVENT_TYPES = frozenset(
         "chat.tool_result",
         "chat.subtask_update",
         "chat.subagent_activity",
+        "chat.notice",
         "chat.usage_summary",
         "chat.file",
         "chat.ask_user_question",
@@ -108,6 +109,7 @@ _HISTORY_COLLAPSE_KEEP_KEYS = {
     "is_goal_objective_message",
     "is_goal_completed_message",
     "evidence",
+    "payload_refs",
     "agent_template_name",
 }
 

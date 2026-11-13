@@ -15,6 +15,7 @@ files:
   - jiuwenswarm/common/browser_settings.py
   - jiuwenswarm/resources/config.yaml
   - jiuwenswarm/server/runtime/session/session_history.py
+  - jiuwenswarm/server/wire_truncate.py
   - jiuwenswarm/channels/web/frontend/src/features/runtimeMonitorNotices.ts
 ---
 
@@ -36,7 +37,7 @@ SDK 的 ReAct/RuntimeMonitor 负责步骤、证据、收益窗口、触发、建
 
 ## 传输与持久记录
 
-`chat.runtime_monitor` 只含 schema_version、任务/generation 身份、窗口统计、步骤及最近建议摘要；不包含目标全文、参数、证据原文或密钥。`chat.notice` 使用 notice_type=runtime_intervention 和稳定 notice_id=generation:advice_id，展示原因、建议及状态。同一建议状态变化更新同一条系统提示；传输去重保留状态变化，历史还原最后状态。结构化诊断即使 content 为空也可落盘。
+`chat.runtime_monitor` 只含 schema_version、任务/generation 身份、窗口统计、步骤及最近建议摘要；不包含目标全文、参数、证据原文或密钥。`chat.notice` 使用 notice_type=runtime_intervention 和稳定 notice_id=generation:advice_id，展示原因、建议及状态。同一建议状态变化更新同一条系统提示；传输去重保留状态变化，历史还原最后状态。结构化诊断即使 content 为空也可落盘。历史查询共享白名单保留 chat.notice；JSONL 的 index/cursor 分页和旧 JSON 的 index 分页都保留建议 ID、状态与顺序。chat.runtime_monitor 不进入聊天历史分页，原始诊断及提示不作为模型上下文恢复输入。
 
 投影失败不改变执行结论，成功投递后才更新去重缓存；不提供 exactly-once 或恢复检查点。没有业务 EvidenceAdapter 的可信验收证明，verified_progress_count 保持 0。
 

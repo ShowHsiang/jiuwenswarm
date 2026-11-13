@@ -15,6 +15,7 @@ files:
   - tests/unit_tests/agentserver/test_runtime_monitor_config.py
   - tests/unit_tests/agentserver/test_runtime_monitor.py
   - tests/conftest.py
+  - jiuwenswarm/server/wire_truncate.py
   - pyproject.toml
 designs:
   - agent-core:D-20261029-1613-react-runtime-intervention
@@ -60,7 +61,7 @@ SDK 相关回归 207 passed。前端 test:jev-settings 72 passed，test:runtime-
 在激活应用 .venv 并设置 PYTHONPATH=仓库根、PYTHONDONTWRITEBYTECODE=1 后运行：
 
 ```powershell
-python -m pytest tests/unit_tests/agentserver/test_runtime_monitor.py tests/unit_tests/agentserver/test_runtime_monitor_config.py tests/unit_tests/common/test_browser_decision_config.py tests/unit_tests/common/test_jev_model_clear.py tests/unit_tests/common/test_moa_config.py tests/unit_tests/common/test_moa_config_panel.py tests/unit_tests/agentserver/test_moa_runtime.py tests/unit_tests/test_session_history_empty_filter.py tests/unit_tests/agentserver/test_agent_reload_scope.py tests/unit_tests/agentserver/test_deep_adapter_runtime_config_timing.py tests/unit_tests/agentserver/test_context_engine_config_wiring.py tests/unit_tests/agentserver/test_a2x_client_init.py tests/agents/swarm/test_electron_browser_fallback.py tests/unit_tests/test_desktop_electron_contract.py -q -o addopts='' --asyncio-mode=auto -o log_cli=false --tb=short --show-capture=no --disable-warnings
+python -m pytest tests/unit_tests/agentserver/test_runtime_monitor.py tests/unit_tests/agentserver/test_runtime_monitor_config.py tests/unit_tests/common/test_browser_decision_config.py tests/unit_tests/common/test_jev_model_clear.py tests/unit_tests/common/test_moa_config.py tests/unit_tests/common/test_moa_config_panel.py tests/unit_tests/agentserver/test_moa_runtime.py tests/unit_tests/test_session_history_empty_filter.py tests/unit_tests/agentserver/test_agent_reload_scope.py tests/unit_tests/agentserver/test_deep_adapter_runtime_config_timing.py tests/unit_tests/agentserver/test_context_engine_config_wiring.py tests/unit_tests/agentserver/test_a2x_client_init.py tests/agents/swarm/test_electron_browser_fallback.py tests/unit_tests/test_desktop_electron_contract.py tests/unit_tests/test_history_replay.py tests/unit_tests/test_history_index_paging.py tests/unit_tests/test_history_review_regressions.py tests/unit_tests/agentserver/test_history_get_stream_split.py -q -o addopts='' --asyncio-mode=auto -o log_cli=false --tb=short --show-capture=no --disable-warnings
 ```
 
 前端目录依次运行 npm run test:jev-settings、npm run test:runtime-monitor、npm run test:subagent-history，合计 **128 passed**。测试中的 HTTP transport、JEV/LLM 响应和 UI 服务请求为可控替身；生产装配入口、请求编码、配置文件/.env 写入、历史写入与会话状态检查为真实代码。
@@ -69,3 +70,12 @@ python -m pytest tests/unit_tests/agentserver/test_runtime_monitor.py tests/unit
 ### 交付前检视
 
 只读检视限定本次共享配置增量及官方合并保留的 SDK 装配入口：核对 browser.decision 解析、前端配置服务写入、凭据清空与轮换、LLM 隔离、评分 generation、创建/重载/清理和事件投影。依据应用 S_01_runtime-monitor、SDK S_02_runtime-monitor 及现行配置契约，未发现该范围新的阻断问题。修正文档中可能被理解为运行时不读取配置的表述，并更新本地依赖注释；行为代码与上述通过测试的候选相同。全量依赖锁仍受上述 OpenTelemetry 约束冲突限制，不将定向回归视作安装或全应用端到端验收。交付前再次查询官方远端，两仓 develop SHA 与“基线与合并”所记一致。
+
+
+### 推送期间新增官方历史恢复更新
+
+初次推送完成后的核对发现官方 develop 新增 9f403d1ca27cfb73a5521a7c7d7e1f517c0dc61d（会话历史恢复内存优化），已继续合入；本节记录取代前文 f5638897d 作为最终应用基线。此提交没有前端或依赖约束变化。核对自动合并后的 create/reload/cleanup、事件投影及历史写入，BAI 增量均保留。官方已有的上下文快照实现不等于本功能已实现恢复层，BAI 未接入恢复动作。
+
+扩展读取链检视发现原适配只覆盖历史落盘，chat.notice 被共享的历史查询事件白名单过滤。JSONL 回归先重现查询结果为空；将 chat.notice 纳入共享白名单，使 Web/Control/旧 session handler 一致支持提示还原。真实历史 writer 加 index/cursor 分页验证同一建议 applied → improved 的稳定 ID、状态与顺序，旧 JSON 存储按既有契约验证 index 分页。chat.runtime_monitor 仍仅保留在诊断历史，原始诊断和提示均不作为主模型上下文恢复输入。已同步 S_01 与中英文接入说明。
+
+在最终集成候选上运行上面的扩展命令，**500 passed，退出码 0**，包括 14 个原范围及 history_replay、history_index_paging、history_review_regressions、history_get_stream_split。SDK 207 与前端 128 的证据仍对应未变的相关代码。只读复查确认三个历史查询入口共用该事件集合；未新增 JEV 调用、成本预测或恢复动作。全量依赖锁限制保持不变。
