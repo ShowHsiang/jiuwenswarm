@@ -6,11 +6,11 @@
 
 - 应用分支：`runtime-bai-adaptation`。
 - SDK：相邻目录 `../agent-core` 的 `react-runtime-bai` 分支，editable 安装；直接使用该分支当前工作区代码。
-- `pyproject.toml` 的 `[tool.uv.sources].openjiuwen` 已指向本地路径，主依赖和 harmony 依赖不再声明旧远端提交。
+- `pyproject.toml` 的 `[tool.uv.sources].openjiuwen` 指向本地路径；`override-dependencies` 同时覆盖新拆分的 agent-gateway 所携带的远端 SDK 钉。harmony 仅保留版本下限。
 - 在已有应用 `.venv` 中执行 `./scripts/use-local-agent-core.ps1`。脚本核对分支，再替换 SDK，最后验证实际导入路径；不会切分支。目录不相邻时传 `-AgentCorePath <路径>`。
 - 启动用已有 `.venv/Scripts/python.exe`、`.venv` 中的入口程序，或 `uv run --no-sync jiuwenswarm-start`。SDK Python 代码改动直接生效，已有进程需要重启才会重新导入。
 
-**当前依赖限制：** 完整 `uv lock` 未成功。此 SDK 要求 `opentelemetry-sdk>=1.45.1`，应用的 A2UI/Google ADK 与 `google-genai<2` 组合无法同时满足；直接升级 GenAI/ADK 会扩展本次适配范围。原 `uv.lock` 保留不变，不能宣称已经生成新的全量锁文件。联调脚本使用 `uv pip install --no-deps --no-build-isolation --editable`，复用现有应用依赖，仅替换 SDK。联调期间不要用普通 `uv sync` / `uv run` 重解依赖，也不要用 `--frozen` 把旧远端 SDK 装回来。干净环境、全平台依赖安装和生产打包尚需单独解决兼容性并生成锁文件。
+**当前依赖限制：** 最新官方应用要求 `opentelemetry-sdk>=1.28.0,<1.42`，本地 SDK 要求 `>=1.45.1`，完整 `uv lock` 仍失败。`uv.lock` 已随官方 develop 更新，但没有生成适用于本地 SDK 的完整新锁。联调脚本以 `--no-deps --no-build-isolation --editable` 仅替换 SDK；不能使用普通 `uv sync`、`uv run` 或 `--frozen` 声称这组完整依赖已闭环。当前联调 venv 已按官方锁定版本补入 agent-gateway、openjiuwen-protocol、openjiuwen-runtime-foundation、openjiuwen-computeruse、JiuwenMemory；干净环境与生产打包仍需解决依赖约束冲突。
 
 ## 配置
 
@@ -22,10 +22,6 @@ execution_guard:
     enabled: true
     mode: observe  # active 才将建议加入主模型请求
     backend: jev
-    jev:
-      api_key: "${JEV_API_KEY:-}"
-      api_base: https://api.typesafe.ai
-      model_name: jev-latest
     parameters:
       window_size: 5
       warmup_steps: 2
@@ -35,9 +31,13 @@ execution_guard:
       review_timeout: 1.5
 ```
 
-通过既有密钥/环境配置提供 `JEV_API_KEY`，不要把真实值提交到仓库。`backend: llm` 会使用当前主 Agent 已配置的 chat model 作为 evaluator，不单独拥有或关闭它；需要较长响应时间时在 parameters 中调整 A/B 超时。默认 JEV 客户端独立创建且 `max_retries=0`。SDK `RuntimeEvaluator`、`review_evaluator` 和 `EvidenceAdapter` 接口仍可用于后续定制。
+JEV 连接统一在 **设置 → 模型 → 决策模型** 配置，和浏览器 Agent 共用 `browser.decision` 的 provider、api_base、model、api_key_env。TypeSafe 使用 `TYPESAFE_API_KEY` 和 `/systemone`，OpenRouter 使用 `OPENROUTER_API_KEY` 和 `/decisions`，自定义地址使用 `JEV_CUSTOM_API_KEY` 和 TypeSafe 协议。前端密钥仍由现有配置服务保存，运行时按既有方式解密，不进入 YAML、通知或指纹明文。
 
-适配器创建及 reload 都执行装配。配置没变则复用 monitor/client；参数无效时保留上一次可用配置；关闭或 cleanup 释放客户端。mode/backend 改变会切换评分版本并在下次绑定时重新建立收益窗口，避免旧的 active 建议或已耗尽的观察片段污染新模式。修改量表或 LLM 模型含义时，应同步调整 `parameters.rubric_version`。
+浏览器的 llm/shadow/hybrid、重试、超时和决策次数是独立策略，不控制 BAI。BAI 继续使用自己的 enabled/mode/parameters；JEV 客户端 `max_retries=0`，A/B 使用自身超时。`backend: llm` 复用当前主模型，不读取 JEV 配置或关闭共享模型。SDK 的 RuntimeEvaluator、review_evaluator、EvidenceAdapter 替换接口保留。
+
+**旧配置迁移：** 删除 `execution_guard.runtime_monitor.jev` 整段以及仅为 BAI 设置的 `JEV_API_KEY` 引用，在决策模型中配置同一连接。新配置严格拒绝该旧字段，不再提供第二套连接来源。本次改动不会自动覆盖现有工作区配置文件。
+
+创建及 reload 都执行装配。配置未变复用 client/window；只修改浏览器模式、显示名称或浏览器预算不重建 BAI。轮换共享密钥重建客户端但保留评分窗口；JEV 模型/端点、BAI mode/backend 改变则切换评分 generation。清空当前共享密钥会解绑 BAI 并关闭旧客户端，后续重新配置后可重建；其他无效重载保留上一次有效配置。关闭或 cleanup 同样释放客户端。LLM 模型语义或量表变化时仍需更新 `parameters.rubric_version`。
 
 ## 执行与触发
 
@@ -84,3 +84,6 @@ flowchart LR
 应用专项测试使用真实 create_deep_agent、adapter 工厂、invoke 和 run_one_round 入口，JEV、主模型和工具结果使用可控替身：active 的下一步实际转为 verify，observe 保持原动作；验证建议送达、效果更新、客户端关闭、会话隔离、失败重试及实际历史文件写入。前端测试覆盖 live notice ID、传输去重、历史末状态及已有历史行为。没有执行真实 JEV/LLM 调用或完整浏览器端到端测试。
 
 后续按顺序推进：为主要业务工具补可信证据/验收适配；用代表性轨迹在 observe 模式标注误触发与延迟；校准后逐步开启 active。恢复层以后通过独立接口对接，当前 BACKTRACK 不调用任何恢复动作。详细 SDK 算法见相邻仓库的 [运行监控说明](../../agent-core/docs/runtime_monitor.md)。
+
+
+2026-11-13 官方 develop 同步与共享配置验证记录见 `.agents/agent-docs/features/F_20261113_1109_runtime-bai-shared-jev.md`；英文用法见 [Runtime monitor](en/runtime-monitor.md)。

@@ -31,6 +31,15 @@ for _name, _value in {
 
 
 def pytest_unconfigure(config):
+    background_logging = sys.modules.get("jiuwenswarm.common.background_logging")
+    if background_logging is not None:
+        background_logging.stop_background_logging()
+    # Restored application handlers can be absent from logging's weak registry.
+    application_logger = logging.getLogger("jiuwenswarm")
+    for handler in application_logger.handlers[:]:
+        application_logger.removeHandler(handler)
+        handler.close()
+    logging.shutdown()
     _test_environment.undo()
     _collection_home.cleanup()
 

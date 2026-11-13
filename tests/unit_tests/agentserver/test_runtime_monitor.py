@@ -1,5 +1,6 @@
 """Application assembly, live SDK feedback and user-visible notice/history contracts."""
 import asyncio
+import importlib
 import json
 import uuid
 from types import SimpleNamespace
@@ -62,14 +63,18 @@ class FakeJev:
 
 @pytest.fixture
 def fake_jev(monkeypatch):
+    # Load SDK type contracts before replacing the public transport constructor.
+    importlib.import_module("openjiuwen.harness.moa.config")
+    monkeypatch.setattr("jiuwenswarm.common.config.get_crypto_provider", lambda: None)
     FakeJev.instances = []
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-only-not-a-secret")
     monkeypatch.setattr("openjiuwen.core.foundation.llm.system_one.JevSystemOneClient", FakeJev)
     return FakeJev
 
 
 def config(mode="active", **parameters):
     return {"execution_guard": {"runtime_monitor": {
-        "enabled": True, "mode": mode, "jev": {"api_key": "test-only-not-a-secret"},
+        "enabled": True, "mode": mode,
         "parameters": {"warmup_steps": 0, "low_gain_steps": 1, **parameters},
     }}}
 
@@ -122,9 +127,9 @@ async def test_llm_replacement_uses_supplied_model_without_owning_it(fake_jev):
 
 @pytest.mark.asyncio
 async def test_missing_key_does_not_construct_a_client(fake_jev, monkeypatch):
-    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     settings = {"execution_guard": {"runtime_monitor": {"enabled": True}}}
-    with pytest.raises(ValueError, match="api_key_missing"):
+    with pytest.raises(ValueError, match="Jev API key is required"):
         await configure_runtime_monitor(SimpleNamespace(set_runtime_monitor=MagicMock()), settings)
     assert not fake_jev.instances
 

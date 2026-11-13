@@ -9,11 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from collections import OrderedDict
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
+
+from jiuwenswarm.common.browser_settings import MissingJevCredentialError, resolve_jev_connection
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_EVENT = "chat.runtime_monitor"
@@ -21,19 +22,11 @@ NOTICE_TYPE = "runtime_intervention"
 SCHEMA_VERSION = "runtime-monitor.v1"
 
 
-class JevSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    api_key: SecretStr = SecretStr("")
-    api_base: str = "https://api.typesafe.ai"
-    model_name: str = "jev-latest"
-
-
 class RuntimeMonitorSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool = False
     mode: Literal["observe", "active"] = "observe"
     backend: Literal["jev", "llm"] = "jev"
-    jev: JevSettings = Field(default_factory=JevSettings)
     parameters: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -209,9 +202,34 @@ async def configure_runtime_monitor(agent, config: dict, *, current=None, chat_m
     monitor_config = monitor_config.model_copy(update={
         "rubric_version": f"{monitor_config.rubric_version}:{settings.backend}:{settings.mode}",
     })
-    api_key = settings.jev.api_key.get_secret_value() or os.environ.get("JEV_API_KEY", "")
+    connection = None
+    if settings.backend == "jev":
+        from jiuwenswarm.common.config import get_crypto_provider, resolve_env_vars
+
+        try:
+            connection = resolve_jev_connection(config, resolve_value=resolve_env_vars)
+        except MissingJevCredentialError:
+            if current is None:
+                raise
+            # Clearing the shared key revokes use of an already cached credential.
+            agent.set_runtime_monitor(None)
+            await current.aclose()
+            return None
+        crypto = get_crypto_provider()
+        if crypto is not None:
+            try:
+                connection["api_key"] = crypto.decrypt(connection["api_key"])
+            except Exception:
+                raise ValueError("JEV credential cannot be decrypted; re-enter it in Models > Jev settings") from None
+        if not connection["api_key"]:
+            raise ValueError("Jev API key is required in Models > Jev settings")
+        # Model/endpoint changes invalidate scores; rotating a key preserves them.
+        evaluator_version = _digest({key: value for key, value in connection.items() if key != "api_key"})[:16]
+        monitor_config = monitor_config.model_copy(update={
+            "rubric_version": f"{monitor_config.rubric_version}:{evaluator_version}",
+        })
     signature = _digest([
-        settings.model_dump(mode="json"), _digest(api_key), language,
+        settings.model_dump(mode="json"), _digest(connection), language,
         id(chat_model) if settings.backend == "llm" else None,
     ])
     if current is not None and not current.closed and current.signature == signature:
@@ -220,12 +238,10 @@ async def configure_runtime_monitor(agent, config: dict, *, current=None, chat_m
 
     client = None
     if settings.backend == "jev":
-        if not api_key or api_key.startswith("${"):
-            raise ValueError("runtime_monitor_jev_api_key_missing")
         from openjiuwen.core.foundation.llm.system_one import JevSystemOneClient
 
         client = JevSystemOneClient(
-            api_key=api_key, api_base=settings.jev.api_base, model_name=settings.jev.model_name,
+            **connection,
             max_retries=0, timeout=max(monitor_config.assessment_timeout, monitor_config.review_timeout),
         )
         evaluator = None

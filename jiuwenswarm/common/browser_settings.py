@@ -26,6 +26,10 @@ JEV_PROVIDER_DEFAULTS = {
 }
 
 
+class MissingJevCredentialError(ValueError):
+    """The selected shared decision model no longer has a credential."""
+
+
 def resolve_jev_connection(
     config: dict[str, Any], *, resolve_value: Callable[[Any], Any] | None = None,
 ) -> dict[str, str]:
@@ -58,7 +62,7 @@ def resolve_jev_connection(
         raise ValueError("Jev API base must be an HTTPS URL without credentials, query or fragment")
     secret = os.environ.get(settings.get("api_key_env", ""), "").strip()
     if not secret:
-        raise ValueError("Jev API key is required in Models > Jev settings")
+        raise MissingJevCredentialError("Jev API key is required in Models > Jev settings")
     return {
         "api_base": api_base.rstrip("/"),
         "model_name": settings.get("model", ""),

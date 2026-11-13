@@ -1043,10 +1043,7 @@ execution_guard:
     enabled: false
     mode: observe
     backend: jev                     # jev（默认）或 llm（复用当前主模型接口）
-    jev:
-      api_key: "${JEV_API_KEY:-}"      # 不填写明文；缺少凭据不启用监控
-      api_base: https://api.typesafe.ai
-      model_name: jev-latest
+    # 共用“设置 → 模型 → 决策模型”的 browser.decision 连接与供应商密钥。
     parameters:
       window_size: 5
       warmup_steps: 2

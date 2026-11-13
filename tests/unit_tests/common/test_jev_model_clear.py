@@ -81,7 +81,7 @@ async def test_clear_jev_retains_connection_and_other_credentials(tmp_path, monk
 
     template = tmp_path / "template.yaml"
     resource = Path(__file__).parents[3] / "jiuwenswarm/resources/config.yaml"
-    template.write_text(yaml.safe_dump({"browser": yaml.safe_load(resource.read_text())["browser"]}), encoding="utf-8")
+    template.write_text(yaml.safe_dump({"browser": yaml.safe_load(resource.read_text(encoding="utf-8"))["browser"]}), encoding="utf-8")
     config_module.migrate_config_from_template(template, config_path)
     migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     for name, value in expected_decision.items():
