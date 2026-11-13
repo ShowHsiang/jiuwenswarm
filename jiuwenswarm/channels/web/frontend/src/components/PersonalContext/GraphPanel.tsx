@@ -8,6 +8,7 @@
  */
 
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -35,6 +36,9 @@ import {
   pcApi,
 } from '../../services/personalContextApi';
 import { MarkdownRenderer } from '../MarkdownRenderer';
+import { FilePreviewIcon } from '../ui/FilePreviewPanel/FilePreviewIcon';
+import FolderAssetIcon from '../../assets/work-mode/folder.svg?react';
+import FolderFoldAssetIcon from '../../assets/work-mode/folder-fold.svg?react';
 import './GraphPanel.css';
 
 interface PersonalContextGraphPanelProps {
@@ -293,6 +297,8 @@ export function PersonalContextGraphPanel({
   const { graph, loadingGraph, status, config, loadGraph, loadStatus } = usePersonalContextStore();
   const [query, setQuery] = useState('');
   const [treeCollapsed, setTreeCollapsed] = useState(false);
+  const [treeExpanded, setTreeExpanded] = useState(true);
+  const [treeToggleVersion, setTreeToggleVersion] = useState(0);
   const [searchResults, setSearchResults] = useState<ContextSearchResultItem[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [expandedResults, setExpandedResults] = useState<Set<string>>(new Set());
@@ -321,6 +327,11 @@ export function PersonalContextGraphPanel({
   const collapseBadgeHideTimerRef = useRef<number | null>(null);
   const autoFitRequestRef = useRef(0);
   const autoFitCancelledRef = useRef(false);
+  // 稳定回调：避免 GraphPanel 无关重渲染触发整棵文件树重渲染
+  const handleTreeSelect = useCallback((id: string) => {
+    autoFitCancelledRef.current = true;
+    setSelectedNodeId(id);
+  }, []);
   const layoutTicksRemainingRef = useRef(0);
   const transformInitializedRef = useRef(false);
   const [autoFitRequest, setAutoFitRequest] = useState(0);
@@ -364,8 +375,10 @@ export function PersonalContextGraphPanel({
 
   // 空态引导
   const hasRunningFetch = useMemo(() => {
-    const states = status?.fetch_service_states ?? {};
-    return Object.values(states).some((st) => st === 'STARTING' || st === 'RUNNING' || st === 'STOPPING');
+    const progress = status?.fetch_run_progress ?? {};
+    return Object.values(progress).some(
+      (item) => item.run_state === 'running' || item.run_state === 'stopping',
+    );
   }, [status]);
   const hasEnabledService = config.fetch_services.some((s) => s.enabled);
   const hasFetchServices = config.fetch_services.length > 0;
@@ -1324,6 +1337,21 @@ export function PersonalContextGraphPanel({
           </div>
 
           {!treeCollapsed && (
+          <>
+          {fileTree.length > 0 && !hasQuery && (
+            <div className="pc-graph__tree-toggle-all">
+              <button
+                type="button"
+                className="pc-graph__tree-toggle-all-btn"
+                onClick={() => {
+                  setTreeExpanded((v) => !v);
+                  setTreeToggleVersion((v) => v + 1);
+                }}
+              >
+                {t(treeExpanded ? 'personalContext.info.collapseTree' : 'personalContext.info.expandTree')}
+              </button>
+            </div>
+          )}
           <div className="pc-graph__tree-content" ref={treeContentRef}>
             {hasQuery ? (
               <>
@@ -1379,13 +1407,16 @@ export function PersonalContextGraphPanel({
                 <FileTree
                   nodes={fileTree}
                   hits={searchHits}
-                  onSelect={(id) => { autoFitCancelledRef.current = true; setSelectedNodeId(id); }}
+                  onSelect={handleTreeSelect}
                   selectedId={selectedNodeId}
                   selectedAncestorPaths={selectedAncestorPaths}
+                  initialExpanded={treeExpanded}
+                  key={treeToggleVersion}
                 />
               )
             )}
           </div>
+          </>
           )}
         </aside>
 
@@ -1402,7 +1433,12 @@ export function PersonalContextGraphPanel({
             onWheel={handleWheel}
           />
           {!contextReady && nodeCount === 0 && (
-            <div className="pc-graph__empty pc-graph__empty--overlay">{t(emptyHintKey)}</div>
+            <div
+              className="pc-graph__empty pc-graph__empty--overlay"
+              data-testid="personal-context-graph-empty-hint-canvas"
+            >
+              {t(emptyHintKey)}
+            </div>
           )}
         </div>
 
@@ -1422,7 +1458,7 @@ export function PersonalContextGraphPanel({
             )}
             <div className="pc-graph__detail-divider" />
             {detailLoading ? (
-              <Loader2 className="spin" size={16} />
+              <Loader2 className="spin pc-graph__detail-loading" size={16} />
             ) : nodeDetail ? (
               <div className="pc-graph__detail-content">
                 <div
@@ -1491,19 +1527,19 @@ export function PersonalContextGraphPanel({
           <div className="pc-graph__legend" data-testid="personal-context-graph-legend">
             <div className="pc-graph__legend-item">
               <span className="pc-graph__legend-node pc-graph__legend-node--root" />
-              <span className="pc-graph__legend-text">content root</span>
+              <span className="pc-graph__legend-text">{t('personalContext.info.legendRoot')}</span>
             </div>
             <div className="pc-graph__legend-item">
               <span className="pc-graph__legend-node pc-graph__legend-node--folder" />
-              <span className="pc-graph__legend-text">目录</span>
+              <span className="pc-graph__legend-text">{t('personalContext.info.legendFolder')}</span>
             </div>
             <div className="pc-graph__legend-item">
               <span className="pc-graph__legend-node pc-graph__legend-node--doc" />
-              <span className="pc-graph__legend-text">Markdown 文档</span>
+              <span className="pc-graph__legend-text">{t('personalContext.info.legendDoc')}</span>
             </div>
             <div className="pc-graph__legend-item">
               <span className="pc-graph__legend-edge" />
-              <span className="pc-graph__legend-text">关系</span>
+              <span className="pc-graph__legend-text">{t('personalContext.info.legendEdge')}</span>
             </div>
           </div>
         )}
@@ -1513,12 +1549,13 @@ export function PersonalContextGraphPanel({
 }
 
 /** 文件树渲染（递归，可折叠）。 */
-function FileTree({
+function FileTreeInner({
   nodes,
   hits,
   onSelect,
   selectedId,
   selectedAncestorPaths,
+  initialExpanded = true,
   depth = 0,
 }: {
   nodes: TreeNode[];
@@ -1526,13 +1563,14 @@ function FileTree({
   onSelect: (id: string) => void;
   selectedId: string | null;
   selectedAncestorPaths: Set<string>;
+  initialExpanded?: boolean;
   depth?: number;
 }) {
   return (
-    <ul className="pc-graph__tree-list" style={{ paddingLeft: depth > 0 ? 12 : 0 }}>
+    <ul className="pc-graph__tree-list" style={{ paddingLeft: depth > 0 ? 24 : 0 }}>
       {nodes.map((n) => {
         const nodeId = n.node?.id;
-        const isHit = nodeId ? hits.has(nodeId) : false;
+        const isHit = nodeId ? (hits.size > 0 && hits.has(nodeId)) : false;
         const isSelected = nodeId === selectedId;
         return (
           <li key={n.path} className="pc-graph__tree-item">
@@ -1544,14 +1582,14 @@ function FileTree({
                 onClick={() => nodeId && onSelect(nodeId)}
               >
                 <span className="pc-graph__tree-icon">
-                  <FileIcon />
+                  <FilePreviewIcon fileName={n.name} size={12} />
                 </span>
                 <span className="pc-graph__tree-name">{n.name}</span>
               </button>
             ) : (
-              <FolderRow name={n.name} path={n.path} isHit={isHit} selectedAncestorPaths={selectedAncestorPaths}>
+              <FolderRow name={n.name} isHit={isHit} isAncestor={selectedAncestorPaths.has(n.path)} initialExpanded={initialExpanded}>
                 {n.children.length > 0 && (
-                  <FileTree nodes={n.children} hits={hits} onSelect={onSelect} selectedId={selectedId} selectedAncestorPaths={selectedAncestorPaths} depth={depth + 1} />
+                  <FileTree nodes={n.children} hits={hits} onSelect={onSelect} selectedId={selectedId} selectedAncestorPaths={selectedAncestorPaths} initialExpanded={initialExpanded} depth={depth + 1} />
                 )}
               </FolderRow>
             )}
@@ -1562,23 +1600,25 @@ function FileTree({
   );
 }
 
+const FileTree = memo(FileTreeInner);
+
 /** 文件夹行：文件夹图标 + 名称 + 右侧收起按钮（可折叠）。 */
-function FolderRow({
+function FolderRowInner({
   name,
-  path,
   isHit,
-  selectedAncestorPaths,
+  isAncestor,
+  initialExpanded,
   children,
 }: {
   name: string;
-  path: string;
   isHit: boolean;
-  selectedAncestorPaths: Set<string>;
+  isAncestor: boolean;
+  initialExpanded: boolean;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(initialExpanded);
   // 选中节点在该目录内时强制展开，保证目录树自动跳转可见
-  const isOpen = open || selectedAncestorPaths.has(path);
+  const isOpen = open || isAncestor;
   return (
     <>
       <div
@@ -1586,7 +1626,7 @@ function FolderRow({
         onClick={() => setOpen((v) => !v)}
       >
         <span className="pc-graph__tree-icon">
-          <FolderIcon open={isOpen} />
+          {isOpen ? <FolderFoldAssetIcon width={12} height={12} /> : <FolderAssetIcon width={12} height={12} />}
         </span>
         <span className="pc-graph__tree-name">{name}</span>
         <span className="pc-graph__tree-toggle">
@@ -1598,30 +1638,11 @@ function FolderRow({
   );
 }
 
-function FolderIcon({ open }: { open: boolean }) {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-      {open ? (
-        <path d="M1 3.5C1 2.67 1.67 2 2.5 2h2.6l1 1.2H9.5c.83 0 1.5.67 1.5 1.5v.8H1V3.5z M1 5.5h10v3c0 .83-.67 1.5-1.5 1.5h-7C1.67 10 1 9.33 1 8.5v-3z" fill="#33bcf2" />
-      ) : (
-        <path d="M1 3.5C1 2.67 1.67 2 2.5 2h2.6l1 1.2H9.5c.83 0 1.5.67 1.5 1.5v4c0 .83-.67 1.5-1.5 1.5h-7C1.67 10 1 9.33 1 8.5v-5z" fill="#33bcf2" />
-      )}
-    </svg>
-  );
-}
-
-function FileIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M3 1.5h3.5L9 4v6.5a.5.5 0 0 1-.5.5h-5a.5.5 0 0 1-.5-.5V2a.5.5 0 0 1 .5-.5z" fill="#fff" stroke="#bdbdbd" strokeWidth="0.8" />
-      <path d="M6 1.5V4h2.5" fill="none" stroke="#bdbdbd" strokeWidth="0.8" />
-    </svg>
-  );
-}
+const FolderRow = memo(FolderRowInner);
 
 function CollapseIcon({ open }: { open: boolean }) {
   return (
-    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.15s ease' }}>
+    <svg width="16" height="16" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ transform: open ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.15s ease' }}>
       <path d="M3 4.5L6 7.5L9 4.5" stroke="#808080" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );

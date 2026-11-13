@@ -1,4 +1,9 @@
 import type { PublishMetadata, PublishRecord } from '../types/assetPublish';
+
+export function canShowAssetPublish(installed: boolean | undefined, capability = true): boolean {
+  return installed === true && capability;
+}
+
 export function publishOutcome(record: PublishRecord): string {
   if (record.execution_status === 'queued' || record.execution_status === 'uploading') return record.execution_status;
   if (record.execution_status === 'failed') return 'failed';
@@ -7,6 +12,51 @@ export function publishOutcome(record: PublishRecord): string {
   if (result === 'published' || result === 'publish_success') return 'published';
   if (result === 'publish_failed') return 'failed';
   return 'unknown';
+}
+
+/**
+ * 记录卡片展示用：只表达“本地能确定”的状态。
+ * 远端（Hub）的审核/发布结果不在 App 内声称，因此 pending_moderation / published / unknown
+ * 一律不上屏，统一表现为“已提交”或“提交结果未确认”。
+ */
+export type LocalRecordState = 'queued' | 'uploading' | 'failed' | 'submitted' | 'unconfirmed';
+
+export function localRecordState(record: PublishRecord): LocalRecordState {
+  switch (record.execution_status) {
+    case 'queued':
+    case 'uploading':
+    case 'failed':
+      return record.execution_status;
+    case 'completed':
+      return 'submitted';
+    default:
+      // execution_status === 'unknown'：提交结果未被确认
+      return 'unconfirmed';
+  }
+}
+/**
+ * A submission that is still in flight keeps the form locked: only queued / uploading
+ * operations can change on their own, so replacing them would race the running upload.
+ * An unverified outcome is terminal, so it must not lock the asset; the user resolves it with a
+ * new submission instead.
+ */
+export function isSubmissionLocked(record: PublishRecord): boolean {
+  return shouldPollPublish(record);
+}
+
+export function shouldPollPublish(record: PublishRecord): boolean {
+  if (['completed', 'blocked', 'reconcile_upload', 'reauth_required'].includes(record.stage || '')) return false;
+  return record.execution_status === 'queued' || record.execution_status === 'uploading';
+}
+
+export function canRetrySkillPack(record: PublishRecord): boolean {
+  return ['reconcile_upload', 'reauth_required'].includes(record.stage || '') ||
+    (record.stage === 'blocked' && ['SKILLPACK_HUB_CHECK_FAILED', 'SKILLPACK_DISABLED'].includes(record.error?.code || ''));
+}
+
+/** Terminal records, including an unverified outcome, can start a new submission. */
+export function canStartNewVersion(record: PublishRecord): boolean {
+  return !isSubmissionLocked(record);
 }
 export function validateMetadata(metadata: PublishMetadata): string[] {
   const errors: string[] = [];
@@ -46,7 +96,7 @@ export function definitiveCommitRejection(error: unknown): 'expired' | 'rejected
   if (values.some((value) => /\bdraft_expired\b/i.test(value))) return 'expired';
   if (
     values.some((value) =>
-      /\b(?:invalid_draft|draft_not_found|publish_auth_required|auth_required|invalid_identifier|queue_full|target_conflict)\b/i.test(
+      /\b(?:invalid_draft|draft_not_found|publish_auth_required|auth_required|invalid_identifier|queue_full|target_conflict|skillpack_disabled)\b/i.test(
         value,
       ),
     )

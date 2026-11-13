@@ -1,15 +1,33 @@
-import { createPortal } from 'react-dom';
-import { useMemo, useRef, useState, type RefObject } from 'react';
-import { Check, Search, X } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { LoaderCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import EntityAddIcon from '../../assets/agent-management/add.svg?react';
+import EntityRemoveIcon from '../../assets/agent-management/remove.svg?react';
 import {
   getAgentAvatarUrl,
+  isAgentGroupAgentCompatibilityLoading,
   isAgentGroupAgentSelectable,
   resolveAgentGroupSelectionId,
+  sortAgentGroupOptions,
   type AgentCatalogItem,
+  type RequestStatus,
 } from '../../features/agentManagement';
-import { PageCard } from '../ui';
-import { useDialogFocusTrap } from './useDialogFocusTrap';
+import { PickerDrawer, PickerListRegion, PageCard, SelectedCount } from '../ui';
+import type { PageCardDefaultButton } from '../ui';
+
+type AgentGroupMemberPickerProps = {
+  mode: 'leader' | 'member';
+  agents: AgentCatalogItem[];
+  agentsStatus: RequestStatus;
+  agentsError: string | null;
+  selectedLeaderId: string;
+  selectedMemberIds: string[];
+  onCancel: () => void;
+  onConfirm: (ids: string[]) => void;
+  onReloadAgents: () => void;
+  onInstallAgent?: (id: string) => void | Promise<void>;
+  installingAgentIds?: ReadonlySet<string>;
+};
 
 export function AgentOptionAvatar({ agent }: { agent: AgentCatalogItem }) {
   const [imageFailed, setImageFailed] = useState(false);
@@ -25,56 +43,44 @@ export function AgentOptionAvatar({ agent }: { agent: AgentCatalogItem }) {
   );
 }
 
-type AgentGroupMemberPickerProps = {
-  mode: 'leader' | 'member';
-  agents: AgentCatalogItem[];
-  selectedLeaderId: string;
-  selectedMemberIds: string[];
-  onCancel: () => void;
-  onConfirm: (ids: string[]) => void;
-  restoreFocusRef?: RefObject<HTMLElement | null>;
-};
-
 export function AgentGroupMemberPicker({
   mode,
   agents,
+  agentsStatus,
+  agentsError,
   selectedLeaderId,
   selectedMemberIds,
   onCancel,
   onConfirm,
-  restoreFocusRef,
+  onReloadAgents,
+  onInstallAgent,
+  installingAgentIds,
 }: AgentGroupMemberPickerProps) {
   const { t } = useTranslation();
   const [query, setQuery] = useState('');
+  const [sourceTab, setSourceTab] = useState<'local' | 'market'>('market');
   const [selection, setSelection] = useState<string[]>(
     mode === 'leader' ? (selectedLeaderId ? [selectedLeaderId] : []) : selectedMemberIds,
   );
-  const dialogRef = useRef<HTMLElement>(null);
   const filteredAgents = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    return agents.filter((agent) => {
-      const selectionId = resolveAgentGroupSelectionId(agent);
-      const selectable = isAgentGroupAgentSelectable(agent, mode);
-      const selected =
-        mode === 'leader'
-          ? selection.includes(selectionId) || selection.includes(agent.id)
-          : selection.includes(selectionId) ||
-            selection.includes(agent.id) ||
-            selectionId === selectedLeaderId ||
-            agent.id === selectedLeaderId;
-      if (!selectable && !selected) return false;
+    const sourceAgents = agents.filter((agent) =>
+      sourceTab === 'market' ? agent.source !== 'local' : agent.source === 'local' || agent.installed === true,
+    );
+    return sortAgentGroupOptions(sourceAgents, agentsStatus).filter((agent) => {
       if (!normalized) return true;
       return `${agent.id} ${agent.runtimePackageName} ${agent.displayName} ${agent.description} ${agent.category} ${agent.tags.map((tag) => tag.label).join(' ')}`
         .toLocaleLowerCase()
         .includes(normalized);
     });
-  }, [agents, mode, query, selectedLeaderId, selection]);
-
-  useDialogFocusTrap({ dialogRef, restoreFocusRef, onEscape: onCancel });
+  }, [agents, agentsStatus, query, sourceTab]);
 
   const toggle = (id: string, legacyId?: string) => {
     if (mode === 'leader') {
-      setSelection([id]);
+      // 单选但可反选：再点已选中的即取消，确认按钮会因 selection 为空而置灰
+      setSelection((current) =>
+        current.includes(id) || (legacyId ? current.includes(legacyId) : false) ? [] : [id],
+      );
       return;
     }
     setSelection((current) => {
@@ -88,137 +94,118 @@ export function AgentGroupMemberPicker({
 
   const title =
     mode === 'leader' ? t('agentManagement.group.picker.leaderTitle') : t('agentManagement.group.picker.memberTitle');
-  const selectedCount = selection.length;
 
-  return createPortal(
-    <div
-      className="agent-management-selection-overlay"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onCancel();
+  const normalizeSelection = () =>
+    Array.from(
+      new Set(
+        selection.map((id) => {
+          const agent = agents.find((item) => resolveAgentGroupSelectionId(item) === id || item.id === id);
+          return agent ? resolveAgentGroupSelectionId(agent) : id;
+        }),
+      ),
+    );
+
+  return (
+    <PickerDrawer
+      title={title}
+      onClose={onCancel}
+      onConfirm={() => onConfirm(normalizeSelection())}
+      confirmDisabled={mode === 'leader' && selection.length === 0}
+      testId="agent-group-member-picker"
+      footerLeading={<SelectedCount count={selection.length} testId="agent-group-member-picker-selected-count" />}
+      search={query}
+      onSearchChange={setQuery}
+      searchPlaceholder={t('agentManagement.form.selectionSearchPlaceholder')}
+      tabs={{
+        value: sourceTab,
+        onChange: setSourceTab,
+        ariaLabel: t('agentManagement.group.picker.sourceTabsLabel'),
+        items: [
+          { value: 'market', label: t('agentManagement.tabs.catalog') },
+          { value: 'local', label: t('agentManagement.tabs.mine') },
+        ],
       }}
     >
-      <section
-        ref={dialogRef}
-        className="agent-management-selection-dialog"
-        data-testid="agent-group-member-picker"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-group-picker-title"
-        tabIndex={-1}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header>
-          <h2 id="agent-group-picker-title">{title}</h2>
-          <button
-            type="button"
-            aria-label={t('common.close')}
-            data-testid="agent-group-member-picker-close"
-            onClick={onCancel}
-          >
-            <X size={18} aria-hidden="true" />
-          </button>
-        </header>
-        <label className="agent-management-selection-search">
-          <Search size={16} aria-hidden="true" />
-          <input
-            type="search"
-            data-testid="agent-group-member-picker-search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder={t('agentManagement.form.selectionSearchPlaceholder')}
-            autoFocus
-          />
-        </label>
-        <div
-          className={`agent-management-selection-dialog__body${filteredAgents.length === 0 ? ' is-empty' : ''}`}
-          role="group"
-          aria-label={title}
-        >
-          {filteredAgents.length === 0 ? (
-            <div className="agent-management-selection-empty-state">
-              <p>{t('agentManagement.group.picker.empty')}</p>
-            </div>
-          ) : (
-            <div className="agent-management-selection-grid">
-              {filteredAgents.map((agent) => {
-                const selectionId = resolveAgentGroupSelectionId(agent);
-                const selected = selection.includes(selectionId) || selection.includes(agent.id);
-                const selectable = isAgentGroupAgentSelectable(agent, mode);
-                const disabled =
-                  !selectable ||
-                  (mode === 'member'
-                    ? selectionId === selectedLeaderId || agent.id === selectedLeaderId
-                    : selectedMemberIds.includes(selectionId) || selectedMemberIds.includes(agent.id));
-                const categoryTags = agent.tags.length > 0 ? agent.tags.map((tag) => tag.label) : undefined;
-                const description = agent.description || t('agentManagement.unknownDescription');
-                return (
-                  <PageCard
-                    key={agent.id}
-                    className={`agent-management-selection-card agent-management-selection-card--expert${selected ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}`}
-                    testId="agent-group-member-picker-item"
-                    variant={selectionId}
-                    interactive
-                    selected={selected}
-                    disabled={disabled}
-                    ariaLabel={agent.displayName}
-                    onClick={() => toggle(selectionId, agent.id)}
-                    avatar={{
-                      name: agent.displayName,
-                      iconUrl: getAgentAvatarUrl(agent),
-                      testId: 'agent-group-member-picker-avatar',
-                    }}
-                    title={agent.displayName}
-                    label={categoryTags}
-                    description={description}
-                    actionSlot={(
-                      <span className="agent-management-selection-card__action" aria-hidden="true">
-                        {selected ? <Check size={12} strokeWidth={2.5} /> : null}
-                      </span>
-                    )}
-                  />
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <footer>
-          <span>{t('agentManagement.group.picker.selectedCount', { count: selectedCount })}</span>
-          <div>
-            <button
-              type="button"
-              data-testid="agent-group-member-picker-cancel"
-              className="agent-management-button agent-management-button--secondary"
-              onClick={onCancel}
-            >
-              {t('common.cancel')}
-            </button>
-            <button
-              type="button"
-              data-testid="agent-group-member-picker-confirm"
-              className="agent-management-button agent-management-button--primary"
-              disabled={mode === 'leader' && selection.length === 0}
-              onClick={() =>
-                onConfirm(
-                  Array.from(
-                    new Set(
-                      selection.map((id) => {
-                        const agent = agents.find(
-                          (item) => resolveAgentGroupSelectionId(item) === id || item.id === id,
-                        );
-                        return agent ? resolveAgentGroupSelectionId(agent) : id;
-                      }),
-                    ),
-                  ),
-                )
+      <PickerListRegion
+        status={
+          agentsStatus === 'error' ? 'error' : agentsStatus === 'loading' && agents.length === 0 ? 'loading' : 'success'
+        }
+        items={filteredAgents}
+        getItemKey={(agent) => resolveAgentGroupSelectionId(agent)}
+        testId="agent-group-member-picker"
+        loadingMessage={t('agentManagement.group.picker.loading')}
+        errorMessage={agentsError || t('agentManagement.states.loadError')}
+        emptyMessage={t('agentManagement.group.picker.empty')}
+        retryLabel={t('common.retry')}
+        onRetry={onReloadAgents}
+        loadMoreLabel={t('agentManagement.loadMore')}
+        renderItem={(agent) => {
+          const selectionId = resolveAgentGroupSelectionId(agent);
+          const selected = selection.includes(selectionId) || selection.includes(agent.id);
+          const compatibilityLoading = isAgentGroupAgentCompatibilityLoading(agent, agentsStatus);
+          const selectable = !compatibilityLoading && isAgentGroupAgentSelectable(agent, mode);
+          const disabled =
+            !selectable ||
+            (mode === 'member'
+              ? selectionId === selectedLeaderId || agent.id === selectedLeaderId
+              : selectedMemberIds.includes(selectionId) || selectedMemberIds.includes(agent.id));
+          const installed = agent.installed === true;
+          const installing = installingAgentIds?.has(agent.id) === true;
+          const categoryTags = agent.tags.length > 0 ? agent.tags.map((tag) => tag.label) : undefined;
+          const description = agent.description || t('agentManagement.unknownDescription');
+          const cardDisabled = !compatibilityLoading && disabled;
+          const defaultButton: PageCardDefaultButton | undefined =
+            !compatibilityLoading && !installed && onInstallAgent
+              ? {
+                  text: installing
+                    ? t('agentManagement.group.picker.installing')
+                    : t('agentManagement.group.picker.install'),
+                  testId: 'agent-group-member-picker-install',
+                  variant: agent.id,
+                  disabled: installing,
+                  busy: installing,
+                  onClick: () => void onInstallAgent(agent.id),
+                }
+              : undefined;
+          return (
+            <PageCard
+              className={`agent-management-selection-card${selected ? ' is-selected' : ''}${compatibilityLoading ? ' is-loading' : cardDisabled ? ' is-disabled' : ''}`}
+              testId="agent-group-member-picker-item"
+              variant={selectionId}
+              interactive={installed && !compatibilityLoading}
+              selected={selected}
+              disabled={cardDisabled && installed}
+              onClick={
+                installed && !compatibilityLoading && !disabled ? () => toggle(selectionId, agent.id) : undefined
               }
-            >
-              {t('common.confirm')}
-            </button>
-          </div>
-        </footer>
-      </section>
-    </div>,
-    document.body,
+              avatar={{
+                name: agent.displayName,
+                iconUrl: getAgentAvatarUrl(agent),
+                testId: 'agent-group-member-picker-avatar',
+              }}
+              title={agent.displayName}
+              label={categoryTags}
+              description={description}
+              defaultButton={defaultButton}
+              actionSlot={
+                compatibilityLoading ? (
+                  <span className="animate-spin" aria-label={t('agentManagement.group.picker.loading')}>
+                    <LoaderCircle size={16} />
+                  </span>
+                ) : installed || !onInstallAgent ? (
+                  <span className="shrink-0" aria-hidden="true">
+                    {selected ? (
+                      <EntityRemoveIcon className="text-[color:var(--color-chat-accent)]" />
+                    ) : (
+                      <EntityAddIcon className="text-text-muted" />
+                    )}
+                  </span>
+                ) : null
+              }
+            />
+          );
+        }}
+      />
+    </PickerDrawer>
   );
 }

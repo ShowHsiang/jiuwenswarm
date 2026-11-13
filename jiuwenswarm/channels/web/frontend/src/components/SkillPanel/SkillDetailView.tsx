@@ -19,13 +19,24 @@ import {
   FilePreviewPanel,
   FilePreviewTree,
   MarkdownPane,
+  PageCard,
   PageToolbar,
+  Select,
   Tabs,
   isPreviewableImagePath,
   type FilePreviewContentFile,
   type FilePreviewTreeNode,
 } from '../ui';
 import { Switch } from '../Switch';
+import { resolveMarketplaceInstalledLocalName } from '../../utils/skillNetUrl';
+import { isEnterprise } from '../../edition';
+import {
+  formatSkillVersionLabel,
+  isAdminManagedSkill,
+  resolveSkillFileReference,
+  shouldShowEnableSwitch,
+  shouldShowSkillPublish,
+} from './skillPanelUtils';
 import { buildSkillVersionOptions } from './skillVersionOptions';
 import type {
   EvolutionEntry,
@@ -35,6 +46,7 @@ import type {
   MarketplacePluginItem,
   SkillDetail,
   SkillFilePreview,
+  SkillPackMember,
   SkillVersion,
 } from './types';
 
@@ -42,20 +54,86 @@ import type {
  * 将技能文件预览数据映射为共享 FilePreviewContent 所需结构。
  * 以当前选中路径为准：加载中/失败时 content 为空，但 header 与错误态仍正常显示
  * （对齐 agent 侧 file.loading/file.error 行为）；图片回退 raw-file 地址。
+ * 例外：切换文件的 loading 期间沿用上一次的预览数据（含其自身 path），
+ * 让内容区继续渲染旧文件，避免预览面板高度塌缩引起页面跳动。
  */
 function buildSkillPreviewFile(
   filePreview: SkillFilePreview | null,
   selectedPath: string,
+  filePreviewStatus: LoadState,
   skillFilePath: string,
 ): FilePreviewContentFile {
-  const matched = filePreview && filePreview.path === selectedPath ? filePreview : null;
+  const matched =
+    filePreview && (filePreview.path === selectedPath || filePreviewStatus === 'loading') ? filePreview : null;
+  const sourcePath = matched?.path ?? selectedPath;
   const skillDir = (skillFilePath || '').replace(/[\\/][^\\/]+$/, '');
   const downloadUrl =
     matched?.download_url ||
-    (isPreviewableImagePath(selectedPath)
-      ? `/file-api/raw-file?path=${encodeURIComponent(`${skillDir}/${selectedPath}`)}`
+    (isPreviewableImagePath(sourcePath)
+      ? `/file-api/raw-file?path=${encodeURIComponent(`${skillDir}/${sourcePath}`)}`
       : null);
-  return { path: selectedPath, content: matched?.content ?? null, downloadUrl };
+  return { path: sourcePath, content: matched?.content ?? null, downloadUrl };
+}
+
+/** 技能包成员阻塞原因 → i18n key（用于"包含技能"页签成员卡片状态徽标） */
+const MEMBER_BLOCKING_REASON_KEYS: Record<string, string> = {
+  disabled: 'skills.memberBlockedReasonDisabled',
+  missing: 'skills.memberBlockedReasonMissing',
+  invalid: 'skills.memberBlockedReasonInvalid',
+  uninstalled: 'skills.memberBlockedReasonUninstalled',
+};
+
+/** 技能包"包含技能"成员卡片网格（我的技能详情 / 广场详情共用），视觉与技能卡片一致 */
+function PackMembersGrid({
+  members,
+  mode = 'hub',
+  onOpenMember,
+}: {
+  members?: SkillPackMember[];
+  /** installed：已安装模式，卡片可点击进成员详情；hub：未安装，只读 */
+  mode?: 'hub' | 'installed';
+  onOpenMember?: (name: string) => void;
+}) {
+  const { t } = useTranslation();
+  // 成员为空时显示空态文案
+  if (!members || members.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-10 text-sm text-text-muted">
+        {t('skills.noPackMembers')}
+      </div>
+    );
+  }
+  return (
+    <div className="card-grid-auto" data-testid="skill-panel-pack-members-grid">
+      {members.map((member) => {
+        // enabled === false 或 available === false 时视为不可用，并展示阻塞原因
+        const isUnavailable = member.enabled === false || member.available === false;
+        // 硬阻塞（缺失/损坏）成员不可交互
+        const isBlocked = member.available === false;
+        const reasonKey = member.blocking_reason ? MEMBER_BLOCKING_REASON_KEYS[member.blocking_reason] : undefined;
+        const interactable = mode === 'installed' && !isBlocked;
+        return (
+          <PageCard
+            key={member.path || member.name}
+            testId="skill-panel-pack-member-card"
+            variant={member.path || member.name}
+            avatar={{ name: member.display_name || member.name }}
+            title={member.display_name || member.name}
+            label={
+              isUnavailable
+                ? [`${t('skills.memberUnavailable')}${reasonKey ? ` · ${t(reasonKey)}` : ''}`]
+                : undefined
+            }
+            description={[
+              member.description || t('skills.noDescription'),
+              member.version ? `${member.version} · ${member.asset_id || ''}` : '',
+            ].filter(Boolean).join('\n')}
+            onClick={interactable ? () => onOpenMember?.(member.name) : undefined}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 interface SkillDetailCommonProps {
@@ -67,8 +145,8 @@ export interface InstalledSkillDetailViewProps extends SkillDetailCommonProps {
   mode: 'installed';
   selectedSkill: SkillDetail;
   detailContent: string;
-  detailTab: 'content' | 'files' | 'experience';
-  setDetailTab: (tab: 'content' | 'files' | 'experience') => void;
+  detailTab: 'content' | 'files' | 'experience' | 'members';
+  setDetailTab: (tab: 'content' | 'files' | 'experience' | 'members') => void;
   detailMenuOpen: boolean;
   setDetailMenuOpen: (open: boolean) => void;
   actionTarget: string | null;
@@ -82,7 +160,7 @@ export interface InstalledSkillDetailViewProps extends SkillDetailCommonProps {
   previewTreeNodes: FilePreviewTreeNode[];
   filePreview: SkillFilePreview | null;
   onSelectSkillFile: (filePath: string) => void;
-  onFetchSkillFiles: (skillName: string) => void;
+  onFetchSkillFiles: (skillName: string, preferredPath?: string) => void;
   evolutionMessage: string | null;
   evolutionMessageType: 'success' | 'error' | null;
   evolutionFormatError: string | null;
@@ -93,17 +171,25 @@ export interface InstalledSkillDetailViewProps extends SkillDetailCommonProps {
   rebuildLoading: boolean;
   onRebuild: (skillName: string, version: string | null) => void;
   setSynthesizeTooltip: (tooltip: { left: number; top: number } | null) => void;
-  onBackToList: () => void;
+  onBack: () => void;
   onEditSkill: (skillName: string, skillType?: string) => void;
   onUninstall: (pluginName: string) => void;
   onToggleSkillDisabled: (skillName: string) => void;
   onGoToChat: (skillName: string, skillType?: string) => void;
+  /** "包含技能"成员：点击进成员详情 */
+  onOpenPackMember: (memberName: string) => void;
 }
 
 export interface HubSkillDetailViewProps extends SkillDetailCommonProps {
   mode: 'hub';
   hubSkill: MarketplacePluginItem;
   hubDetail: HubSkillDetail | null;
+  /** 本地技能列表：按 origin 判定广场条目是否已安装（SKILL.md name 可能 ≠ slug） */
+  localSkills: Array<{ name: string; origin?: string | null }>;
+  installedSkillNames: ReadonlySet<string>;
+  /** 广场详情页签（内容详情 / 包含技能，仅技能包显示"包含技能"） */
+  hubDetailTab: 'content' | 'members';
+  setHubDetailTab: (tab: 'content' | 'members') => void;
   actionTarget: string | null;
   onInstallHubSkill: (skill: MarketplacePluginItem) => void;
   onGoToChat: (skillName: string, skillType?: string) => void;
@@ -115,23 +201,24 @@ export type SkillDetailViewProps = InstalledSkillDetailViewProps | HubSkillDetai
 export function SkillDetailView(props: SkillDetailViewProps) {
   const { t, i18n } = useTranslation();
   const tid = props.mode === 'installed' ? 'skill-panel-my-detail' : 'skill-panel-hub-detail';
-  const onBack = props.mode === 'installed' ? props.onBackToList : props.onBackToHubDetail;
+  const onBack = props.mode === 'installed' ? props.onBack : props.onBackToHubDetail;
 
   const renderShell = (
     header: { avatar: EntityHeaderAvatar; title: string; titleEnd?: ReactNode; tags?: string[] },
     headerRight: ReactNode,
     basicInfoText: ReactNode,
     body: ReactNode,
+    notice?: ReactNode,
   ) => (
     <>
       {props.detailState === 'loading' ? (
         /* 详情加载中：整区域状态视图（参考 agent-management），flex:1 填满详情区避免布局塌陷/抖动 */
-        <div data-testid={`${tid}-state`} data-variant="loading" className="skill-detail-state">
+        <div data-testid={`${tid}-state`} data-variant="loading" className="skill-detail-state detail-loading-shell">
           <button type="button" className="detail-back" onClick={onBack}>
             <BackIcon aria-hidden="true" />
             {t('agentManagement.actions.back')}
           </button>
-          <p>{t('common.loading')}</p>
+          <p className="detail-loading-center" data-testid={`${tid}-loading-text`}>{t('common.loading')}</p>
         </div>
       ) : (
         <div className="flex-1 flex flex-col min-h-0" data-testid={tid}>
@@ -162,6 +249,15 @@ export function SkillDetailView(props: SkillDetailViewProps) {
 
             {/* 基本信息（skill/agent 详情共享区块组件） */}
             <DetailSection testId={`${tid}-basic-info`} title={t('skills.detail.basicInfo')}>
+              {/* 基本信息内的灰色来源提示（如"非自研"说明）：info 图标 + 弱化文本，无边框卡片 */}
+              {notice ? (
+                <div
+                  className="flex items-center gap-1.5 text-sm text-text-muted mb-1.5"
+                  data-testid={`${tid}-notice`}
+                >
+                  {notice}
+                </div>
+              ) : null}
               {basicInfoText}
             </DetailSection>
 
@@ -173,19 +269,36 @@ export function SkillDetailView(props: SkillDetailViewProps) {
   );
 
   if (props.mode === 'hub') {
-    const { hubSkill, hubDetail, installedSkillMap, actionTarget, onInstallHubSkill, onGoToChat } = props;
-    const isInstalled = installedSkillMap.has(hubSkill.name);
+    const {
+      hubSkill,
+      hubDetail,
+      localSkills,
+      installedSkillNames,
+      actionTarget,
+      onInstallHubSkill,
+      onGoToChat,
+      hubDetailTab,
+      setHubDetailTab,
+    } = props;
+    const localName = resolveMarketplaceInstalledLocalName(hubSkill, localSkills, installedSkillNames);
+    const isInstalled = Boolean(localName);
     const installing = actionTarget === `install:${hubSkill.identifier || hubSkill.asset_id}`;
+    // 当前广场条目是否为技能包（用于显示"包含技能"页签）
+    const isHubPackSkill = hubSkill.skill_type === 'skillpack' || hubSkill.plugin_type === 'skillpack';
     return renderShell(
       {
-        avatar: { name: hubSkill.display_name || hubSkill.name, iconUrl: hubSkill.icon_uri, testId: 'skill-panel-hub-avatar' },
+        avatar: {
+          name: hubSkill.display_name || hubSkill.name,
+          iconUrl: hubSkill.icon_uri,
+          testId: 'skill-panel-hub-avatar',
+        },
         title: hubSkill.display_name || hubSkill.name,
       },
       /* 下载/去试试按钮 */
       <div className="flex items-center gap-2 flex-shrink-0">
-        {isInstalled ? (
+        {isInstalled && localName ? (
           <button
-            onClick={() => onGoToChat(hubSkill.name, hubSkill.plugin_type === 'swarmskill' ? 'swarm_skill' : undefined)}
+            onClick={() => onGoToChat(localName, hubSkill.plugin_type === 'swarmskill' ? 'swarm_skill' : undefined)}
             className="flex items-center justify-center rounded-[16px] text-sm text-control-emphasis bg-card border border-control-emphasis hover:bg-secondary/30 whitespace-nowrap"
             style={{ height: '32px', padding: '0 24px' }}
             data-testid={`${tid}-go-try-btn`}
@@ -205,24 +318,37 @@ export function SkillDetailView(props: SkillDetailViewProps) {
         )}
       </div>,
       hubDetail?.data?.short_desc || hubSkill.short_desc || t('skills.noDescription'),
-      /* 仅内容详情页签 */
+      /* 页签：内容详情 / 包含技能（仅技能包显示"包含技能"） */
       <div data-testid={`${tid}-tabs-section`} className="flex flex-col min-h-0">
         <PageToolbar style={{ marginTop: 0, flexShrink: 0 }}>
           <Tabs
             role="tablist"
             itemTestId={`${tid}-tab`}
-            className="text-base"
-            value="content"
-            items={[{ value: 'content', label: t('skills.detail.tabs.contentDetail') }]}
+            className="page-tabs"
+            value={hubDetailTab}
+            onChange={(tab) => setHubDetailTab(tab)}
+            items={[
+              { value: 'content', label: t('skills.detail.tabs.contentDetail') },
+              ...(isHubPackSkill
+                ? [{ value: 'members' as const, label: t('skills.includedSkills'), testId: 'skill-panel-pack-members-tab' }]
+                : []),
+            ]}
           />
         </PageToolbar>
 
         {/* 内容详情 */}
-        <MarkdownPane
-          testId={`${tid}-content`}
-          content={hubDetail?.data?.detail_desc || null}
-          emptyText={t('skills.noContent')}
-        />
+        {hubDetailTab === 'content' ? (
+          <MarkdownPane
+            testId={`${tid}-content`}
+            content={hubDetail?.data?.detail_desc || null}
+            emptyText={t('skills.noContent')}
+          />
+        ) : (
+          /* 包含技能成员列表（未安装，无启停开关） */
+          <div className="flex-1 min-h-0">
+            <PackMembersGrid members={hubDetail?.data?.skillpack?.members} />
+          </div>
+        )}
       </div>,
     );
   }
@@ -261,10 +387,41 @@ export function SkillDetailView(props: SkillDetailViewProps) {
     onUninstall,
     onToggleSkillDisabled,
     onGoToChat,
+    onOpenPackMember,
   } = props;
   const skillDisplayName = selectedSkill.display_name || selectedSkill.name;
   const uninstallPluginName = installedSkillMap.get(selectedSkill.name)?.plugin_name || selectedSkill.name;
   const uninstalling = actionTarget === `uninstall:${uninstallPluginName}`;
+  // 当前详情技能是否为技能包（接口标记 skillpack，或技能名与所属插件名一致）
+  const packPlugin = installedSkillMap.get(selectedSkill.name);
+  const isPackSkill =
+    selectedSkill.skill_type === 'skillpack' ||
+    Boolean(packPlugin && packPlugin.plugin_name === selectedSkill.name && packPlugin.skills.length > 1);
+  // 技能包含有已卸载成员时整包被禁用，且不允许直接启用（需重新下载完整技能包）
+  const isPackBlocked = (selectedSkill.blocked_members?.length ?? 0) > 0;
+  const enterpriseEdition = isEnterprise();
+  const adminManaged = isAdminManagedSkill(selectedSkill, enterpriseEdition);
+  const showEnableSwitch = shouldShowEnableSwitch(selectedSkill, enterpriseEdition);
+  const showPublish = shouldShowSkillPublish(selectedSkill, enterpriseEdition);
+  const enterpriseVersionLabel = formatSkillVersionLabel(selectedSkill, {
+    allowVersionId: true,
+  });
+  const currentVersionLabel = formatSkillVersionLabel(selectedSkill);
+  const contentSourcePath = selectedSkill.file_path.split(/[\\/]/).pop() || 'SKILL.md';
+  const previewSourcePath =
+    filePreviewStatus === 'loading' && filePreview?.path ? filePreview.path : filePreviewPath;
+  const openReferencedSkillFile = (href: string, sourcePath: string | null) => {
+    if (!sourcePath) return true;
+    const filePath = resolveSkillFileReference(sourcePath, href);
+    if (!filePath) return true;
+    setDetailTab('files');
+    if (filesLoadState === 'success') {
+      onSelectSkillFile(filePath);
+    } else {
+      onFetchSkillFiles(selectedSkill.name, filePath);
+    }
+    return true;
+  };
   return renderShell(
     {
       avatar: { name: skillDisplayName, testId: 'skill-panel-my-detail-avatar' },
@@ -301,92 +458,123 @@ export function SkillDetailView(props: SkillDetailViewProps) {
           ? [t('skills.skillTypes.team')]
           : selectedSkill.skill_type === 'multimodal_skill'
             ? [t('skills.skillTypes.multimodal')]
-            : undefined,
+            : selectedSkill.skill_type === 'skillpack'
+              ? [t('skills.skillTypes.skillpack')]
+              : undefined,
     },
-    /* 右侧操作按钮 */
-    <div className="flex items-center gap-6 flex-shrink-0">
-      <button type="button" className="rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-text" data-testid="skill-panel-my-detail-publish-btn" onClick={() => openAssetPublish({ kind: 'skill', local_id: selectedSkill.name })}>{t('skills.actions.publish')}</button>
-      {/* ... 菜单：编辑/卸载 */}
-      <div className="relative">
-        <button
-          type="button"
-          onClick={() => setDetailMenuOpen(!detailMenuOpen)}
-          className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-secondary text-text hover:text-text"
-          data-testid="skill-panel-my-detail-menu"
+    /* 右侧：编辑/卸载见 adminManaged；启停见 showEnableSwitch；发布见 showPublish */
+    <div className="flex items-center flex-shrink-0">
+      {!adminManaged ? (
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setDetailMenuOpen(!detailMenuOpen)}
+            className={`w-7 h-7 flex items-center justify-center rounded-md text-text hover:text-text hover:bg-secondary ${
+              detailMenuOpen ? 'bg-secondary' : ''
+            }`}
+            aria-expanded={detailMenuOpen}
+            data-testid="skill-panel-my-detail-menu"
+          >
+            <MoreIcon aria-hidden />
+          </button>
+          {detailMenuOpen ? (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setDetailMenuOpen(false)} />
+              <div className="dropdown-menu">
+                <button
+                  onClick={
+                    selectedSkill.enabled !== false
+                      ? () => {
+                          setDetailMenuOpen(false);
+                          onEditSkill(selectedSkill.name, selectedSkill.skill_type);
+                        }
+                      : undefined
+                  }
+                  disabled={selectedSkill.enabled === false}
+                  className="flex items-center w-full px-3 py-2 text-sm text-left text-text hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed"
+                  data-testid="skill-panel-my-detail-menu-edit"
+                >
+                  {t('skills.actions.edit')}
+                </button>
+                <button
+                  onClick={
+                    uninstalling
+                      ? undefined
+                      : () => {
+                          setDetailMenuOpen(false);
+                          onUninstall(uninstallPluginName);
+                        }
+                  }
+                  disabled={uninstalling}
+                  className="flex items-center w-full px-3 py-2 text-sm text-left text-text hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed"
+                  data-testid="skill-panel-my-detail-menu-uninstall"
+                >
+                  {t(uninstalling ? 'skills.actions.uninstalling' : 'skills.actions.uninstall')}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+      {showEnableSwitch ? (
+        <div
+          className="ml-5 flex items-center gap-2"
+          title={isPackBlocked ? t('skills.packBlockedHint') : undefined}
         >
-          <MoreIcon aria-hidden />
-        </button>
-        {detailMenuOpen ? (
-          <>
-            <div className="fixed inset-0 z-40" onClick={() => setDetailMenuOpen(false)} />
-            <div className="dropdown-menu">
-              <button
-                onClick={
-                  selectedSkill.enabled !== false
-                    ? () => {
-                        setDetailMenuOpen(false);
-                        onEditSkill(selectedSkill.name, selectedSkill.skill_type);
-                      }
-                    : undefined
-                }
-                disabled={selectedSkill.enabled === false}
-                className="flex items-center w-full px-3 py-2 text-sm text-left text-text hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed"
-                data-testid="skill-panel-my-detail-menu-edit"
-              >
-                {t('skills.actions.edit')}
-              </button>
-              <button
-                onClick={
-                  uninstalling
-                    ? undefined
-                    : () => {
-                        setDetailMenuOpen(false);
-                        onUninstall(uninstallPluginName);
-                      }
-                }
-                disabled={uninstalling}
-                className="flex items-center w-full px-3 py-2 text-sm text-left text-text hover:bg-secondary disabled:opacity-40 disabled:cursor-not-allowed"
-                data-testid="skill-panel-my-detail-menu-uninstall"
-              >
-                {t(uninstalling ? 'skills.actions.uninstalling' : 'skills.actions.uninstall')}
-              </button>
-            </div>
-          </>
-        ) : null}
-      </div>
-      {/* 启用开关 + 文字 */}
-      <div className="flex items-center gap-2">
-        <Switch
-          checked={selectedSkill.enabled !== false}
-          onChange={() => onToggleSkillDisabled(selectedSkill.name)}
-          disabled={actionTarget === `toggle:${selectedSkill.name}`}
-        />
-        <span
-          className="text-sm text-text whitespace-nowrap"
-          data-testid="skill-panel-my-detail-enable-label"
-          data-variant={selectedSkill.enabled !== false ? 'enabled' : 'disabled'}
-        >
-          {selectedSkill.enabled !== false ? t('skills.enable') : t('skills.disable')}
-        </span>
-      </div>
+          <Switch
+            checked={selectedSkill.enabled !== false}
+            onChange={() => onToggleSkillDisabled(selectedSkill.name)}
+            disabled={actionTarget === `toggle:${selectedSkill.name}` || isPackBlocked}
+          />
+          <span
+            className="text-sm text-text whitespace-nowrap"
+            data-testid="skill-panel-my-detail-enable-label"
+            data-variant={selectedSkill.enabled !== false ? 'enabled' : 'disabled'}
+          >
+            {selectedSkill.enabled !== false ? t('skills.enable') : t('skills.disable')}
+          </span>
+        </div>
+      ) : null}
       {/* 去试试 */}
       <button
         onClick={
           selectedSkill.enabled !== false ? () => onGoToChat(selectedSkill.name, selectedSkill.skill_type) : undefined
         }
         disabled={selectedSkill.enabled === false}
-        className="flex items-center justify-center rounded-[16px] text-sm text-control-emphasis bg-card border border-control-emphasis hover:bg-secondary/30 whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-        style={{ height: '32px', padding: '0 24px' }}
+        className={`${showEnableSwitch || !adminManaged ? 'ml-6' : 'ml-0'} flex items-center justify-center rounded-[16px] text-sm text-control-emphasis bg-card border border-control-emphasis hover:bg-secondary/30 whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed`}
+        style={{ width: '96px', height: '32px' }}
         data-testid={`${tid}-go-try-btn`}
       >
         {t('skills.actions.goTry')}
       </button>
+      {showPublish ? (
+        <button
+          type="button"
+          className="ml-2 flex items-center justify-center rounded-[16px] text-sm text-text-inverse bg-control-emphasis hover:opacity-80 whitespace-nowrap"
+          style={{ width: '96px', height: '32px' }}
+          data-testid="skill-panel-my-detail-publish-btn"
+          onClick={() => openAssetPublish({ kind: selectedSkill.skill_type === 'skillpack' ? 'skillpack' : 'skill', local_id: selectedSkill.name })}
+        >
+          {t('skills.actions.publish')}
+        </button>
+      ) : null}
     </div>,
     selectedSkill.description || t('skills.noDescription'),
     <>
-      {/* 版本管理 */}
-      <DetailSection testId={`${tid}-versions-section`} title={t('skills.detail.versionManage')}>
-        {versionsLoadState === 'loading' ? (
+      {/* 企业版：只展示当前版本；社区版保留版本管理（可切换历史副本） */}
+      <DetailSection
+        testId={`${tid}-versions-section`}
+        title={t(enterpriseEdition ? 'skills.detail.version' : 'skills.detail.versionManage')}
+      >
+        {enterpriseEdition ? (
+          <div
+            data-testid="skill-panel-my-detail-versions-state"
+            className="text-sm text-text-muted"
+            data-variant={enterpriseVersionLabel ? 'current' : 'empty'}
+          >
+            {enterpriseVersionLabel || t('skills.detail.noVersions')}
+          </div>
+        ) : versionsLoadState === 'loading' ? (
           <div
             data-testid="skill-panel-my-detail-versions-state"
             className="text-sm text-text-muted"
@@ -408,29 +596,32 @@ export function SkillDetailView(props: SkillDetailViewProps) {
             className="text-sm text-text-muted"
             data-variant="empty"
           >
-            {selectedSkill.version ? `v${selectedSkill.version}` : t('skills.detail.noVersions')}
+            {currentVersionLabel || t('skills.detail.noVersions')}
           </div>
         ) : (
           <div className="flex items-center gap-2 flex-wrap">
-            <select
+            <Select
+              aria-label={t('skills.detail.versionManage')}
               value={selectedSkill.version || skillVersionsDefault || ''}
-              onChange={(e) => {
-                const ver = e.target.value;
+              style={{ width: '360px' }}
+              options={buildSkillVersionOptions(skillVersions).map((option) => ({
+                value: option.version,
+                label: (
+                  <span className="skill-version-option">
+                    <span className="skill-version-option__version">{option.version}</span>
+                    {option.isDefault ? (
+                      <span className="skill-version-default-tag">{t('skills.detail.defaultVersion')}</span>
+                    ) : null}
+                  </span>
+                ),
+                disabled: option.disabled,
+                disabledReason: option.disabled ? t('skills.detail.unavailableVersion') : undefined,
+              }))}
+              onChange={(ver) => {
                 if (ver) onFetchSkillDetail(selectedSkill.name, ver);
               }}
-              className="appearance-none rounded-[6px] border border-border bg-panel text-xs text-text outline-none focus:outline-none focus:ring-0 focus:border-border"
-              style={{ width: '360px', height: '28px', paddingLeft: '12px', paddingRight: '12px' }}
               data-testid="skill-panel-my-detail-versions-select"
-            >
-              {buildSkillVersionOptions(skillVersions, {
-                defaultSuffix: ` (${t('skills.detail.defaultVersion')})`,
-                unavailableSuffix: ` (${t('skills.detail.unavailableVersion')})`,
-              }).map((option) => (
-                <option key={option.version} value={option.version} disabled={option.disabled} className="text-xs">
-                  {option.label}
-                </option>
-              ))}
-            </select>
+            />
             {selectedSkill.has_evolutions ? (
               <button
                 onClick={() => onRebuild(selectedSkill.name, selectedSkill.version || null)}
@@ -451,7 +642,7 @@ export function SkillDetailView(props: SkillDetailViewProps) {
           <Tabs
             role="tablist"
             itemTestId={`${tid}-tab`}
-            className="text-base"
+            className="page-tabs"
             value={detailTab}
             onChange={(tab) => {
               setDetailTab(tab);
@@ -461,6 +652,15 @@ export function SkillDetailView(props: SkillDetailViewProps) {
             }}
             items={[
               { value: 'content', label: t('skills.detail.tabs.contentDetail') },
+              ...(isPackSkill
+                ? [
+                    {
+                      value: 'members' as const,
+                      label: t('skills.includedSkills'),
+                      testId: 'skill-panel-pack-members-tab',
+                    },
+                  ]
+                : []),
               { value: 'files', label: t('skills.detail.tabs.filePreview') },
               ...(selectedSkill.has_evolutions
                 ? [{ value: 'experience' as const, label: t('skills.detail.tabs.skillExperience') }]
@@ -492,6 +692,16 @@ export function SkillDetailView(props: SkillDetailViewProps) {
             testId={`${tid}-content`}
             content={selectedSkill.content ? detailContent : null}
             emptyText={t('skills.noContent')}
+            onLinkClick={(href) => openReferencedSkillFile(href, contentSourcePath)}
+          />
+        )}
+
+        {/* 包含技能（技能包成员；已安装模式可点击进成员详情） */}
+        {detailTab === 'members' && (
+          <PackMembersGrid
+            mode="installed"
+            members={selectedSkill.skillpack?.members}
+            onOpenMember={onOpenPackMember}
           />
         )}
 
@@ -523,9 +733,12 @@ export function SkillDetailView(props: SkillDetailViewProps) {
                 selected={Boolean(filePreviewPath)}
                 selectedPreviewable={Boolean(filePreviewPath)}
                 file={
-                  filePreviewPath ? buildSkillPreviewFile(filePreview, filePreviewPath, selectedSkill.file_path) : null
+                  filePreviewPath
+                    ? buildSkillPreviewFile(filePreview, filePreviewPath, filePreviewStatus, selectedSkill.file_path)
+                    : null
                 }
                 status={filePreviewStatus}
+                onLinkClick={(href) => openReferencedSkillFile(href, previewSourcePath)}
                 labels={{
                   selectPrompt: t('skills.detail.selectFileToPreview'),
                   notPreviewable: t('skills.detail.notPreviewable'),
@@ -632,5 +845,19 @@ export function SkillDetailView(props: SkillDetailViewProps) {
         )}
       </div>
     </>,
+    /* 基本信息下方灰色提示条：内置技能且不在自研名单（proprietary 为 false 或缺失）时显示"非自研" */
+    (selectedSkill.is_builtin || selectedSkill.is_builtin_source || selectedSkill.source === 'builtin') &&
+    !selectedSkill.proprietary ? (
+      <>
+        <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
+          />
+        </svg>
+        <span>{t('skills.proprietaryLabels.thirdPartyHint')}</span>
+      </>
+    ) : undefined,
   );
 }

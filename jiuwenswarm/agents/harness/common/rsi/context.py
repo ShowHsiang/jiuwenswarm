@@ -112,7 +112,7 @@ class RsiServiceContext:
             self.store,
             adapter_resolver=self.adapter_for,
         )
-        self.artifact_files_service = RsiArtifactFilesService(self.store)
+        self.artifact_files_service = RsiArtifactFilesService(self.store, artifact_service=self.artifact_service)
         self.workspace_recovery = RsiWorkspaceRecovery(
             self.store,
             self.projector,
@@ -241,11 +241,17 @@ class RsiServiceContext:
         adapters: dict[str, Any] = {}
         if program is not None:
             adapters["ARTIFACT:PROGRAM"] = ArtifactEngineAdapter(
-                "PROGRAM", program, model_resolver=model_resolver
+                "PROGRAM",
+                program,
+                model_resolver=model_resolver,
+                tasks_root=self.tasks_root,
             )
         if paper is not None:
             adapters["ARTIFACT:PAPER"] = ArtifactEngineAdapter(
-                "PAPER", paper, model_resolver=model_resolver
+                "PAPER",
+                paper,
+                model_resolver=model_resolver,
+                tasks_root=self.tasks_root,
             )
         self.register_adapters(adapters)
         return adapters

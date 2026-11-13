@@ -1,10 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canShowAssetPublish,
   publishOutcome,
+  localRecordState,
+  isSubmissionLocked,
+  canStartNewVersion,
+  canRetrySkillPack,
+  definitiveCommitRejection,
   validateMetadata,
   createCommitAttempt,
 } from '../node_modules/.cache/asset-publish/assetPublishState.js';
+
+test('publish action is visible only for explicitly installed assets', () => {
+  assert.equal(typeof canShowAssetPublish, 'function');
+  assert.equal(canShowAssetPublish(true), true);
+  assert.equal(canShowAssetPublish(false), false);
+  assert.equal(canShowAssetPublish(undefined), false);
+  assert.equal(canShowAssetPublish(true, true), true);
+  assert.equal(canShowAssetPublish(true, false), false);
+});
 test('completed upload does not imply published', () => {
   assert.equal(
     publishOutcome({ execution_status: 'completed', result: { publish_result: 'pending_moderation' } }),
@@ -90,8 +105,107 @@ test('cache metadata stays alongside cards and refresh polling cancels stale que
   context.mock.timers.tick(4000);
   assert.equal(calls, 1);
 });
+test('catalog notice hides normal refreshes and only reports stale or failed data', async () => {
+  const { catalogCacheNotice, formatCatalogCacheUpdatedAt } =
+    await import('../node_modules/.cache/asset-publish/catalogCache.js');
+
+  assert.equal(catalogCacheNotice({ state: 'fresh', refreshing: true, complete: true }), null);
+  assert.equal(catalogCacheNotice({ state: 'miss', refreshing: true, complete: false }), null);
+  assert.equal(catalogCacheNotice({ state: 'fresh', refreshing: false, complete: false }), null);
+  assert.deepEqual(catalogCacheNotice({ state: 'stale', refreshing: true, updated_at: 1789522670.483113 }), {
+    kind: 'stale',
+    updatedAt: 1789522670.483113,
+  });
+  assert.deepEqual(
+    catalogCacheNotice({
+      state: 'fresh',
+      refreshing: false,
+      fetched_at: '2026-09-16T01:37:50Z',
+      error: 'refresh_failed',
+    }),
+    { kind: 'error', updatedAt: '2026-09-16T01:37:50Z' },
+  );
+
+  const formatted = formatCatalogCacheUpdatedAt(1789522670.483113, 'zh-CN', 'Asia/Shanghai');
+  assert.match(formatted, /2026/);
+  assert.match(formatted, /09/);
+  assert.doesNotMatch(formatted, /1789522670/);
+});
 test('timestamps support backend Unix seconds and ISO dates', async () => {
   const { publishTimestamp } = await import('../node_modules/.cache/asset-publish/assetPublishState.js');
   assert.equal(publishTimestamp(1700000000), 1700000000000);
   assert.equal(publishTimestamp('2023-11-14T22:13:20Z'), 1700000000000);
+});
+
+test('empty catalog waits for background refresh but settled and failed lists stop loading', async () => {
+  const { catalogAwaitingItems } = await import('../node_modules/.cache/asset-publish/catalogCache.js');
+  assert.equal(catalogAwaitingItems(0, { state: 'miss', refreshing: true }), true);
+  assert.equal(catalogAwaitingItems(0, { state: 'fresh', refreshing: false }), false);
+  assert.equal(catalogAwaitingItems(1, { state: 'stale', refreshing: true }), false);
+  assert.equal(catalogAwaitingItems(0, { state: 'error', refreshing: true }), false);
+  assert.equal(catalogAwaitingItems(0, undefined), false);
+});
+
+test('exhausted refresh stops loading and exposes an error notice', (context) => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  return import('../node_modules/.cache/asset-publish/catalogCache.js').then(
+    ({ scheduleCatalogRefresh, catalogAwaitingItems, catalogCacheNotice }) => {
+      const pending = { state: 'miss', refreshing: true };
+      let cache;
+      for (let i = 0; i < 151; i++) {
+        cache = scheduleCatalogRefresh(
+          'exhausted-test',
+          pending,
+          () => {},
+          () => true,
+        );
+        context.mock.timers.tick(400);
+      }
+      assert.equal(catalogAwaitingItems(0, cache), false);
+      assert.equal(catalogCacheNotice(cache)?.kind, 'error');
+      assert.equal(pending.refreshing, true);
+    },
+  );
+});
+
+test('only in-flight operations lock the form; an unverified outcome can start again', () => {
+  for (const execution_status of ['queued', 'uploading']) {
+    const record = { execution_status };
+    assert.equal(isSubmissionLocked(record), true);
+    assert.equal(canStartNewVersion(record), false);
+  }
+  // #4749: 'unknown' is terminal, not an operation still owned by the backend.
+  for (const execution_status of ['completed', 'failed', 'unknown']) {
+    const record = { execution_status };
+    assert.equal(isSubmissionLocked(record), false);
+    assert.equal(canStartNewVersion(record), true);
+  }
+});
+
+test('records expose only locally confirmed states', () => {
+  assert.equal(localRecordState({ execution_status: 'queued' }), 'queued');
+  assert.equal(localRecordState({ execution_status: 'uploading' }), 'uploading');
+  assert.equal(localRecordState({ execution_status: 'failed' }), 'failed');
+  assert.equal(localRecordState({ execution_status: 'completed' }), 'submitted');
+  // 远端态（pending_moderation / published）不再上屏
+  assert.equal(localRecordState({ execution_status: 'completed', result: { publish_result: 'pending_moderation' } }), 'submitted');
+  assert.equal(localRecordState({ execution_status: 'completed', result: { publish_result: 'published' } }), 'submitted');
+  assert.equal(localRecordState({ execution_status: 'unknown' }), 'unconfirmed');
+});
+
+test('a disabled new SkillPack confirmation is a definitive rejection, not an uncertain upload', () => {
+  assert.equal(definitiveCommitRejection({ code: 'SKILLPACK_DISABLED' }), 'rejected');
+  assert.equal(definitiveCommitRejection({ message: 'SKILLPACK_DISABLED' }), 'rejected');
+  assert.equal(definitiveCommitRejection({ message: 'request timeout' }), null);
+  assert.equal(definitiveCommitRejection({ code: 'SKILLPACK_HUB_CHECK_FAILED' }), null);
+});
+
+test('an older confirmed SkillPack blocked by the toggle can request server-side recovery', () => {
+  for (const code of ['SKILLPACK_DISABLED', 'SKILLPACK_HUB_CHECK_FAILED']) {
+    const record = { stage: 'blocked', execution_status: 'failed', error: { code } };
+    assert.equal(canRetrySkillPack(record), true);
+    assert.equal(isSubmissionLocked(record), false);
+  }
+  assert.equal(canRetrySkillPack({ stage: 'blocked', error: { code: 'MEMBER_TYPE_NOT_ALLOWED' } }), false);
+  assert.equal(canRetrySkillPack({ stage: 'completed', error: { code: 'SKILLPACK_DISABLED' } }), false);
 });

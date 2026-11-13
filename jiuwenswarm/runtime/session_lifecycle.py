@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
+from jiuwenswarm.runtime.session.model import (
+    ExecutionLifecycleContext,
+    SessionLifecycleContext,
+)
+
 
 class SessionKind(str, Enum):
     """Stable business kind used by lifecycle participants."""
@@ -39,7 +44,9 @@ class SessionLifecycleTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class SessionPrepareEvent:
+class SessionInputIntentEvent:
+    """A user intends to continue the Session, independent of any consumer."""
+
     target: SessionLifecycleTarget
     has_history: bool = False
     view_id: str = ""
@@ -73,16 +80,16 @@ class SessionInactiveEvent:
     target: SessionLifecycleTarget
 
 
-class SessionPrepareDisposition(str, Enum):
+class SessionInputIntentDisposition(str, Enum):
     SCHEDULED = "scheduled"
     NOT_NEEDED = "not_needed"
 
 
 class SessionActivityParticipant(Protocol):
-    async def session_preparing(
+    async def session_input_intent(
         self,
-        event: SessionPrepareEvent,
-    ) -> SessionPrepareDisposition:
+        event: SessionInputIntentEvent,
+    ) -> SessionInputIntentDisposition:
         ...
 
     async def foreground_changed(self, event: SessionForegroundEvent) -> None:
@@ -162,9 +169,56 @@ class RuntimeResourceLease(Protocol):
         ...
 
 
+class SessionRuntimeLifecyclePort(Protocol):
+    """Define Team-domain lifecycle actions orchestrated by AgentRuntime."""
+
+    async def remove_response_waiter(
+        self,
+        context: ExecutionLifecycleContext,
+        *,
+        reason: str,
+    ) -> None:
+        """Remove the response waiter owned by the current request."""
+        ...
+
+    async def pause_session(
+        self,
+        context: SessionLifecycleContext,
+        *,
+        reason: str,
+        channel_id: str | None = None,
+    ) -> bool:
+        """Return whether one Team Session generation was paused or drained."""
+        ...
+
+    async def stop_session(
+        self,
+        context: SessionLifecycleContext,
+        *,
+        reason: str,
+    ) -> None:
+        """Stop one Team Session generation."""
+        ...
+
+    async def publish_pause_completed(
+        self,
+        session_id: str,
+        *,
+        generation: int | None,
+        channel_id: str | None = None,
+    ) -> None:
+        """Publish pause completion through surviving Session observers."""
+        ...
+
+    def is_running(self, context: SessionLifecycleContext) -> bool:
+        """Return whether one Team generation owns active work."""
+        ...
+
+
 __all__ = [
     "RuntimeParticipantRegistry",
     "RuntimeResourceLease",
+    "SessionRuntimeLifecyclePort",
     "SessionActivityParticipant",
     "SessionDeleteParticipant",
     "SessionDescriptor",
@@ -172,8 +226,8 @@ __all__ = [
     "SessionExecutionFinishedEvent",
     "SessionForegroundEvent",
     "SessionInactiveEvent",
+    "SessionInputIntentDisposition",
+    "SessionInputIntentEvent",
     "SessionKind",
     "SessionLifecycleTarget",
-    "SessionPrepareDisposition",
-    "SessionPrepareEvent",
 ]

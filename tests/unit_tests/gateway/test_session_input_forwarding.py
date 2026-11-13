@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
-from jiuwenswarm.common.schema.message import Message, ReqMethod
-from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
+from openjiuwen_protocol.e2a.agent_models import AgentResponse, AgentResponseChunk
+from openjiuwen_protocol.message import Message, ReqMethod
+from agent_gateway.message_handler.message_handler import MessageHandler
 
 
 def message(rid, *, stream=False, mode=None, channel="web", **params):
@@ -189,3 +189,101 @@ async def test_conflicting_modes_do_not_kill_forward_loop(gateway):
     await handler.publish_user_messages(message("good", mode="steer"))
     await receive(handler, "good", event_type="runtime.accepted")
     assert [e.request_id for e in client.calls] == ["good"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_image_only_steer_reference_reaches_running_request(gateway, stream):
+    handler, client = gateway
+    images = [{
+        "type": "image", "path": "/server/sessions/sess-input-gateway/uploads/shot.png",
+        "filename": "shot.png", "mime_type": "image/png",
+    }]
+    await handler.publish_user_messages(message("original", stream=True))
+    assert await asyncio.wait_for(client.started.get(), 5) == "original"
+    await handler.publish_user_messages(message("image-steer", mode="steer", stream=stream, query="", media_items=images))
+    assert await asyncio.wait_for(client.started.get(), 5) == "image-steer"
+    await receive(handler, "image-steer", event_type="runtime.accepted")
+    assert client.calls[-1].params["media_items"] == images
+    assert not client.release.is_set() and not client.cancelled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attachments", [
+    {"media_items": [{"type": "image", "base64Data": "AAAA", "mime_type": "image/png"}]},
+    {"files": {"uploaded_images": [{"path": "/server/shot.png"}]}},
+    {"attachments": [{"path": "/server/document.pdf"}]},
+])
+async def test_invalid_steer_attachments_are_not_forwarded(gateway, attachments):
+    handler, client = gateway
+    await handler.publish_user_messages(message("bad-image", mode="steer", **attachments))
+    await receive(handler, "bad-image", ok=False)
+    await handler.publish_user_messages(message("valid-text", mode="steer"))
+    await receive(handler, "valid-text", event_type="runtime.accepted")
+    assert [call.request_id for call in client.calls] == ["valid-text"]
+
+
+_IM_CHANNELS = (
+    "feishu",
+    "wecom",
+    "dingtalk",
+    "slack",
+    "discord",
+    "telegram",
+    "wechat",
+    "whatsapp",
+    "xiaoyi",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", _IM_CHANNELS)
+async def test_im_steer_reaches_the_running_session(gateway, channel):
+    handler, client = gateway
+    original = message("original", stream=True, channel=channel)
+    supplement = message("supplement", stream=True, channel=channel)
+    supplement.params.pop("input_mode", None)
+    supplement.metadata = dict(supplement.metadata)
+    supplement.metadata["runtime_mode"] = "steer"
+    handler.get_or_create_channel_state(original).session_id = original.session_id
+    handler.get_or_create_channel_state(supplement).session_id = supplement.session_id
+    await handler.publish_user_messages(original)
+    assert await asyncio.wait_for(client.started.get(), 5) == "original"
+    await handler.publish_user_messages(supplement)
+    assert await asyncio.wait_for(client.started.get(), 5) == "supplement"
+    ack = await receive(handler, "supplement", event_type="runtime.accepted")
+    delivered = client.calls[-1]
+    assert delivered.params["input_mode"] == "steer"
+    assert delivered.params["query"] == "supplement"
+    assert delivered.session_id == "sess-input-gateway"
+    assert ack.session_id == "sess-input-gateway"
+    assert not client.cancelled
+    assert handler._session_has_streams_blocking_processing_false("sess-input-gateway")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", _IM_CHANNELS)
+async def test_busy_im_chat_send_steers_without_cancelling(gateway, channel):
+    handler, client = gateway
+    original = message("original", stream=True, channel=channel)
+    follow = message("follow-up", stream=True, channel=channel)
+    handler.get_or_create_channel_state(original).session_id = original.session_id
+    handler.get_or_create_channel_state(follow).session_id = follow.session_id
+    await handler.publish_user_messages(original)
+    assert await asyncio.wait_for(client.started.get(), 5) == "original"
+    await handler.publish_user_messages(follow)
+    assert await asyncio.wait_for(client.started.get(), 5) == "follow-up"
+    await receive(handler, "follow-up", event_type="runtime.accepted")
+    delivered = client.calls[-1]
+    assert delivered.params["input_mode"] == "steer"
+    assert delivered.params["query"] == "follow-up"
+    assert not client.cancelled
+    assert handler._session_has_streams_blocking_processing_false("sess-input-gateway")
+
+
+@pytest.mark.asyncio
+async def test_idle_im_chat_send_stays_ordinary(gateway):
+    handler, client = gateway
+    await handler.publish_user_messages(message("only", channel="slack"))
+    assert await asyncio.wait_for(client.started.get(), 5) == "only"
+    assert client.calls[-1].params.get("input_mode") in (None, "")

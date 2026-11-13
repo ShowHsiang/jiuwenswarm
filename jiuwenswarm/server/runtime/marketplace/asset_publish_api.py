@@ -19,7 +19,7 @@ from .asset_publish_adapters import PublishValidationError
 from .asset_publish_models import PublishIdentity
 from .asset_publish_service import AssetPublishService
 from .asset_publish_store import PublishStore, PublishStoreError
-from .hub_client import HubClient
+from .hub_client import HubClient, HubProtocolError
 from .hub_publish_client import PublishAuth
 
 
@@ -46,7 +46,7 @@ def resolve_local_asset(kind: str, local_id: str):
     from jiuwenswarm.common.utils import get_agent_skills_dir, get_workspace_dir
 
     local_id = _safe_id(local_id)
-    if kind == "skill":
+    if kind in {"skill", "skillpack"}:
         root = get_agent_skills_dir()
         candidate = root / local_id
         if (
@@ -56,18 +56,22 @@ def resolve_local_asset(kind: str, local_id: str):
         ):
             raise PublishAPIError("RESOURCE_NOT_FOUND")
         return candidate
-    if kind in {"agent_template", "plugin"}:
+    if kind in {"agent_template", "agent_group", "plugin"}:
         from jiuwenswarm.server.runtime import extension_package_manager as packages
 
-        runtime_id = packages.resolve_equipment_runtime_id(
-            "agent_templates" if kind == "agent_template" else "plugin_packages",
-            local_id,
-        )
-        resolver = (
-            packages.resolve_agent_template_dir
-            if kind == "agent_template"
-            else packages.resolve_plugin_dir
-        )
+        if kind == "agent_group":
+            runtime_id = packages.resolve_equipment_runtime_id("agent_groups", local_id)
+            resolver = packages.resolve_agent_group_publish_dir
+        else:
+            runtime_id = packages.resolve_equipment_runtime_id(
+                "agent_templates" if kind == "agent_template" else "plugin_packages",
+                local_id,
+            )
+            resolver = (
+                packages.resolve_agent_template_dir
+                if kind == "agent_template"
+                else packages.resolve_plugin_dir
+            )
         try:
             return resolver(runtime_id)
         except (ValueError, OSError):
@@ -94,11 +98,11 @@ def _defaults(kind: str, local_id: str, source) -> dict:
     if isinstance(source, Path):
         if source.is_symlink():
             raise PublishAPIError("UNSAFE_PATH")
-        path = source / ("SKILL.md" if kind == "skill" else "manifest.json")
+        path = source / ("SKILL.md" if kind in {"skill", "skillpack"} else "manifest.json")
         if not path.is_file() or path.is_symlink() or path.stat().st_size > 1024 * 1024:
             raise PublishAPIError("INVALID_PACKAGE")
         text = path.read_text(encoding="utf-8")
-        if kind == "skill":
+        if kind in {"skill", "skillpack"}:
             match = re.match(r"\s*---\s*\n(.*?)\n---(?:\s*\n|$)", text, re.S)
             data = yaml.safe_load(match.group(1)) if match else {}
         else:
@@ -114,7 +118,17 @@ def _defaults(kind: str, local_id: str, source) -> dict:
             value = value.get("zh") or value.get("en") or ""
         return value if isinstance(value, str) else ""
 
-    name = label(data.get("id" if kind in {"plugin", "mcp"} else "name")) or local_id
+    manifest_name = label(data.get("name"))
+    if kind in {"agent_template", "agent_group"} and isinstance(source, Path):
+        # Agent manifests use ``name`` as a user-facing label, while the
+        # resolved package directory is the canonical Hub package identity.
+        # This also avoids publishing a Hub asset UUID when ``local_id`` is
+        # the remote identity rather than the installed package name.
+        name = source.name
+        display_name = label(data.get("display_name")) or manifest_name or name
+    else:
+        name = label(data.get("id" if kind in {"plugin", "mcp"} else "name")) or local_id
+        display_name = label(data.get("display_name")) or name
     version = label(data.get("version")) or "1.0.0"
     if not re.fullmatch(r"(?:\d+\.\d+\.\d+|[0-9a-f]{7})", version):
         version = "1.0.0"
@@ -126,7 +140,7 @@ def _defaults(kind: str, local_id: str, source) -> dict:
     return dict(
         asset_name=name,
         version=version,
-        display_name=label(data.get("display_name")) or name,
+        display_name=display_name,
         description=label(data.get("description"))
         or label(data.get("display_description")),
         tags=[t for t in tags if isinstance(t, str)] if isinstance(tags, list) else [],
@@ -142,6 +156,7 @@ class AssetPublishAPI:
         publisher=None,
         resolver: Callable = resolve_local_asset,
         hub_url: str | None = None,
+        skillpack_hub=None,
     ):
         from .hub_client import HttpHubTransport
 
@@ -181,9 +196,18 @@ class AssetPublishAPI:
             publisher or HubClient(base_url=self.hub_url),
             lambda scope, kind, local_id: resolver(kind, local_id),
             self.root / "packages",
-            on_published=lambda request, result: invalidate_hub_catalog(
-                request.identity.kind
+            on_published=lambda request, result: (
+                invalidate_hub_catalog("skill" if request.identity.kind == "skillpack" else request.identity.kind),
+                invalidate_hub_catalog("agent_template")
+                if request.identity.kind == "agent_group" else None,
             ),
+        )
+        from .skillpack_publish_hub import SkillPackPublishHub
+        from .skillpack_publish_service import SkillPackPublishService
+
+        self.skillpack_hub = skillpack_hub or SkillPackPublishHub(self.hub_url)
+        self.skillpacks = SkillPackPublishService(
+            self.root / "skillpacks", self.service, self.store, resolver, self.skillpack_hub,
         )
 
     def scope(self, gateway_user: str, auth_data: dict) -> str:
@@ -221,6 +245,7 @@ class AssetPublishAPI:
         await self.service.start()
 
     async def close(self):
+        await self.skillpacks.close()
         await self.service.close()
         self.store.close()
 
@@ -232,34 +257,90 @@ class AssetPublishAPI:
             raise PublishAPIError("INVALID_PARAMETERS")
         if method == "local_status":
             kind, local_id = params.get("kind"), _safe_id(params.get("local_id"))
-            if kind not in {"skill", "agent_template", "plugin", "mcp"}:
+            if kind not in {"skill", "skillpack", "agent_template", "agent_group", "plugin", "mcp"}:
                 raise PublishAPIError("INVALID_KIND")
             # Workspace access remains enforced by the Web/Gateway route and local
             # resolver. This read-only summary never grants Hub account access.
             self._resolver(kind, local_id)
             return {"state": self.store.local_status(kind, local_id)}
-        auth = self._auth(params.get("auth"))
-        scope = self.scope(str(gateway_user or ""), params["auth"])
+        # Local defaults use workspace access; account records still require Hub auth.
+        auth_data = params.get("auth")
+        local_describe = method == "describe" and (
+            auth_data is None
+            or (isinstance(auth_data, dict) and auth_data.get("access_token") in (None, ""))
+        )
+        auth = None if local_describe else self._auth(auth_data)
+        scope = None if local_describe else self.scope(str(gateway_user or ""), auth_data)
+        member_record_scope = scope
         try:
+            pack_request = params.get("kind") == "skillpack" or self.skillpacks.owns(
+                params.get("draft_id") or params.get("operation_id")
+            )
+            publisher_id = None
+            identity_errors = []
+            if pack_request and auth is not None:
+                try:
+                    publisher_id = await self.skillpack_hub.publisher_id(auth)
+                except HubProtocolError as exc:
+                    if method != "describe":
+                        raise
+                    # Local defaults remain readable; account history must not
+                    # fall back to an unverified identity or another scope.
+                    local_describe = True
+                    scope = None
+                    code = "SKILLPACK_HUB_CHECK_FAILED"
+                    if getattr(exc, "status_code", None) in {401, 403}:
+                        code = "AUTH_REQUIRED"
+                    identity_errors = [{"code": code}]
+                else:
+                    identity_scope = json.dumps([
+                        str(self.root.resolve()), self.hub_url, str(gateway_user or ""),
+                        auth.oauth_provider, publisher_id,
+                    ]).encode()
+                    scope = hmac.new(self._secret, identity_scope, hashlib.sha256).hexdigest()
+            if pack_request and method == "commit":
+                return await self.skillpacks.commit(
+                    scope, params.get("draft_id"), params.get("request_id"), auth=auth,
+                )
+            if pack_request and method == "status":
+                operation_id = params.get("operation_id")
+                self.skillpacks.resume(scope, operation_id, auth)
+                return self.skillpacks.status(scope, operation_id)
             if method in {"describe", "prepare", "records"}:
                 kind, local_id = params.get("kind"), _safe_id(params.get("local_id"))
-                if kind not in {"skill", "agent_template", "plugin", "mcp"}:
+                if kind not in {"skill", "skillpack", "agent_template", "agent_group", "plugin", "mcp"}:
                     raise PublishAPIError("INVALID_KIND")
                 if method == "records":
                     return {
-                        "records": self.service.records(scope, kind, local_id),
+                        "records": (
+                            self.skillpacks.records(scope, local_id)
+                            if pack_request
+                            else self.service.records(scope, kind, local_id)
+                        ),
                         "identity_verified": False,
                     }
                 source = self._resolver(kind, local_id)
                 if method == "describe":
+                    capability_errors = list(identity_errors)
+                    if pack_request:
+                        from .skillpack_publish_config import skillpack_publish_profile
+
+                        try:
+                            skillpack_publish_profile()
+                        except PublishValidationError as exc:
+                            capability_errors.append({"code": exc.code})
                     return dict(
                         kind=kind,
                         local_id=local_id,
                         defaults=_defaults(kind, local_id, source),
-                        can_publish=True,
+                        can_publish=not capability_errors,
                         hub_url=self.hub_url,
-                        errors=[],
-                        records=self.service.records(scope, kind, local_id),
+                        errors=capability_errors,
+                        records=[] if local_describe else (
+                            self.skillpacks.records(scope, local_id)
+                            if pack_request
+                            else self.service.records(scope, kind, local_id)
+                        ),
                         identity_verified=False,
                     )
                 metadata = params.get("metadata")
@@ -282,6 +363,16 @@ class AssetPublishAPI:
                     metadata.get("version", ""),
                     params.get("target_asset_id") or None,
                 )
+                force = params.get("force", False)
+                if pack_request:
+                    pack_metadata = dict(metadata)
+                    pack_metadata.pop("asset_name", None)
+                    pack_metadata.pop("version", None)
+                    pack_metadata["force"] = force
+                    return await self.skillpacks.prepare(
+                        scope, publisher_id, local_id, identity, pack_metadata,
+                        auth=auth, member_record_scope=member_record_scope,
+                    )
                 prepared = await self.service.prepare(
                     scope,
                     local_id,
@@ -292,15 +383,25 @@ class AssetPublishAPI:
                             for k, v in metadata.items()
                             if k not in {"asset_name", "version"}
                         },
-                        "force": params.get("force", False),
+                        "force": force,
                     },
+                )
+                version_conflict = not force and any(
+                    record.get("package_name") == identity.package_name
+                    and record.get("version") == identity.version
+                    and record.get("execution_status") != "failed"
+                    for record in self.service.records(scope, kind, local_id)
                 )
                 return {
                     **prepared,
                     "artifact_sha256": prepared["checksum_sha256"],
-                    "can_submit": True,
+                    "can_submit": not version_conflict,
                     "warnings": [],
-                    "errors": [],
+                    "errors": (
+                        [{"code": "VERSION_CONFLICT", "field": "version"}]
+                        if version_conflict
+                        else []
+                    ),
                 }
             if method == "commit":
                 return await self.service.commit(
@@ -311,6 +412,10 @@ class AssetPublishAPI:
             raise PublishAPIError("UNKNOWN_METHOD")
         except PublishAPIError:
             raise
+        except HubProtocolError as exc:
+            if getattr(exc, "status_code", None) in {401, 403}:
+                raise PublishAPIError("AUTH_REQUIRED") from None
+            raise PublishAPIError("SKILLPACK_HUB_CHECK_FAILED") from None
         except (PublishStoreError, PackageBuildError) as exc:
             raise PublishAPIError(exc.code) from None
         except PublishValidationError as exc:

@@ -11,6 +11,7 @@ import copy
 import hashlib
 import hmac
 import json
+import logging
 import sqlite3
 import time
 import secrets
@@ -20,9 +21,11 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlsplit
 
+logger = logging.getLogger(__name__)
+
 _ALLOWED = frozenset(
     (
-        'catalog_kind items skills success query count source category_id category_name plugin_type '
+        'catalog_kind items skills success query count source category_id category_name plugin_type skill_type '
         'request_id user_id complete has_more total page page_size asset_id kind package_name '
         'display_name short_description public_latest_version icon_uri tags name summary version '
         'author category native_score updated_at is_team_skill short_desc latest_version score '
@@ -314,10 +317,17 @@ async def cached_asset_catalog(port, kind, *, refresh=False, preload=False):
         # Sanitization may remove a text field containing a signed URL. Rebuild
         # the required card schema with safe defaults; one malformed disk card
         # must never make an otherwise usable catalog fail.
-        fields = {
-            name: item.get(name) if isinstance(item.get(name), str) else ""
-            for name in ("display_name", "short_description", "public_latest_version", "icon_uri", "package_name")
-        }
+        fields = {}
+        for name in (
+            "display_name",
+            "short_description",
+            "public_latest_version",
+            "icon_uri",
+            "package_name",
+            "category_name",
+        ):
+            value = item.get(name)
+            fields[name] = value if isinstance(value, str) else ""
         tags = item.get('tags')
         fields['tags'] = tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, (list, tuple)) else ()
         items.append(HubAssetSummary(kind=kind, asset_id=asset_id, **fields))
@@ -346,12 +356,34 @@ def invalidate_hub_catalog(kind: str):
 
 
 async def start_hub_catalog_preload(skill_manager=None):
-    """Schedule the four configured defaults, returning without network waits."""
+    """Schedule configured catalog defaults without waiting on Hub network I/O.
+
+    Skill Plaza home keys are swarmskill/skill × top_k=6 (see useHubMarketplace).
+    """
     from .hub_asset_port import create_default_hub_asset_port
     port = create_default_hub_asset_port()
-    for kind in ('agent_template', 'plugin', 'mcp'):
+    for kind in ('agent_template', 'agent_group', 'plugin', 'mcp'):
         await cached_asset_catalog(port, kind, preload=True)
-    if skill_manager is not None:
-        await skill_manager.handle_skills_swarm_skills_hub_recommend({
-            'cache_mode': 'prefer_cache', 'top_k': 50,
-        })
+    if skill_manager is None:
+        return
+
+    async def _warm_skill_recommend(plugin_type: str, top_k: int) -> None:
+        try:
+            await skill_manager.handle_skills_swarm_skills_hub_recommend({
+                'cache_mode': 'prefer_cache',
+                'plugin_type': plugin_type,
+                'top_k': top_k,
+            })
+        except Exception:
+            # Preload must not block startup; recommend warm is best-effort.
+            logger.warning(
+                "Hub catalog preload recommend failed plugin_type=%s top_k=%s",
+                plugin_type,
+                top_k,
+                exc_info=True,
+            )
+
+    await asyncio.gather(
+        _warm_skill_recommend('swarmskill', 6),
+        _warm_skill_recommend('skill', 6),
+    )

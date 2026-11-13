@@ -1,4 +1,6 @@
-﻿import {
+
+import { isEnterprise } from '../../edition';
+import {
   useState,
   useRef,
   useCallback,
@@ -20,7 +22,7 @@
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { AtSign, ChevronRight, CircleX, Loader2, Lock, Mic, Plus, Settings, Square, Workflow, X } from 'lucide-react';
+import { AtSign, ChevronRight, CircleX, Infinity as InfinityIcon, ListChecks, Loader2, Lock, Mic, Pencil, Plus, Rocket, Settings, Square, SquarePlay, Workflow, X } from 'lucide-react';
 
 // import { stopAllTts } from '../../utils';
 import {
@@ -31,12 +33,19 @@ import {
   useWorkspaceStore,
   usePersonalContextStore,
 } from '../../stores';
+import { isConversationModelGroupBlocked } from '../../multi-session/state/conversationModelSelection';
+import { useMultiModelCollaborationEnabled } from '../../features/multiModelCollaboration/featureConfig';
 import { seedAgentCatalog, useAgentCatalogStore } from '../../stores/agentCatalogStore';
+import { getSelectedAgentGroup } from '../../stores/agentGroupCatalogSeed';
 import { supportsPlanMode } from '../../features/planMode/wireMode';
+import { isReachableTeamMemberStatus } from '../../features/teamMemberDeparture';
 import { applyPlanToggle, evaluatePlanToggle } from '../../features/planMode/planModeGate';
+import { applyGoalArm, evaluateGoalArm } from '../../features/goalMode/goalModeGate';
 import { queueOrAddGoalObjectiveMessage } from '../../features/goalPendingObjectiveBubble';
+import { OverwriteGoalConfirmModal } from '../GoalBar/OverwriteGoalConfirmModal';
 import { AgentMode, MediaItem, Permission, type ProjectInfo } from '../../types';
 import { NEW_CONVERSATION_ID } from '../../multi-session/state/newConversationLifecycle';
+import { attachmentDraftsBySession, useAttachmentDraftClearNonce } from '../../features/sessionAssets/attachmentDraftRegistry';
 import { ProjectCreateMenu, type ProjectCreateMode } from '../../multi-session/sidebar/ProjectCreateMenu';
 import { projectCreateErrorKey } from '../../multi-session/sidebar/projectCreateErrors';
 import { AGENT_MODE_OPTIONS, PERMISSION_OPTIONS } from '../../config/chatConfig';
@@ -48,6 +57,21 @@ import { FileIcon } from '../FileIcon';
 import { getEvolutionPillLabel } from './evolution-status';
 import { webRequest } from '../../services/webClient';
 import {
+  markUploadDispatched,
+  unmarkUploadDispatched,
+  selectSessionAssets,
+  useSessionAssetsStore,
+} from '../../features/sessionAssets/sessionAssets';
+import {
+  assetKindFromMime,
+  findReferencedAssets,
+  normalizePath,
+  samePath,
+  stemFilename,
+  validateAssetName,
+} from '../../features/sessionAssets/assetReferences';
+import { useSessionArtifacts } from '../ArtifactsPanel';
+import {
   parseSlashLine,
   parseGoalSlashArgs,
   findSlashCommand,
@@ -57,18 +81,33 @@ import {
   type SlashCommandContext,
 } from './slashCommands/registry';
 import {
+  createComposerSkillRange,
+  readComposerSkillPositions,
+  readComposerText,
+  splitComposerSlashChip,
+} from './composerDraftHydrate';
+import {
+  canUseSlashCommand,
   getWebSlashCommandsForMode,
   hasUnfinishedGoal as isUnfinishedGoal,
   isSlashCommandDisabledByGoal,
+  resolveSlashCommandDescription,
   shouldExecuteRegisteredSlashCommand,
 } from './slashCommands/semantics';
+import {
+  getSkillArgumentSuggestion,
+  getSkillArgumentReplacement,
+  filterSkillSuggestions,
+  type SkillSuggestion,
+} from './slashCommands/skillArgumentCompletion';
 import { withUploadDocumentBlock } from '../../utils/documentMessage';
+import { planUnsentImageDiscard, type UnsentImageDraft } from './unsentImageDiscard';
 import { ExtensionPickerPanel } from './ExtensionPickerPanel';
 import { SkillPickerPanel } from './SkillPickerPanel';
 import { PickerPanel } from './PickerPanel';
 import { PickerSearchInput } from './PickerSearchInput';
 import { Switch } from '../Switch';
-import { Input } from '../ui';
+import { Button, CloseButton, Dialog, Input } from '../ui';
 import { Select } from '../ui/Select/Select';
 import { ExtensionIcon } from '../ConnectorMarket/icons';
 import {
@@ -87,18 +126,24 @@ import { useDesktopLocalFilePickerReady } from '../../hooks';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
 import { getInputProjectOptions, isDefaultInputProject } from './projectSelection';
 import {
+  canRetryAttachmentDraft,
+  DESKTOP_CLIPBOARD_IMAGES_EVENT,
   getClipboardImageFiles,
+  inspectClipboardImageFiles,
   IMAGE_INPUT_DISABLED_ALERT_KEY,
   isImageInputDisabled,
+  resolveImageMimeType,
   shouldAlertImagePasteDisabled,
+  type DesktopClipboardImagesEventDetail,
 } from './clipboardImagePaste';
 import AgentPickerIcon from '../../assets/agent-management/智能体选择.svg?react';
 import AttachmentIcon from '../../assets/agent-management/attachment.svg?react';
 import GoalIcon from '../../assets/agent-management/goal.svg?react';
 import PlanIcon from '../../assets/agent-management/planned-events.svg?react';
 import SkillIcon from '../../assets/agent-management/agent-skill.svg?react';
+import CommandIcon from '../../assets/chat/command.svg?react';
 import closeSvg from '../../assets/work-mode/close.svg?raw';
-
+import { insertPlainText } from '../../utils/textEditCommands';
 // 个人上下文图标——文档/知识库隐喻，与 SessionSidebar 的 personalContextNavIcon 同源内联 SVG。
 function PersonalContextIcon(props: SVGProps<SVGSVGElement>) {
   return (
@@ -121,6 +166,18 @@ function PersonalContextIcon(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+import { TeamSelector } from './TeamSelector';
+import { resolveOrganizationTeamIdentity } from '../../features/teamOrganization/teamIdentity';
+import { useTeamSelectorStore } from '../../stores/teamSelectorStore';
+import { useTeamOrganizationUiEnabled } from '../../features/teamOrganization/featureConfig';
+import { useOrganizationProcessing } from '../../features/teamOrganization/processing';
+import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
+import { resolveTeamGroupDisplayName } from '../../features/teamGroupIdentity';
+import {
+  resolveTeamBootstrapMode,
+  resolveTeamDispatchMode,
+  useTeamScheduledDispatchEnabled,
+} from '../../features/teamDispatch/featureConfig';
 
 const MENU_GAP = 10;
 /** 智能体选择列表单行高度（与 ChatPanel.css 的 .chat-agent-picker__item min-height 一致） */
@@ -137,6 +194,8 @@ const GROUP_PICKER_ROW_HEIGHT = 40;
 function isSameAgentOption(item: AgentCatalogItem, selectedId: string | null): boolean {
   return selectedId !== null && (item.id === selectedId || item.runtimePackageName === selectedId);
 }
+/** 「+」菜单含文件/技能/计划/目标/设计。欢迎页若按 200px 判断向下展开，底部「设计」会被视口裁掉。 */
+const ATTACH_MENU_ESTIMATED_HEIGHT = 360;
 
 function resolveMenuDirection(anchorBottom: number, menuHeight: number) {
   const spaceBelow = window.innerHeight - anchorBottom - MENU_GAP;
@@ -149,17 +208,24 @@ import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import { CodeBranchSelector } from '../../features/code-mode/CodeBranchSelector';
 import { generateUuidV4 } from '../../utils/uuid';
 import { buildInstalledSkillNames, filterEnabledMySkills } from '../../utils/mySkills';
+import { contextCompressionElapsedText, resolveCompactStartedAt } from '../../utils/contextCompression';
+import { useElapsedSeconds } from '../../hooks/useCompressionElapsed';
 import {
   createAgentManagementClient,
   createAgentGroupManagementClient,
   getAgentAvatarUrl,
+  isAgentGroupSelected,
+  isExternalHarnessCatalogItem,
   type AgentCatalogItem,
   type AgentGroupCatalogItem,
   type AgentGroupIdentity,
 } from '../../features/agentManagement';
+import { DESIGNER_REF_MAX_INLINE_BYTES } from '../../features/designer/designerReferences';
 import { ContextUsageIndicator } from './ContextUsageIndicator';
 import { isImeCompositionKey } from './imeComposition';
 import { useTaskAsr } from '../../features/taskAsr/useTaskAsr';
+import { RecordingWaveform } from '../../features/taskAsr/RecordingWaveform';
+import { useTaskAsrEnabled } from '../../features/taskAsr/featureFlag';
 import { ApplicationPluginTaskInputActions } from '../../applicationPlugins/ApplicationPluginOutlet';
 
 /** 输入栏下拉所需的最小技能数据结构（与 SkillPanel 中的 SkillItem 保持一致） */
@@ -174,12 +240,13 @@ type InputAreaSkillItem = {
   enabled?: boolean;
   installed?: boolean;
   tags?: string[];
-  skill_type?: 'skill' | 'swarm_skill' | 'multimodal_skill';
+  skill_type?: 'skill' | 'skillpack' | 'swarm_skill' | 'multimodal_skill';
 };
 
 type SlashCommandMeta = {
   name: string;
   description: string;
+  description_i18n?: Record<string, string>;
   usage?: string;
   takesArgs?: boolean;
   execution?: string;
@@ -206,23 +273,34 @@ type InputAreaTeamMember = {
   status?: string;
 };
 
-type ComposerSuggestionKind = 'member' | 'role' | 'slash';
+const EMPTY_SKILLS: string[] = [];
+const EMPTY_TEAM_MEMBERS: InputAreaTeamMember[] = [];
+
+type ComposerSuggestionKind = 'member' | 'role' | 'slash' | 'skill';
 type WorkIconName = 'add' | 'arrow' | 'check' | 'close' | 'collapse' | 'expand' | 'folder' | 'search';
 
-type ComposerSuggestionState = {
-  kind: ComposerSuggestionKind;
-  query: string;
-};
+type ComposerSuggestionState =
+  | {
+      kind: Exclude<ComposerSuggestionKind, 'skill'>;
+      query: string;
+    }
+  | SkillSuggestion;
 
 type ComposerSuggestionItem = {
   id: string;
   label: string;
   status?: string;
   description?: string;
-  itemKind?: 'command' | 'skill';
+  itemKind?: 'command' | 'skill' | 'asset';
   takesArgs?: boolean;
   disabled?: boolean;
   disabledReason?: string;
+  /** 素材候选项的真实缩略图（本地 blob URL）；没有时列表退回按文件类型显示通用图标，
+   *  不再借团队成员那套"按 id 生成"的头像（那套头像和上传的文件内容毫无关系）。 */
+  previewUrl?: string;
+  /** 素材在磁盘上的绝对路径。图标兜底时要用它判类型：素材名常常没有扩展名
+   *  （如 `serum`、`Scene1_Shot1-1_OS10s`），只看名字会退回"未知类型"的灰色问号图标。 */
+  assetPath?: string;
 };
 
 function getComposerSuggestionItems(
@@ -233,9 +311,9 @@ function getComposerSuggestionItems(
   isTeamMode: boolean,
 ): ComposerSuggestionItem[] {
   if (!suggestion) return [];
-  if (suggestion.kind === 'slash') {
+  if (suggestion.kind === 'slash' || suggestion.kind === 'skill') {
     const query = suggestion.query.trim().toLowerCase();
-    const commands = slashCommands
+    const commands = (suggestion.kind === 'skill' ? [] : slashCommands)
       .filter((command) => !query || command.name.toLowerCase().includes(query))
       .map((command) => ({
         id: command.name,
@@ -244,18 +322,7 @@ function getComposerSuggestionItems(
         itemKind: 'command' as const,
         takesArgs: command.takesArgs,
       }));
-    const skills = slashSkills
-      .filter((skill) =>
-        isTeamMode ? skill.skill_type === 'swarm_skill' : !skill.skill_type || skill.skill_type === 'skill',
-      )
-      .filter((skill) => {
-        if (!query) return true;
-        return [skill.name, skill.display_name, skill.description]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase()
-          .includes(query);
-      })
+    const skills = filterSkillSuggestions(slashSkills, query, isTeamMode, suggestion.kind === 'skill')
       .map((skill) => ({
         id: skill.name,
         label: skill.display_name || skill.name,
@@ -288,13 +355,17 @@ function isDefaultProject(project: ProjectInfo): boolean {
 interface InputAreaProps {
   onSubmit: (content: string, mediaItems?: MediaItem[]) => void;
   onEnsureSession: (initialTitle?: string) => Promise<string | null>;
-  onNewSession: () => void;
   onForkSession: (sourceSessionId: string) => Promise<void>;
-  onStartSideConversation: (sourceSessionId: string, prompt?: string) => Promise<void>;
   /** Signals that the user is editing an existing real Session. */
   onInputIntent?: (sessionId: string) => void;
+  /** Tab or → in the empty composer; returns true when it filled the composer, which then keeps focus. */
+  onEmptyComposerTab?: () => boolean;
+    /** The next question shown in the empty composer after an answer, independent of timeline visibility. */
+  suggestionPlaceholder?: string | null;
   onPersistMedia: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
   onPersistDocuments: (content: string, mediaItems: MediaItem[]) => Promise<PersistMediaResponse>;
+  /** Delete an unsent image copy under the session uploads directory. */
+  onDiscardMedia?: (sessionId: string, path: string) => Promise<unknown>;
   onInterrupt: (newInput?: string) => void;
   onCancel: () => void;
   onSwitchMode: (mode: AgentMode) => void;
@@ -336,7 +407,7 @@ function clipboardHasFileItems(clipboardData: DataTransfer | null | undefined): 
 
 const ACCEPTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 /**
- * Keep in sync with jiuwenswarm/gateway/document_attachments.py
+ * Keep in sync with gateway/document_attachments.py
  * FORBIDDEN_DOCUMENT_EXTENSIONS.
  */
 const FORBIDDEN_DOCUMENT_EXTENSIONS = new Set([
@@ -437,12 +508,14 @@ const ATTACHMENT_ACCEPT = [
   .filter((item) => !FORBIDDEN_DOCUMENT_EXTENSIONS.has(item.toLowerCase()))
   .join(',');
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v']);
+const AUDIO_EXTENSIONS = new Set(['.mp3', '.wav', '.aac', '.flac', '.ogg', '.m4a']);
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_ATTACHMENT_COUNT = 20;
 const ATTACHMENT_ALERT_DURATION_MS = 3000;
 
-type AttachmentKind = 'image' | 'document';
+type AttachmentKind = 'image' | 'video' | 'audio' | 'document';
 type AttachmentStatus = 'uploading' | 'ready' | 'error';
 
 interface AttachmentDraft {
@@ -459,7 +532,39 @@ interface AttachmentDraft {
   file?: File;
   /** Absolute local path from desktop native picker (WebView2 has no File.path). */
   localPath?: string;
+  /** 用户在卡片上给这个文件起的素材名（之后可用 @名称 引用）；没改过就用文件名。 */
+  assetName?: string;
 }
+
+// ChatPanel/InputArea is unmounted when navigating between some conversation
+// surfaces (notably an existing session and the new-conversation page). Keep
+// unsent attachment drafts at module scope so that navigation does not discard
+// a session's composer state. The persisted image itself already lives under
+// that session's uploads directory; this map preserves only the pending UI draft.
+// Lives in a shared module (not declared here) so multi-session/state/newConversationLifecycle.ts
+// can clear the 'new' entry when a genuinely fresh new conversation starts, without
+// an import cycle (that module is itself imported below for NEW_CONVERSATION_ID).
+
+// Session-asset registration bookkeeping for composer attachment drafts and agent-
+// generated artifacts. Module scope, NOT useRef: InputArea unmounts and remounts
+// across the same surfaces that make attachmentDraftsBySession module-level (see
+// above) -- a useRef would reset to empty on every remount, while a restored draft
+// keeps its id (attachmentDraftsBySession) and a restored artifact keeps its path
+// (useSessionArtifacts), so the registration effect below would read them as "never
+// attempted" and register a duplicate session asset every time. Backend registration
+// is deliberately not idempotent per path (session_assets.py), so there is no safety
+// net underneath this -- these four structures are it. They live for the page's whole
+// lifetime, independent of which component instance or session is currently mounted.
+const attemptedAssetPaths = new Set<string>();
+const attemptedDraftIds = new Set<string>();
+// draftId -> the asset_id the registration effect recorded for it; releaseUnsentUploads
+// (cancel) looks this up by draft id to delete exactly that draft's own asset, never by
+// path (the same path can legitimately back more than one asset).
+const draftAssetIdByDraftId = new Map<string, string>();
+// draftIds canceled while their registration request was still in flight: when the
+// response lands, the asset it created is deleted immediately instead of being kept
+// as an orphan.
+const canceledDraftIds = new Set<string>();
 
 interface AttachmentAlert {
   id: string;
@@ -501,9 +606,23 @@ function attachmentToMediaItem(attachment: AttachmentDraft): MediaItem {
     mimeType,
     mime_type: mimeType,
     filename,
+    // 卡片上重命名过的话，历史消息里的这张卡片也要显示新名字，而不是落盘时用的存储文件名
+    // （大图走 HTTP bridge 落盘后，文件名是服务端生成的随机 id，和用户看到的完全对不上）。
+    ...(attachment.assetName ? { displayName: attachment.assetName } : {}),
+    // session.assets.register 的 client_id：见 types/message.ts 的字段注释。
+    clientId: attachment.id,
     ...(path ? { path } : { base64Data: attachment.base64Data }),
     sizeBytes,
     size_bytes: sizeBytes,
+  };
+}
+
+function toUnsentImageDraft(draft: AttachmentDraft): UnsentImageDraft {
+  return {
+    id: draft.id,
+    kind: draft.kind,
+    status: draft.status,
+    persistedPath: pickString(draft.persistedMediaItem?.path),
   };
 }
 
@@ -562,24 +681,47 @@ function getLocalFilePath(file: File | undefined, explicitPath?: string): string
   return undefined;
 }
 
+function isVideoFile(file: File): boolean {
+  if (file.type.startsWith('video/')) return true;
+  return VIDEO_EXTENSIONS.has(getFileExtension(file.name || ''));
+}
+
+function isAudioFile(file: File): boolean {
+  if (file.type.startsWith('audio/')) return true;
+  return AUDIO_EXTENSIONS.has(getFileExtension(file.name || ''));
+}
+
 /** Classify a picked file for routing to media.persist vs document.persist. */
-function resolveAttachmentKind(file: File): AttachmentKind | null {
+function resolveAttachmentKind(file: File, designMode: boolean): AttachmentKind | null {
   if (isImageFile(file)) return 'image';
+  if (designMode && isVideoFile(file)) return 'video';
+  if (designMode && isAudioFile(file)) return 'audio';
   if (isForbiddenDocumentFile(file)) return null;
   return 'document';
+}
+
+function getMediaValidationError(file: File, t: TFunction, maxBytes: number): string | null {
+  if (file.size > maxBytes) {
+    return t('chat.inputAttachment.fileSizeExceeded', {
+      name: file.name || t('chat.inputAttachment.unnamedFile'),
+      limit: formatAttachmentSize(maxBytes),
+    });
+  }
+  return null;
 }
 
 function getImageValidationError(file: File, t: TFunction): string | null {
   if (!isImageFile(file)) {
     return t('chat.inputAttachment.unsupportedFileType', { name: file.name || t('chat.inputAttachment.unnamedFile') });
   }
-  if (file.size > MAX_FILE_BYTES) {
-    return t('chat.inputAttachment.fileSizeExceeded', {
-      name: file.name || t('chat.inputAttachment.unnamedFile'),
-      limit: formatAttachmentSize(MAX_FILE_BYTES),
-    });
+  return getMediaValidationError(file, t, MAX_IMAGE_BYTES);
+}
+
+function getAvValidationError(file: File, t: TFunction): string | null {
+  if (!isVideoFile(file) && !isAudioFile(file)) {
+    return t('chat.inputAttachment.unsupportedFileType', { name: file.name || t('chat.inputAttachment.unnamedFile') });
   }
-  return null;
+  return getMediaValidationError(file, t, MAX_FILE_BYTES);
 }
 
 function clearAttachmentAlertTimers(timers: Map<string, number>): void {
@@ -593,7 +735,7 @@ function getDocumentValidationError(
   options?: { filename?: string; localPath?: string },
 ): string | null {
   const filename = options?.filename || file?.name || t('chat.inputAttachment.unnamedFile');
-  if (file && file.size > MAX_FILE_BYTES) {
+  if (file && !getLocalFilePath(file, options?.localPath) && file.size > MAX_FILE_BYTES) {
     return t('chat.inputAttachment.fileSizeExceeded', { name: filename, limit: formatAttachmentSize(MAX_FILE_BYTES) });
   }
   if (file && isForbiddenDocumentFile(file)) {
@@ -659,12 +801,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   {
     onSubmit,
     onEnsureSession,
-    onNewSession,
     onForkSession,
-    onStartSideConversation,
     onInputIntent,
+    onEmptyComposerTab,
+    suggestionPlaceholder,
     onPersistMedia,
     onPersistDocuments,
+    onDiscardMedia,
     onInterrupt,
     onCancel,
     onSwitchMode,
@@ -684,9 +827,20 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   },
   ref,
 ) {
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
   const [speechError, setSpeechError] = useState('');
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
-  const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
+  const [attachments, setAttachments] = useState<AttachmentDraft[]>(() =>
+    activeSessionId ? ((attachmentDraftsBySession.get(activeSessionId) as AttachmentDraft[] | undefined) ?? []) : [],
+  );
+  // 当前 `attachments` state 实际对应的 session（和 activeSessionId 分开追踪）：切换会话时
+  // activeSessionId 在本次渲染就已经更新，但 attachments 还要等切换 session 的 effect 跑完
+  // 才会重置成目标会话的草稿。切会话瞬间两者短暂不一致，谁依赖 attachments 做跨会话操作
+  // （比如把它们注册成任务素材）都要先核对这个 ref，否则会把上一个会话的草稿误登记到新会话。
+  const attachmentSessionIdRef = useRef(activeSessionId);
+  // 系统文件选择器把文件交给浏览器之前不会触发 change；先展示准备态，
+  // 避免选择确认后输入框长时间没有任何反馈（issue #6493）。
+  const [isPreparingFiles, setIsPreparingFiles] = useState(false);
   const [attachmentAlerts, setAttachmentAlerts] = useState<AttachmentAlert[]>([]);
   const attachmentAlertTimersRef = useRef<Map<string, number>>(new Map());
   const [attachmentMenuId, setAttachmentMenuId] = useState<string | null>(null);
@@ -701,10 +855,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [projectCreateMode, setProjectCreateMode] = useState<ProjectCreateMode>('blank');
   const [menuDirection, setMenuDirection] = useState<'up' | 'down'>('up');
   const [agentPickerOpen, setAgentPickerOpen] = useState(false);
+  const [groupRuntimeNotice, setGroupRuntimeNotice] = useState<string | null>(null);
+  const [externalAgentSwitchNotice, setExternalAgentSwitchNotice] = useState<string | null>(null);
   const [agentPickerQuery, setAgentPickerQuery] = useState('');
   const [pickerTab, setPickerTab] = useState<'agent' | 'group'>('agent');
   const { tooltip: agentTooltipNode, handlers: agentTooltipHandlers } = useAdaptiveTooltip({ offsetX: -50 });
   const { tooltip: attachTooltipNode, handlers: attachTooltipHandlers } = useAdaptiveTooltip({ placement: 'top' });
+  const { tooltip: uploadLimitsTooltipNode, handlers: uploadLimitsTooltipHandlers } = useAdaptiveTooltip({
+    placement: 'right',
+    multiline: true,
+  });
   const { tooltip: micTooltipNode, handlers: micTooltipHandlers } = useAdaptiveTooltip();
   const { tooltip: sendTooltipNode, handlers: sendTooltipHandlers } = useAdaptiveTooltip();
   const { tooltip: workClearTooltipNode, handlers: workClearTooltipHandlers } = useAdaptiveTooltip({
@@ -722,8 +882,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     () => useAgentCatalogStore.getState().catalog ?? [],
   );
   const [agentOptionsStatus, setAgentOptionsStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [agentPodNotice, setAgentPodNotice] = useState<'starting' | 'timeout' | null>(null);
   const agentManagementClient = useMemo(() => createAgentManagementClient(), []);
-  const [groupOptions, setGroupOptions] = useState<AgentGroupCatalogItem[]>([]);
+  const [groupOptions, setGroupOptions] = useState<AgentGroupCatalogItem[]>(
+    () => [getSelectedAgentGroup()].filter((group): group is AgentGroupCatalogItem => group !== null),
+  );
   const [groupOptionsStatus, setGroupOptionsStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [failedGroupAvatarIds, setFailedGroupAvatarIds] = useState<ReadonlySet<string>>(() => new Set());
   const groupManagementClient = useMemo(() => createAgentGroupManagementClient(), []);
@@ -733,6 +896,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const timeoutId = window.setTimeout(() => setProjectDirError(null), 3000);
     return () => window.clearTimeout(timeoutId);
   }, [projectDirError, workDialogOpen]);
+
+  // bugfix 2026092201 bug001 子问题 1：覆盖已有目标时改用自定义弹窗（OverwriteGoalConfirmModal）
+  // 取代 window.confirm。confirmGoalOverwrite 把参数存进这个 state、返回一个等按钮点击才
+  // resolve 的 Promise；两处需要"确认覆盖"的调用点（handleSubmit 整行提交 / 建议菜单选中后
+  // 立即执行）都改用同一个 useCallback，不再各自内联 window.confirm。
+  const [goalOverwriteRequest, setGoalOverwriteRequest] = useState<{
+    currentObjective: string;
+    requestedObjective: string;
+    resolve: (confirmed: boolean) => void;
+  } | null>(null);
+  const confirmGoalOverwrite = useCallback(
+    (currentObjective: string, requestedObjective: string) =>
+      new Promise<boolean>((resolve) => {
+        setGoalOverwriteRequest({ currentObjective, requestedObjective, resolve });
+      }),
+    [],
+  );
 
   const [composerSuggestion, setComposerSuggestion] = useState<ComposerSuggestionState | null>(null);
   const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(0);
@@ -769,23 +949,65 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const composerFrameRef = useRef<HTMLDivElement>(null);
   const composerSuggestionMenuRef = useRef<HTMLDivElement>(null);
   const compactingSessionIdsRef = useRef<Set<string>>(new Set());
+  const compactStartedAtRef = useRef<Map<string, number>>(new Map());
   const skillPanelRef = useRef<HTMLDivElement>(null);
   const swarmflowConfigBtnRef = useRef<HTMLButtonElement>(null);
   const swarmflowConfigPanelRef = useRef<HTMLDivElement>(null);
   const attachmentMenuTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attachmentMenuOpenedByLongPressRef = useRef(false);
   const isComposingRef = useRef(false);
-  const { t } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const { t, i18n } = useTranslation();
+  const organizationEnabled = useTeamOrganizationUiEnabled();
+  const organizationTeamUnavailable = useTeamSelectorStore((s) => {
+    if (!organizationEnabled || !activeSessionId) return false;
+    const runtime = s.runtimes[activeSessionId];
+    return runtime?.teams.find((team) => team.team_id === runtime.selectedTeamId)?.available === false;
+  });
+  const agentGroupUnavailable = useChatStore(
+    (s) => s.runtimes[activeSessionId ?? '']?.agentGroupUnavailable ?? false,
+  );
   const hasPendingQuestion = useChatStore((s) => Boolean(s.runtimes[activeSessionId ?? '']?.pendingQuestions[0]));
   const isCompactRunning = Boolean(activeSessionId && compactingSessionIds.has(activeSessionId));
+  // 起始时刻按会话记录；这里按当前活跃会话取值，避免多会话并发压缩时读到别的会话的起点。
+  const compactStartedAt = resolveCompactStartedAt(compactStartedAtRef.current, activeSessionId);
+  const compactElapsedSeconds = useElapsedSeconds(compactStartedAt, isCompactRunning);
   // 并行场景：一个 agent 等人工、其它 agent 还在跑时开放输入以便 supplement，故要
   // pendingQuestion 且无 running agent 才锁（而不是有 pendingQuestion 即锁）。
   const hasRunningAgent = useSessionStore((s) => {
     const runs = s.runtimes[activeSessionId ?? '']?.workflowRuns ?? [];
     return runs.some((run) => run.phases?.some((phase) => phase.agents?.some((agent) => agent.status === 'running')));
   });
-  const composerDisabled = isCompactRunning || (hasPendingQuestion && !hasRunningAgent);
+  const workMode = useWorkspaceStore((state) => state.workMode);
+  // Design mode reuses this composer for the old DesignerLanding page. The first
+  // prompt is a one-shot compose: no abort, and no second prompt while it runs.
+  const isDesignLanding = workMode === 'design' && activeSessionId === NEW_CONVERSATION_ID;
+  const designLandingSubmitting = isDesignLanding && isProcessing;
+  const composerDisabled =
+    agentGroupUnavailable ||
+    organizationTeamUnavailable ||
+    isCompactRunning ||
+    (hasPendingQuestion && !hasRunningAgent) ||
+    designLandingSubmitting;
+
+  useEffect(() => {
+    if (!designLandingSubmitting) return;
+    setAttachMenuOpen(false);
+    setAgentPickerOpen(false);
+    setExtensionPanelOpen(false);
+    setSkillPanelOpen(false);
+  }, [designLandingSubmitting]);
+  const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
+  const collaborationEnabled = useMultiModelCollaborationEnabled();
+  const selectedModelSelection = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.selectedModelSelection);
+  const selectionMetadata = useSessionStore((s) => s.currentSession?.session_id === activeSessionId
+    ? s.currentSession
+    : s.sessions.find((session) => session.session_id === activeSessionId));
+  const modelGroupSendBlocked = !isDesignLanding && !isProcessing && isConversationModelGroupBlocked({
+    mode,
+    cronId: selectionMetadata?.cron_id,
+    selectedModelSelection,
+    collaborationEnabled,
+  });
   const selectedAgentId = useSessionStore((s) => {
     const runtime = s.runtimes[activeSessionId ?? ''];
     if (runtime?.mode !== 'agent') return null;
@@ -817,12 +1039,32 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const intent = runtime.agentGroupSelectionIntent;
     return intent?.kind === 'select' ? intent.id : null;
   });
+  const organizationUiEnabled = useTeamOrganizationUiEnabled();
+  const organizationTeam = useTeamSelectorStore((s) => {
+    if (!organizationUiEnabled || !activeSessionId) return undefined;
+    const runtime = s.runtimes[activeSessionId];
+    return runtime?.teams.find((team) => team.team_id === runtime.selectedTeamId && team.organization_id);
+  });
   const agentGroupBinding = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.agentGroupBinding ?? null);
   const agentGroupBindingPending = useSessionStore(
     (s) => s.runtimes[activeSessionId ?? '']?.agentGroupBindingPending ?? null,
   );
   const agentGroupLocked = Boolean(agentGroupBinding || agentGroupBindingPending);
-  const selectedGroup = groupOptions.find((item) => item.id === selectedGroupId) ?? null;
+  const selectedGroup = groupOptions.find((item) => item.name === selectedGroupId || item.id === selectedGroupId) ?? null;
+  const displayedGroupId = organizationTeam ? organizationTeam.agent_group_name?.trim() || null : selectedGroupId;
+  const conversationId = useOrganizationConversationKey(activeSessionId);
+  const groupSnapshot = useSessionStore((s) => s.runtimes[conversationId]?.teamGroupIdentity ?? null);
+  const catalogGroup = useMemo(
+    () => (organizationTeam ? resolveOrganizationTeamIdentity(organizationTeam, groupOptions) : selectedGroup),
+    [organizationTeam, groupOptions, selectedGroup],
+  );
+  const displayedGroup = catalogGroup ?? (
+    groupSnapshot && (groupSnapshot.name === displayedGroupId || groupSnapshot.id === displayedGroupId)
+      ? groupSnapshot
+      : null
+  );
+  const displayedGroupName = resolveTeamGroupDisplayName(displayedGroup, i18n.language) || displayedGroupId;
+  const organizationGroupCatalogNeeded = Boolean(organizationTeam?.agent_group_name);
   const installedGroupOptions = useMemo(
     () => groupOptions.filter((item) => item.installed && item.capabilities.canUse),
     [groupOptions],
@@ -839,16 +1081,28 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   useEffect(() => {
     if (!onAgentGroupIdentityChange) return;
-    onAgentGroupIdentityChange(selectedGroupId && selectedGroup ? selectedGroup : null);
-  }, [onAgentGroupIdentityChange, selectedGroup, selectedGroupId]);
+    // 卸载后的已绑定专家团不再出现在本地目录，但历史消息仍需要使用
+    // 原来的本地化展示名；只有确实没有选中专家团时才清空会话身份。
+    if (displayedGroup) {
+      onAgentGroupIdentityChange(displayedGroup);
+    } else if (!displayedGroupId) {
+      onAgentGroupIdentityChange(null);
+    }
+  }, [onAgentGroupIdentityChange, displayedGroup, displayedGroupId]);
 
   useEffect(() => {
     if (!activeSessionId || (pickerTab !== 'agent' && !selectedAgentId) || (!agentPickerOpen && !selectedAgentId))
       return;
     let cancelled = false;
     setAgentOptionsStatus('loading');
+    setAgentPodNotice(null);
     void agentManagementClient
-      .listCatalog({ filter: 'mine' })
+      .listCatalog({
+        filter: 'mine',
+        onPodStarting: () => {
+          if (!cancelled) setAgentPodNotice('starting');
+        },
+      })
       .then((items) => {
         if (cancelled) return;
         const selectedItem = selectedAgentId ? items.find((item) => isSameAgentOption(item, selectedAgentId)) : null;
@@ -864,10 +1118,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         }
         setAgentOptions(items);
         seedAgentCatalog(items);
+        setAgentPodNotice(null);
         setAgentOptionsStatus('success');
       })
-      .catch(() => {
-        if (!cancelled) setAgentOptionsStatus('error');
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code ?? '') : '';
+        setAgentPodNotice(code === 'pod_start_timeout' ? 'timeout' : null);
+        setAgentOptionsStatus('error');
       });
     return () => {
       cancelled = true;
@@ -875,7 +1133,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [activeSessionId, agentManagementClient, agentPickerOpen, pickerTab, selectedAgentId]);
 
   useEffect(() => {
-    if (!activeSessionId || (!agentPickerOpen && !selectedGroupId) || (pickerTab !== 'group' && !selectedGroupId))
+    if (
+      !activeSessionId ||
+      (!agentPickerOpen && !selectedGroupId && !organizationGroupCatalogNeeded) ||
+      (pickerTab !== 'group' && !selectedGroupId && !organizationGroupCatalogNeeded)
+    )
       return;
     let cancelled = false;
     setGroupOptionsStatus('loading');
@@ -892,7 +1154,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId, agentPickerOpen, groupManagementClient, pickerTab, selectedGroupId]);
+  }, [activeSessionId, agentPickerOpen, groupManagementClient, pickerTab, selectedGroupId, organizationGroupCatalogNeeded]);
 
   useEffect(() => {
     if (attachMenuOpen) return;
@@ -900,15 +1162,17 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setAgentPickerQuery('');
     setPickerTab('agent');
   }, [attachMenuOpen]);
-  const isPaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isPaused ?? false);
+  const conversationIsPaused = useChatStore((s) => s.runtimes[conversationId]?.isPaused ?? false);
+  const organizationIsProcessing = useOrganizationProcessing(activeSessionId);
+  const isPaused = conversationIsPaused;
+  const ownerOrganizationIsProcessing = conversationId === activeSessionId && organizationIsProcessing;
   const queuePaused = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.queuePaused ?? false);
   const isLoadingHistory = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.isLoadingHistory ?? false);
   const inputValue = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.inputValue ?? '');
   const evolutionStatus = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.evolutionStatus ?? null);
-  const mode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.mode ?? 'agent');
-  const selectedSkills = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.selectedSkills ?? []);
+  const selectedSkills = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.selectedSkills ?? EMPTY_SKILLS);
   const teamMembers = useSessionStore(
-    (s) => s.runtimes[activeSessionId ?? '']?.teamMembers ?? [],
+    (s) => s.runtimes[conversationId]?.teamMembers ?? EMPTY_TEAM_MEMBERS,
   ) as InputAreaTeamMember[];
   const currentSession = useSessionStore((s) => s.currentSession);
   const activeSession = useSessionStore((s) => {
@@ -917,9 +1181,18 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     return s.sessions.find((session) => session.session_id === activeSessionId) ?? null;
   });
   const canPersistAttachments = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
-  const { workMode, projects, selectedProject, setSelectedProject, createProject } = useWorkspaceStore();
+  const { projects, selectedProject, setSelectedProject, createProject } = useWorkspaceStore();
   const loadedMsgLen = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.messages?.length ?? 0);
   const hasHistory = (currentSession?.message_count ?? 0) > 0 || loadedMsgLen > 0;
+  const externalAgentSwitchBlocked = Boolean(
+    activeSessionId && activeSessionId !== NEW_CONVERSATION_ID && hasHistory,
+  );
+
+  useEffect(() => {
+    if (!externalAgentSwitchNotice) return;
+    const timer = window.setTimeout(() => setExternalAgentSwitchNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [externalAgentSwitchNotice]);
   const goalArmed = useGoalStore((s) => s.runtimes[activeSessionId ?? '']?.armed ?? false);
   const currentGoal = useGoalStore((s) => s.runtimes[activeSessionId ?? '']?.goal ?? null);
   // 目标 active 时普通发送改走排队，而不是文档 §5.1 原定的 input_mode:'steer' 实时插话——
@@ -931,13 +1204,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const isInterruptible = isProcessing || isPaused || isGoalActive;
   const isAgentMode = mode === 'agent';
   const isTeamMode = mode === 'team';
+  const enterprise = isEnterprise();
+  const modeLocked = enterprise || hasHistory || isProcessing;
+
+  useEffect(() => {
+    if (enterprise && activeSessionId === NEW_CONVERSATION_ID && mode !== 'agent') {
+      onSwitchMode('agent');
+    }
+  }, [enterprise, activeSessionId, mode, onSwitchMode]);
   const isAutoHarnessMode = mode === 'auto_harness';
   const existingTeamGroupSelectionDisabled = Boolean(
     isTeamMode && activeSessionId !== NEW_CONVERSATION_ID && !agentGroupBinding && !agentGroupBindingPending,
   );
   const agentGroupPickerLocked = agentGroupLocked || existingTeamGroupSelectionDisabled;
+  const teamGroupSelectionActive = isTeamMode && Boolean(selectedGroupId);
+  const teamSkillSelectionActive = isTeamMode && selectedSkills.length > 0;
   const agentSelectionDisabled = isTeamMode;
-  const agentGroupSelectionDisabled = isAgentMode || agentGroupPickerLocked;
+  const agentGroupSelectionDisabled = isAgentMode || agentGroupPickerLocked || teamSkillSelectionActive;
 
   useEffect(() => {
     if (!isTeamMode && !isAgentMode) return;
@@ -947,24 +1230,25 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [isAgentMode, isTeamMode]);
 
   const isWorkContextLocked = Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID);
-  const showWorkContextRow = activeSessionId === NEW_CONVERSATION_ID;
+  const showWorkContextRow = !enterprise && activeSessionId === NEW_CONVERSATION_ID;
   /** Goal 入口是否适用于当前上下文（agent 模式 + 已接入 onSetGoal，如欢迎页新会话就不适用） */
-  const canUseGoalMenu = isAgentMode && Boolean(onSetGoal);
-  // 只跟 armed 挂钩：这个 tag 是"下一条消息将用于设置目标"的过渡态指示，发送后 armed 变 false
-  // 就该跟着消失，不能靠"目标是否存在"续命——目标存在与否、当前状态、编辑/暂停/删除，已经由
-  // 输入框上方常驻的 GoalBar 完整覆盖，工具栏这里再挂一份重复的常驻入口只会显得"选择没解除"。
-  const goalTagVisible = canUseGoalMenu && goalArmed;
+  const canUseGoalMenu = !enterprise && isAgentMode && Boolean(onSetGoal);
+  // bugfix 2026092201 bug001 第2轮修订：原来只跟 armed 挂钩（发送后 armed 变 false 就消失，
+  // 理由是"目标是否存在"已由 GoalBar 覆盖，工具栏不需要重复常驻）。但这样一来目标在真正执行
+  // 期间（armed 已经变 false、hasUnfinishedGoal 才是 true）这个 tag 会凭空消失，跟 Plan 的
+  // tag（跟 planActive 走、整个执行期间常驻）体验不一致，用户测试后明确要求对齐 Plan——所以
+  // 改成跟"+"菜单开关的 `goalChecked` 同一个公式：武装中或者真有未完成目标都要显示，关闭按钮
+  // 会在下面按 evaluateGoalArm 的"关闭方向"结果做忙态保护，不会出现"tag 一直在、点了却把执行
+  // 中的目标误关掉"的问题。
+  const goalTagVisible = canUseGoalMenu && (goalArmed || hasUnfinishedGoal);
   // Plan 是持续开关（不是 Goal 那种"下一条消息生效"的过渡态）：打开后一直用
   // agent.plan 发送，直到用户点叉或后端推 plan.mode_exited。
   // 和 Goal 一样只对单 agent 开放，集群模式不提供 Plan 入口。
   const planActive = usePlanStore((s) => s.runtimes[activeSessionId ?? '']?.active ?? false);
-  const planPendingExplicitEntry = usePlanStore(
-    (s) => s.runtimes[activeSessionId ?? '']?.pendingExplicitEntry ?? false,
-  );
   // 个人上下文：agent 加载开关（总开关联动）。总开关关闭时整个菜单项隐藏；开启时默认打开，可单独控制。
   const isConnected = useSessionStore((s) => s.isConnected);
   const personalContextMasterEnabled = usePersonalContextStore(
-    (s) => s.config.collection_enabled || s.config.agent_use_enabled,
+    (s) => s.config.master_enabled ?? (s.config.collection_enabled || s.config.agent_use_enabled),
   );
   const agentUseEnabled = usePersonalContextStore((s) => s.config.agent_use_enabled);
   const agentUsePending = usePersonalContextStore((s) => !!s.pendingWrites.agent_use_enabled);
@@ -984,17 +1268,43 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const swarmflowBudget = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.swarmflowBudget ?? null);
   // 进入真实会话后开关只读：仅新建对话页可修改，真实会话可查看不可改
   const swarmflowToggleDisabled = isProcessing || (activeSessionId !== NEW_CONVERSATION_ID && hasHistory);
-  // Plan 已经真正生效：开关打开且至少发出过一条 Plan 消息（pendingExplicitEntry 已被消费）。
-  // 区别于"刚打开开关但还没发消息"的未提交态——后者和 Goal 的 armed 一样可以被对方随手顶替。
-  const planCommitted = planActive && !planPendingExplicitEntry;
+  // 会话级调度模式：实验开关「调度模式」打开才展示；团队按首条消息建好后不可再改，
+  // 与 swarmflow 开关同一把锁（仅新建对话页可拨）。
+  const teamScheduledDispatchEnabled = useTeamScheduledDispatchEnabled();
+  const sessionTeamDispatchMode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamDispatchMode);
+  const teamDispatchScheduled = resolveTeamDispatchMode(sessionTeamDispatchMode) === 'scheduled';
+  const teamDispatchToggleDisabled = swarmflowToggleDisabled;
+  // 调度模式的子开关「启动即建队」（F_122）：只在调度模式打开时展示，同一把锁。
+  const sessionTeamBootstrapMode = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamBootstrapMode);
+  const teamBootstrapFramework = resolveTeamBootstrapMode(sessionTeamBootstrapMode) === 'framework';
+  const setTeamDispatchScheduled = (next: boolean) => {
+    if (!activeSessionId || teamDispatchToggleDisabled) return;
+    const store = useSessionStore.getState();
+    store.setTeamDispatchMode(activeSessionId, next ? 'scheduled' : 'autonomous');
+    // 关掉调度模式时子开关一并复位：framework 只在 scheduled 下合法。
+    if (!next) store.setTeamBootstrapMode(activeSessionId, 'leader');
+  };
+  const setTeamBootstrapFramework = (next: boolean) => {
+    if (!activeSessionId || teamDispatchToggleDisabled) return;
+    useSessionStore.getState().setTeamBootstrapMode(activeSessionId, next ? 'framework' : 'leader');
+  };
   const canUsePlanMenu = supportsPlanMode(mode);
   const planTagVisible = canUsePlanMenu && planActive;
+  // 永续会话标记：只对真实会话展示（/persist 创建或后端会话列表带 persist_session 的会话），
+  // 欢迎页在 session.create 之前没有可展示的持久化状态。
+  const persistSessionActive = useSessionStore(
+    (s) => s.runtimes[activeSessionId ?? '']?.persistSession ?? false,
+  );
+  const persistTagVisible = Boolean(
+    activeSessionId && activeSessionId !== NEW_CONVERSATION_ID && persistSessionActive,
+  );
 
   const mentionableMembers = useMemo(() => {
     return teamMembers
       .filter((member) => {
         const id = member.member_id?.trim();
-        return id && id !== 'user';
+        // 离队 / 退役中的成员接不到消息，@ 出去也没人接。
+        return id && id !== 'user' && isReachableTeamMemberStatus(member.status);
       })
       .map((member) => ({
         id: member.member_id,
@@ -1003,20 +1313,232 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       }));
   }, [teamMembers]);
 
+  // 任务素材：和团队成员一起出现在 @ 候选里（名称就是引用名）。已经登记到后端的（sessionAssets）
+  // 之外，这条消息里刚选好、还没来得及走完"落盘 -> 注册"往返的附件（欢迎页第一条消息尤其如此，
+  // 那时候还没有 session_id，注册无从谈起）也按同样的默认命名规则加进候选，不用等注册完才能 @。
+  const commandDescriptionLanguage = i18n.resolvedLanguage ?? i18n.language;
+  const sessionAssets = useSessionAssetsStore(selectSessionAssets(activeSessionId));
+  const sessionAssetsRef = useRef(sessionAssets);
+  sessionAssetsRef.current = sessionAssets;
+  // 已经登记到后端的素材只有文件系统绝对路径，浏览器没法直接当图片 src 加载；如果这个素材
+  // 恰好还挂在本地的附件卡片上（刚上传完，最常见的情况），就借它现成的本地预览图，而不是干脆
+  // 不显示缩略图——不能不假思索地借团队成员那套"按 id 生成"的头像，那和文件内容毫无关系。
+  const previewUrlByPath = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const attachment of attachments) {
+      const path = pickString(attachment.persistedMediaItem?.path);
+      if (path && attachment.previewUrl) map.set(normalizePath(path), attachment.previewUrl);
+    }
+    return map;
+  }, [attachments]);
+  const assetSuggestionItems = useMemo(
+    () =>
+      sessionAssets.map((asset) => ({
+        id: asset.name,
+        label: asset.name,
+        status: asset.kind,
+        itemKind: 'asset' as const,
+        // 已经落盘的素材没有本地预览图可用，直接用 file-api 读绝对路径（生成产物在
+        // agent 工作区，Web 端可读）。图片和视频都给 previewUrl：图片直接当缩略图用，
+        // 视频用它当第一帧的来源；音频/文档仍然走文件图标。
+        previewUrl:
+          previewUrlByPath.get(normalizePath(asset.path)) ??
+          (asset.kind === 'image' || asset.kind === 'video'
+            ? `/file-api/raw-file?path=${encodeURIComponent(asset.path)}`
+            : undefined),
+        assetPath: asset.path,
+      })),
+    [previewUrlByPath, sessionAssets],
+  );
+  const pendingAssetSuggestionItems = useMemo(() => {
+    const known = new Set(sessionAssets.map((asset) => asset.name.toLowerCase()));
+    const seen = new Set<string>();
+    return attachments
+      .filter((attachment) => attachment.status === 'ready')
+      .flatMap((attachment) => {
+        const name = attachment.assetName ?? stemFilename(attachment.filename);
+        const key = name.toLowerCase();
+        if (known.has(key) || seen.has(key)) return [];
+        seen.add(key);
+        return [
+          {
+            id: name,
+            label: name,
+            status: assetKindFromMime(attachment.mimeType),
+            itemKind: 'asset' as const,
+            previewUrl: attachment.previewUrl,
+            assetPath: attachment.filename,
+          },
+        ];
+      });
+  }, [attachments, sessionAssets]);
+  // @ 引用的素材直接预览在输入框上方：用 @ 选中图片素材后立刻能看到是哪一张。
+  // 引用是从当前草稿文本里解析出来的，所以把 @名称 从文本里删掉，卡片就跟着消失；
+  // 已经有真实附件卡片的路径（刚上传的那份）不重复显示。
+  const referencedAssetCards = useMemo(() => {
+    if (!inputValue.includes('@')) return [];
+    const attachedPaths = new Set(
+      attachments.flatMap((attachment) => {
+        const path = pickString(attachment.persistedMediaItem?.path);
+        return path ? [normalizePath(path)] : [];
+      }),
+    );
+    return findReferencedAssets(inputValue, sessionAssets)
+      .filter((asset) => asset.kind === 'image')
+      .filter((asset) => !attachedPaths.has(normalizePath(asset.path)))
+      .map((asset) => ({
+        key: `ref-${asset.asset_id}`,
+        name: asset.name,
+        // 刚上传的素材借本地预览图；已经落盘的生成图用 file-api 直接读（这些路径 Web 端可读）。
+        previewUrl:
+          previewUrlByPath.get(normalizePath(asset.path)) ??
+          `/file-api/raw-file?path=${encodeURIComponent(asset.path)}`,
+      }));
+  }, [attachments, inputValue, previewUrlByPath, sessionAssets]);
+  const mentionCandidates = useMemo(
+    () => [...mentionableMembers, ...assetSuggestionItems, ...pendingAssetSuggestionItems],
+    [assetSuggestionItems, mentionableMembers, pendingAssetSuggestionItems],
+  );
+
+  // 任务素材同步：进入会话时拉取；agent 产出的文件按路径登记去重（没有"重新附上"这个概念，
+  // sessionArtifacts 每次渲染都会把同一批路径再报一遍，所以用 attemptedAssetPaths 按路径
+  // 避免重复请求）。附件草稿则按草稿 id 去重——不按路径：故意再次附上同一个文件，必须和
+  // 重新附上一张图片一样各自拿到自己的素材条目，不能被当成对同一条路径的重复请求吞掉。
+  //
+  // attemptedAssetPaths / attemptedDraftIds / draftAssetIdByDraftId / canceledDraftIds 都是
+  // 模块级状态（见文件顶部），不是 useRef：既不按会话切换重置，也不随这个组件卸载/重新挂载
+  // 重置——ChatPanel/index.tsx 有两处 <InputArea>（欢迎页 / 正常会话），在它们之间切换会
+  // 卸载再挂载出一个全新的组件实例，useRef 会被清空，而草稿（attachmentDraftsBySession）和
+  // 产出文件路径（useSessionArtifacts）都不会跟着清空，这里就会把它们当成"没登记过"再注册
+  // 一遍；后端现在不会再按路径去重吞掉这种重复注册（故意的，见 session_assets.py），于是
+  // 每次卸载重挂载都会多出一条重复素材。
+  const sessionArtifacts = useSessionArtifacts();
+  useEffect(() => {
+    if (!canPersistAttachments || !activeSessionId) return;
+    void useSessionAssetsStore
+      .getState()
+      .refresh(activeSessionId)
+      .catch((error) => console.error('Failed to load session assets:', error));
+  }, [activeSessionId, canPersistAttachments]);
+  useEffect(() => {
+    if (!canPersistAttachments || !activeSessionId) return;
+    // 切换会话那一次渲染里，activeSessionId 已经是新会话，但 attachments 还是上一个会话的草稿
+    // （要等下面"切会话"那个 effect 跑完才会重置）。这一轮先跳过，避免把上一个会话还没发送的
+    // 附件误登记成这个新会话的素材；下一轮渲染 attachments 跟 activeSessionId 对齐后会重新触发。
+    if (attachmentSessionIdRef.current !== activeSessionId) return;
+    const sessionId = activeSessionId;
+    const pending: Array<{ path: string; source: 'upload' | 'generated'; name?: string; client_id?: string }> = [];
+    // 和 pending 严格同序：第 i 个待注册项若来自某个附件草稿，这里记它的草稿 id；
+    // 来自 agent 产出文件（没有草稿）的记 null。响应里 created[i] 对应 pending[i]，
+    // 靠这个数组把 asset_id 精确地分还给对应的草稿。
+    const pendingDraftIds: Array<string | null> = [];
+    attachments.forEach((attachment) => {
+      if (attachment.status !== 'ready' || attemptedDraftIds.has(attachment.id)) return;
+      const path = pickString(attachment.persistedMediaItem?.path);
+      if (!path) return;
+      attemptedDraftIds.add(attachment.id);
+      markUploadDispatched(sessionId, path);
+      pending.push({
+        path,
+        source: 'upload',
+        ...(attachment.assetName ? { name: attachment.assetName } : {}),
+        client_id: attachment.id,
+      });
+      pendingDraftIds.push(attachment.id);
+    });
+    sessionArtifacts.forEach((artifact) => {
+      const value = artifact.path?.trim();
+      if (!value || attemptedAssetPaths.has(value)) return;
+      attemptedAssetPaths.add(value);
+      pending.push({ path: value, source: 'generated' });
+      pendingDraftIds.push(null);
+    });
+    if (pending.length === 0) return;
+    // 乐观标记（attemptedDraftIds / attemptedAssetPaths / markUploadDispatched）发生在
+    // 请求发出之前——如果这条请求本身失败（网络抖动 / RPC 报错），或者单个 item 虽然请求
+    // 成功但没真的建出素材（created[i] 为空），这些标记必须撤回：否则这条路径/草稿会被
+    // 永久当成"已经登记过"，既不会被这个 effect 重试，也会让发送时 registerUploads 那个
+    // 兜底（见 useWebSocket.ts）误以为已经登记过而跳过，素材就再也建不出来了。
+    const rollbackPendingItem = (index: number) => {
+      const draftId = pendingDraftIds[index];
+      if (draftId) {
+        attemptedDraftIds.delete(draftId);
+        canceledDraftIds.delete(draftId);
+      }
+      const item = pending[index];
+      if (item.source === 'upload') unmarkUploadDispatched(sessionId, item.path);
+      else attemptedAssetPaths.delete(item.path);
+    };
+    void useSessionAssetsStore
+      .getState()
+      .register(sessionId, pending)
+      .then((response) => {
+        const created = response.created ?? [];
+        pending.forEach((_item, index) => {
+          const asset = created[index];
+          const draftId = pendingDraftIds[index];
+          if (!asset) {
+            rollbackPendingItem(index);
+            return;
+          }
+          if (!draftId) return;
+          if (canceledDraftIds.has(draftId)) {
+            // 响应回来之前这个草稿已经被取消/清空了——没人会再去删它，现在直接删，
+            // 不留孤儿素材。
+            canceledDraftIds.delete(draftId);
+            void useSessionAssetsStore
+              .getState()
+              .remove(sessionId, asset.asset_id)
+              .catch((error) => console.error('Failed to remove orphaned session asset:', error));
+            return;
+          }
+          draftAssetIdByDraftId.set(draftId, asset.asset_id);
+        });
+      })
+      .catch((error) => {
+        console.error('Failed to register session assets:', error);
+        pending.forEach((_, index) => rollbackPendingItem(index));
+      });
+  }, [activeSessionId, attachments, canPersistAttachments, sessionArtifacts]);
+
   const composerSuggestionItems = useMemo(() => {
     const items = getComposerSuggestionItems(
       composerSuggestion,
-      mentionableMembers,
-      getWebSlashCommandsForMode(slashCommands, mode),
+      mentionCandidates,
+      getWebSlashCommandsForMode(slashCommands, mode)
+        .filter((command) =>
+          canUseSlashCommand(
+            findSlashCommand(command.name),
+            Boolean(activeSessionId && activeSessionId !== NEW_CONVERSATION_ID),
+          ),
+        )
+        .map((command) => ({
+          ...command,
+          description: resolveSlashCommandDescription(command, commandDescriptionLanguage),
+        })),
       slashSkills,
       isTeamMode,
     );
     return items.map((item) =>
-      item.itemKind === 'command' && isSlashCommandDisabledByGoal(item.id, hasUnfinishedGoal)
-        ? { ...item, disabled: true, disabledReason: t('plan.toolbarUnavailableGoal') }
-        : item,
+      item.itemKind === 'skill' && composerSuggestion?.kind !== 'skill' && teamGroupSelectionActive
+        ? { ...item, disabled: true, disabledReason: t('chat.teamSkillsGroupLocked') }
+        : item.itemKind === 'command' && isSlashCommandDisabledByGoal(item.id, hasUnfinishedGoal)
+          ? { ...item, disabled: true, disabledReason: t('plan.toolbarUnavailableGoal') }
+          : item,
     );
-  }, [composerSuggestion, hasUnfinishedGoal, isTeamMode, mentionableMembers, mode, slashCommands, slashSkills, t]);
+  }, [
+    activeSessionId,
+    commandDescriptionLanguage,
+    composerSuggestion,
+    hasUnfinishedGoal,
+    isTeamMode,
+    mentionCandidates,
+    mode,
+    slashCommands,
+    slashSkills,
+    teamGroupSelectionActive,
+    t,
+  ]);
 
   const selectableComposerSuggestionIndices = useMemo(
     () =>
@@ -1028,7 +1550,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   );
 
   useEffect(() => {
-    if (composerSuggestion?.kind !== 'slash' || slashCatalogLoaded || slashCatalogLoading) return;
+    if (
+      !composerSuggestion ||
+      (composerSuggestion.kind !== 'slash' && composerSuggestion.kind !== 'skill') ||
+      slashCatalogLoaded || slashCatalogLoading
+    ) {
+      return;
+    }
     setSlashCatalogLoading(true);
     void Promise.all([
       webRequest<{ commands?: SlashCommandMeta[] }>('commands.list', {
@@ -1136,7 +1664,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const separator = current && !/\s$/.test(current) ? ' ' : '';
       editor.appendChild(document.createTextNode(`${separator}${text}`));
       useChatStore.getState().setInputValue(sid, `${current}${separator}${text}`);
-      if (sid !== NEW_CONVERSATION_ID) onInputIntent?.(sid);
+      onInputIntent?.(sid);
 
       editor.focus();
       const range = document.createRange();
@@ -1152,21 +1680,32 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const {
     isRecording: isListening,
     isTranscribing,
+    audioLevel,
     isSupported: taskAsrSupported,
     toggleRecording,
   } = useTaskAsr({
     onTranscript: appendTaskAsrTranscript,
     onError: setSpeechError,
   });
+  const taskAsrEnabled = useTaskAsrEnabled();
 
-  const imageInputDisabled = isImageInputDisabled({
-    isListening: isListening || isTranscribing,
-    isCompactRunning,
-    isInterruptible,
-    isTeamMode,
-    isAgentMode,
-  });
+  const imageInputDisabled =
+    designLandingSubmitting ||
+    isImageInputDisabled({
+      isListening: isListening || isTranscribing,
+      isCompactRunning,
+      isInterruptible,
+      isTeamMode,
+      isAgentMode,
+    });
   const isDesktopBridgeReady = useDesktopLocalFilePickerReady();
+  const uploadLimitsTooltip = [
+    t('chat.inputAttachment.imageLimitTooltip', { limit: MAX_IMAGE_BYTES / (1024 * 1024) }),
+    ...(!isDesktopBridgeReady
+      ? [t('chat.inputAttachment.fileLimitTooltip', { limit: MAX_FILE_BYTES / (1024 * 1024) })]
+      : []),
+    t('chat.inputAttachment.countLimitTooltip', { limit: MAX_ATTACHMENT_COUNT }),
+  ].join('\n');
   // "+" 触发按钮本身不跟图片/目标的可用性挂钩：菜单以后可能挂其他跟图片/目标无关的功能，
   // 触发按钮只要不在录音就该能点开；具体某一项能不能选，交给菜单里每一项各自的禁用态处理。
   const attachTriggerDisabled = isListening || isTranscribing || composerDisabled;
@@ -1190,6 +1729,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       }
       clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
     };
+  }, []);
+
+  // 取消选择时现代浏览器会派发 cancel；老版本浏览器由准备卡片上的关闭按钮兜底。
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) return;
+    const handleCancel = () => setIsPreparingFiles(false);
+    input.addEventListener('cancel', handleCancel);
+    return () => input.removeEventListener('cancel', handleCancel);
   }, []);
 
   const pushAttachmentAlert = useCallback((message: string) => {
@@ -1227,21 +1775,198 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setAttachmentAlerts((prev) => prev.filter((item) => item.id !== id));
   }, []);
 
-  const updateAttachment = useCallback((id: string, update: Partial<AttachmentDraft>) => {
-    setAttachments((prev) => prev.map((item) => (item.id === id ? { ...item, ...update } : item)));
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+  const discardedImageUploadsRef = useRef(new Map<string, string>());
+  const onDiscardMediaRef = useRef(onDiscardMedia);
+  onDiscardMediaRef.current = onDiscardMedia;
+
+  const requestImageDiscard = useCallback((sessionId: string, path: string) => {
+    const discard = onDiscardMediaRef.current;
+    if (!discard || !sessionId || sessionId === NEW_CONVERSATION_ID || !path) return;
+    void discard(sessionId, path).catch((error) => {
+      console.error('Failed to discard unsent image:', error);
+    });
   }, []);
+
+  const releaseUnsentUploads = useCallback((drafts: AttachmentDraft[]) => {
+    const removingIds = new Set(drafts.map((draft) => draft.id));
+    const remaining = attachmentsRef.current.filter((draft) => !removingIds.has(draft.id));
+    const registeredPaths = new Set(sessionAssetsRef.current.map((asset) => normalizePath(asset.path)));
+    const plan = planUnsentImageDiscard(
+      drafts.map(toUnsentImageDraft),
+      remaining.map(toUnsentImageDraft),
+      registeredPaths,
+      normalizePath,
+    );
+    const sessionId = activeSessionId || '';
+    for (const id of plan.pendingIds) {
+      discardedImageUploadsRef.current.set(id, sessionId);
+    }
+    for (const path of plan.paths) {
+      requestImageDiscard(sessionId, path);
+    }
+    // A removed chip that had already been auto-registered as a session material
+    // (session.assets.register fires as soon as the upload completes, well before
+    // send) must drop that material too. Each draft owns exactly the asset_id the
+    // registration effect recorded for it (draftAssetIdByDraftId) -- never matched by
+    // path, since the same path can now legitimately back more than one asset
+    // (a deliberate re-attach of an already-registered file gets its own new
+    // entry, the same as re-attaching an image always did). Agent-generated
+    // ('generated') materials are not tied to any composer draft and are never
+    // touched here.
+    for (const draft of drafts) {
+      const assetId = draftAssetIdByDraftId.get(draft.id);
+      // Only worth remembering as "canceled" when a registration request for this
+      // draft is genuinely in flight (attempted, response not back yet): that is the
+      // one case where the response handler still needs to find this id later to
+      // delete the orphaned asset. A draft that was never attempted at all (removed
+      // before reaching 'ready', or never had a path) has no pending response ever
+      // coming for it -- adding it here would leave a permanent, unconsumed entry.
+      if (!assetId && attemptedDraftIds.has(draft.id)) canceledDraftIds.add(draft.id);
+      if (!assetId) continue;
+      draftAssetIdByDraftId.delete(draft.id);
+      canceledDraftIds.delete(draft.id);
+      // This draft's path was marked dispatched (sessionAssets.ts) so send-time
+      // registerUploads would not double-register it -- now that the draft and its
+      // asset are both gone, clear that mark too, or a fresh re-attach of the same
+      // path could send before the live registration effect dispatches it and have
+      // registerUploads silently skip it as "already handled". Only clear it when no
+      // OTHER still-attached draft shares this exact path: that one may already rely
+      // on the mark to avoid being registered a second time by registerUploads.
+      const draftPath = pickString(draft.persistedMediaItem?.path);
+      if (draftPath) {
+        const normalizedDraftPath = normalizePath(draftPath);
+        const stillShared = remaining.some((other) => {
+          const otherPath = pickString(other.persistedMediaItem?.path);
+          return Boolean(otherPath) && normalizePath(otherPath!) === normalizedDraftPath;
+        });
+        if (!stillShared && sessionId) unmarkUploadDispatched(sessionId, draftPath);
+      }
+      if (!sessionId || sessionId === NEW_CONVERSATION_ID) continue;
+      void useSessionAssetsStore
+        .getState()
+        .remove(sessionId, assetId)
+        .catch((error) => console.error('Failed to remove session asset:', error));
+    }
+  }, [activeSessionId, requestImageDiscard]);
+
+  const updateAttachment = useCallback((id: string, update: Partial<AttachmentDraft>) => {
+    if (discardedImageUploadsRef.current.has(id)) {
+      const persistedPath = pickString(update.persistedMediaItem?.path);
+      const terminal = Boolean(persistedPath) || update.status === 'error' || update.status === 'ready';
+      if (!terminal) return;
+      const uploadSessionId = discardedImageUploadsRef.current.get(id) ?? '';
+      discardedImageUploadsRef.current.delete(id);
+      if (persistedPath) requestImageDiscard(uploadSessionId, persistedPath);
+      return;
+    }
+    setAttachments((prev) => {
+      if (prev.some((item) => item.id === id)) {
+        return prev.map((item) => (item.id === id ? { ...item, ...update } : item));
+      }
+      for (const [sessionId, drafts] of attachmentDraftsBySession) {
+        if (!drafts.some((item) => item.id === id)) continue;
+        attachmentDraftsBySession.set(
+          sessionId,
+          drafts.map((item) => (item.id === id ? { ...item, ...update } : item)),
+        );
+        break;
+      }
+      return prev;
+    });
+  }, [requestImageDiscard]);
 
   const removeAttachment = useCallback((id: string) => {
+    const target = attachmentsRef.current.find((item) => item.id === id);
+    if (target) releaseUnsentUploads([target]);
     setAttachments((prev) => prev.filter((item) => item.id !== id));
     setAttachmentMenuId((current) => (current === id ? null : current));
-  }, []);
+  }, [releaseUnsentUploads]);
+
+  // 附件卡片上重命名：记在草稿上（登记素材时用），也记到按文件名的待用名字里（欢迎页第一条消息
+  // 发出时才建会话、落盘）；文件已经登记过的话，直接改后端里的素材名。
+  const [renamingAttachmentId, setRenamingAttachmentId] = useState<string | null>(null);
+  const [attachmentRenameDraft, setAttachmentRenameDraft] = useState('');
+  const commitAttachmentRename = useCallback(
+    async (attachment: AttachmentDraft) => {
+      setRenamingAttachmentId(null);
+      const checked = validateAssetName(attachmentRenameDraft);
+      if ('error' in checked) {
+        pushAttachmentAlert(t('sessionAssets.invalidName'));
+        return;
+      }
+      const previous = attachment.assetName ?? attachment.filename;
+      if (checked.name === previous) return;
+      updateAttachment(attachment.id, { assetName: checked.name });
+      const path = pickString(attachment.persistedMediaItem?.path);
+      if (path) useSessionAssetsStore.getState().setPendingName(path, checked.name);
+      // Prefer the asset the registration effect recorded for THIS draft (draftAssetIdByDraftId)
+      // over a path lookup: the same path can now legitimately back more than one asset (a
+      // deliberate re-attach, or a desktop local-path video/audio/document draft, none of which
+      // get a unique path on disk) -- sessionAssetsRef.current.find(samePath) would silently
+      // grab whichever asset happens to match first, renaming a DIFFERENT card's material. Only
+      // fall back to the path lookup when this draft hasn't been registered yet (no entry to find).
+      const draftAssetId = draftAssetIdByDraftId.get(attachment.id);
+      const registeredAssetId =
+        draftAssetId ?? (path ? sessionAssetsRef.current.find((asset) => samePath(asset.path, path))?.asset_id : undefined);
+      if (!registeredAssetId || !activeSessionId) return;
+      try {
+        await useSessionAssetsStore.getState().rename(activeSessionId, registeredAssetId, checked.name);
+      } catch (error) {
+        updateAttachment(attachment.id, { assetName: attachment.assetName });
+        pushAttachmentAlert(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [activeSessionId, attachmentRenameDraft, pushAttachmentAlert, t, updateAttachment],
+  );
 
   const clearAttachments = useCallback(() => {
+    releaseUnsentUploads(attachmentsRef.current);
     setAttachments([]);
     setAttachmentAlerts([]);
     setAttachmentMenuId(null);
     clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
-  }, []);
+  }, [releaseUnsentUploads]);
+
+  useEffect(() => {
+    const sessionId = attachmentSessionIdRef.current;
+    if (sessionId) attachmentDraftsBySession.set(sessionId, attachments);
+  }, [attachments]);
+
+  // 外部清空（目前只有 App.tsx enterNewConversation 对 'new' 调用 clearAttachmentDrafts）
+  // 只改了 Map，不会让 activeSessionId 变化——如果这时候本来就停留在被清的那个会话上
+  // （典型：已经在 'new' 欢迎页带着未发送附件，又点了一次"新建对话"），下面"切换会话"
+  // 那个 effect 不会跑，本地 attachments state 就不会跟着清空，残留的附件之后一发送
+  // 还是会被注册成新会话自己的素材——清空形同虚设。这个 effect 专门补上这种"没有发生
+  // 会话切换"的清空场景。
+  const attachmentDraftClearNonce = useAttachmentDraftClearNonce(activeSessionId);
+  const attachmentDraftClearNonceRef = useRef(attachmentDraftClearNonce);
+  useEffect(() => {
+    if (attachmentDraftClearNonce === attachmentDraftClearNonceRef.current) return;
+    attachmentDraftClearNonceRef.current = attachmentDraftClearNonce;
+    // ref 还没等于 activeSessionId 说明一次真正的会话切换正在进行中，下面那个 effect
+    // 本来就会用（已经清空的）Map 内容重新同步本地 state，这里不用重复处理。
+    if (attachmentSessionIdRef.current !== activeSessionId) return;
+    releaseUnsentUploads(attachmentsRef.current);
+    setAttachments([]);
+    setAttachmentAlerts([]);
+    setAttachmentMenuId(null);
+    clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
+  }, [attachmentDraftClearNonce, activeSessionId, releaseUnsentUploads]);
+
+  useEffect(() => {
+    if (attachmentSessionIdRef.current === activeSessionId) return;
+    const previousSessionId = attachmentSessionIdRef.current;
+    if (previousSessionId) attachmentDraftsBySession.set(previousSessionId, attachments);
+    attachmentSessionIdRef.current = activeSessionId;
+    setAttachments(
+      activeSessionId ? ((attachmentDraftsBySession.get(activeSessionId) as AttachmentDraft[] | undefined) ?? []) : [],
+    );
+    setAttachmentAlerts([]);
+    setAttachmentMenuId(null);
+    clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
+  }, [activeSessionId, attachments]);
 
   const stopAttachmentMenuTimer = useCallback(() => {
     if (attachmentMenuTimerRef.current) {
@@ -1282,6 +2007,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               filename: attachment.filename,
               localPath: attachment.localPath,
             })
+          : attachment.kind === 'video' || attachment.kind === 'audio'
+            ? (attachment.file ? getAvValidationError(attachment.file, t) : null)
           : attachment.file
             ? getImageValidationError(attachment.file, t)
             : attachment.base64Data
@@ -1359,6 +2086,51 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             });
           }
         })();
+        return;
+      }
+
+      if (attachment.kind === 'video' || attachment.kind === 'audio') {
+        const localPath = getLocalFilePath(attachment.file, attachment.localPath);
+        if (localPath) {
+          updateAttachment(attachment.id, {
+            persistedMediaItem: {
+              type: attachment.kind,
+              filename: attachment.filename,
+              mime_type: attachment.mimeType,
+              path: localPath,
+              size_bytes: attachment.size,
+            },
+            status: 'ready',
+            error: undefined,
+          });
+          return;
+        }
+        if (!attachment.file) {
+          const error = t('chat.inputAttachment.uploadFailed');
+          pushAttachmentAlert(error);
+          updateAttachment(attachment.id, { status: 'error', error });
+          return;
+        }
+        if (attachment.file.size > DESIGNER_REF_MAX_INLINE_BYTES) {
+          const error = t('designer.chat.tooLarge');
+          pushAttachmentAlert(error);
+          updateAttachment(attachment.id, { status: 'error', error });
+          return;
+        }
+        void readBinaryFileAsBase64(attachment.file).then((payload) => {
+          if (!payload?.base64Data) {
+            updateAttachment(attachment.id, {
+              status: 'error',
+              error: t('chat.inputAttachment.uploadFailed'),
+            });
+            return;
+          }
+          updateAttachment(attachment.id, {
+            base64Data: payload.base64Data,
+            status: 'ready',
+            error: undefined,
+          });
+        });
         return;
       }
 
@@ -1452,7 +2224,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const retryAttachment = useCallback(
     (attachment: AttachmentDraft) => {
-      uploadAttachment(attachment);
+      if (attachment.kind !== 'image') {
+        uploadAttachment(attachment);
+        return;
+      }
+      const mimeType = resolveImageMimeType(attachment.filename, attachment.mimeType);
+      const previewUrl = attachment.base64Data
+        ? `data:${mimeType};base64,${attachment.base64Data}`
+        : attachment.previewUrl;
+      uploadAttachment({ ...attachment, mimeType, previewUrl });
     },
     [uploadAttachment],
   );
@@ -1476,7 +2256,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       }
 
       const drafts = filesToAdd.reduce<AttachmentDraft[]>((items, file) => {
-        const kind = resolveAttachmentKind(file);
+        const kind = resolveAttachmentKind(file, workMode === 'design');
         if (!kind) {
           const message = isForbiddenDocumentFile(file)
             ? t('chat.inputAttachment.forbiddenFileType', { name: file.name || t('chat.inputAttachment.unnamedFile') })
@@ -1491,7 +2271,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           id: makeAttachmentId(file),
           kind,
           filename: file.name || (kind === 'document' ? `document-${Date.now()}` : `image-${Date.now()}`),
-          mimeType: file.type || 'application/octet-stream',
+          mimeType:
+            kind === 'image'
+              ? resolveImageMimeType(file.name || '', file.type)
+              : file.type || 'application/octet-stream',
           size: file.size,
           file,
           ...(localPath ? { localPath } : {}),
@@ -1499,7 +2282,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         const validationError =
           kind === 'document'
             ? getDocumentValidationError(file, t, { filename: base.filename, localPath })
-            : getImageValidationError(file, t);
+            : kind === 'video' || kind === 'audio'
+              ? getAvValidationError(file, t)
+              : getImageValidationError(file, t);
         if (validationError) {
           pushAttachmentAlert(validationError);
           items.push({
@@ -1524,7 +2309,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         uploadAttachment(draft);
       });
     },
-    [attachments, pushAttachmentAlert, uploadAttachment, t],
+    [attachments, pushAttachmentAlert, uploadAttachment, t, workMode],
   );
 
   const appendLocalFilePicks = useCallback(
@@ -1566,28 +2351,32 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           pushAttachmentAlert(t('chat.inputAttachment.readImageFailed', { name: pick.filename }));
           return items;
         }
-        if (pick.size > MAX_FILE_BYTES) {
+        if (pick.kind === 'image' && pick.size > MAX_IMAGE_BYTES) {
           pushAttachmentAlert(
-            t('chat.inputAttachment.fileSizeExceeded', {
+            t('chat.inputAttachment.imageSizeExceeded', {
               name: pick.filename,
-              limit: formatAttachmentSize(MAX_FILE_BYTES),
+              limit: formatAttachmentSize(MAX_IMAGE_BYTES),
             }),
           );
           return items;
         }
 
+        const mimeType =
+          pick.kind === 'image'
+            ? resolveImageMimeType(pick.filename, pick.mime_type)
+            : pick.mime_type || 'application/octet-stream';
         const draft: AttachmentDraft = {
           id: `${pick.filename}-${pick.size}-${generateUuidV4()}`,
           kind: pick.kind,
           filename: pick.filename,
-          mimeType: pick.mime_type || 'application/octet-stream',
+          mimeType,
           size: pick.size,
           localPath: pick.path,
           status: 'uploading',
           ...(pick.kind === 'image' && pick.base64
             ? {
                 base64Data: pick.base64,
-                previewUrl: `data:${pick.mime_type || 'application/octet-stream'};base64,${pick.base64}`,
+                previewUrl: `data:${mimeType};base64,${pick.base64}`,
               }
             : {}),
         };
@@ -1607,12 +2396,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const openAttachmentPicker = useCallback(async () => {
     if (imageInputDisabled) return;
     setAttachMenuOpen(false);
-    // 文档上传优先走本机绝对路径：桌面 pywebview 或浏览器后端 path.select_files。
-    // 在无 GUI 的 Docker / 远程服务器部署下，后端原生文件对话框不可用（返回
-    // unsupported/failed），此时回退到浏览器 HTML <input type="file">，由浏览器
-    // 在本机弹选择框，文件内容以 base64 上传到服务器（图片走 media.persist，
-    // 文档走 document.persist 的 base64 分支）。
+    // Web 直接选择访问者电脑上的文件；桌面端通过原生桥接保留本机路径引用。
+    if (!isDesktopBridgeReady && !isDesktopLocalFilePicker()) {
+      if (fileInputRef.current) {
+        setIsPreparingFiles(true);
+        fileInputRef.current.click();
+      } else {
+        pushAttachmentAlert(t('chat.inputAttachment.filePickerFailed'));
+      }
+      return;
+    }
+    if (!isDesktopLocalFilePicker()) {
+      pushAttachmentAlert(t('chat.inputAttachment.filePickerFailed'));
+      return;
+    }
+    setIsPreparingFiles(true);
     const result = await selectLocalFiles(true);
+    setIsPreparingFiles(false);
     if (result.ok) {
       appendLocalFilePicks(result.files);
       return;
@@ -1620,14 +2420,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     if (result.reason === 'cancelled') {
       return;
     }
-    // 原生选择器不可用（Docker/远程/无 GUI）：回退浏览器文件选择器。
-    if (fileInputRef.current) {
-      fileInputRef.current.click();
-    } else {
-      // input 元素尚未挂载或被条件渲染隐藏时，给用户可见提示而非静默失败。
-      pushAttachmentAlert(t('chat.inputAttachment.filePickerUnsupported'));
-    }
-  }, [appendLocalFilePicks, imageInputDisabled, pushAttachmentAlert, t]);
+    pushAttachmentAlert(t('chat.inputAttachment.filePickerFailed'));
+  }, [appendLocalFilePicks, imageInputDisabled, isDesktopBridgeReady, pushAttachmentAlert, t]);
 
   const acceptExternalLocalFilePicks = useCallback(
     (picks: LocalFilePick[]) => {
@@ -1692,6 +2486,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       // 下面任何 ref 的子树内——靠 data-connector-auth-modal 识别“点的是弹窗内部”，跳过关闭（与
       // ExtensionPickerPanel.tsx 的同款监听一致；bug 2026091001-001 portal 化后的回归修复）。
       if ((event.target as HTMLElement | null)?.closest?.('[data-connector-auth-modal]')) return;
+      // Select 下拉面板同样门户挂到 body（data-select-panel），点选单位等选项时不视为外部点击，
+      // 否则配置面板先于选项 click 卸载，选择丢失
+      if ((event.target as HTMLElement | null)?.closest?.('[data-select-panel]')) return;
       if (
         !attachMenuRef.current?.contains(event.target as Node) &&
         !attachMenuPortalRef.current?.contains(event.target as Node) &&
@@ -1720,7 +2517,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       if (!attachMenuRef.current) return;
       const rect = attachMenuRef.current.getBoundingClientRect();
       setAttachMenuAnchor(rect);
-      setAttachMenuDirection(window.innerHeight - rect.bottom >= 200 ? 'down' : 'up');
+      setAttachMenuDirection(resolveMenuDirection(rect.bottom, ATTACH_MENU_ESTIMATED_HEIGHT));
     }
     window.addEventListener('resize', updateAttachMenuPosition);
     window.addEventListener('scroll', updateAttachMenuPosition, true);
@@ -1791,15 +2588,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
   }, [autoFocusKey]);
 
-  // 切会话时用 inputValue 填充 contenteditable（chip 位置丢失，仅恢复纯文本）
-  useEffect(() => {
-    if (!inputRef.current) return;
-    const sid = useChatStore.getState().activeSessionId;
-    if (!sid) return;
-    const text = useChatStore.getState().runtimes[sid]?.inputValue ?? '';
-    inputRef.current.textContent = text;
-  }, [activeSessionId]);
-
   // 监听外部设置 inputValue 的事件（如编辑排队任务）
   useEffect(() => {
     const handler = (e: Event) => {
@@ -1824,27 +2612,101 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   /** 从 contenteditable 提取纯文本（技能 chip 不进入纯文本，其它 token 展开为可提交文本） */
   const extractPlainText = useCallback((): string => {
     const el = inputRef.current;
-    if (!el) return '';
-    let text = '';
-    el.childNodes.forEach((node) => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        text += node.textContent || '';
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        const elem = node as HTMLElement;
-        if (elem.getAttribute('contenteditable') === 'false' && elem.dataset.slashCommand) {
-          text += `/${elem.dataset.slashCommand}`;
-        } else if (elem.getAttribute('contenteditable') === 'false' && elem.dataset.composerToken) {
-          const prefix = elem.dataset.composerToken === 'role' ? '$' : '@';
-          text += `${prefix}${elem.dataset.value || elem.textContent || ''}`;
-        } else if (elem.getAttribute('contenteditable') === 'false') {
-          // 跳过技能 chip
-        } else {
-          text += elem.textContent || '';
-        }
-      }
-    });
-    return text.replace(/\u200B/g, '');
+    return el ? readComposerText(el) : '';
   }, []);
+
+  // Capture before the next session's passive hydration replaces the editor DOM.
+  useLayoutEffect(() => {
+    const editor = inputRef.current;
+    const sid = activeSessionId;
+    if (!editor || !sid) return;
+    return () => {
+      const runtime = useChatStore.getState().runtimes[sid];
+      const text = readComposerText(editor);
+      // Sending or an external edit may already have replaced the stored draft.
+      if (runtime && runtime.inputValue === text) {
+        useChatStore.getState().setInputValue(sid, text, readComposerSkillPositions(editor));
+      }
+    };
+  }, [activeSessionId]);
+
+  // 切会话时用 inputValue 填充 contenteditable。技能 chip 由 selectedSkills 同步效果重建；
+  // 有参斜杠 chip（如 /persist）写在纯文本里，这里还原成蓝色标签，避免切回后"标签消失"（#5771）。
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const sid = useChatStore.getState().activeSessionId;
+    if (!sid) return;
+    const text = useChatStore.getState().runtimes[sid]?.inputValue ?? '';
+    el.replaceChildren();
+    const { command, rest } = splitComposerSlashChip(text);
+    if (command) {
+      const chip = document.createElement('span');
+      chip.className = 'chat-input-chip-inline chat-input-chip-inline--slash-command';
+      chip.setAttribute('contenteditable', 'false');
+      chip.dataset.slashCommand = command;
+
+      const prefix = document.createElement('span');
+      prefix.className = 'chat-input-chip-inline__prefix';
+      prefix.textContent = '/';
+
+      const labelEl = document.createElement('span');
+      labelEl.className = 'chat-input-chip-inline__label';
+      labelEl.textContent = command;
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'chat-input-chip-inline__remove';
+      removeBtn.setAttribute('aria-label', 'remove slash command');
+      removeBtn.innerHTML = closeSvg;
+      removeBtn.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const next = chip.nextSibling;
+        if (next && next.nodeType === Node.TEXT_NODE) {
+          const nextText = next.textContent || '';
+          if (nextText.startsWith(' ')) {
+            next.textContent = nextText.slice(1);
+          }
+        }
+        chip.remove();
+        const activeSid = useChatStore.getState().activeSessionId;
+        if (activeSid) useChatStore.getState().setInputValue(activeSid, extractPlainText());
+      });
+
+      chip.append(prefix, labelEl, removeBtn);
+      el.append(chip);
+      el.append(document.createTextNode(rest || '\u200B'));
+    } else {
+      el.textContent = text;
+    }
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }, [activeSessionId, extractPlainText]);
+
+  const composerConversationRef = useRef(conversationId);
+  useEffect(() => {
+    if (composerConversationRef.current === conversationId) return;
+    composerConversationRef.current = conversationId;
+    setComposerSuggestion(null);
+    // Member IDs are scoped to a Team, even when two Teams use the same ID.
+    // Preserve the draft but remove the old Team's member addressing tokens.
+    const editor = inputRef.current;
+    if (!editor) return;
+    const tokens = editor.querySelectorAll<HTMLElement>(
+      '[data-composer-token="member"]:not([data-composer-item-kind="asset"])',
+    );
+    if (!tokens.length) return;
+    tokens.forEach((token) => token.remove());
+    const sid = useChatStore.getState().activeSessionId;
+    if (sid) useChatStore.getState().setInputValue(sid, extractPlainText());
+  }, [conversationId, extractPlainText]);
 
   /** 从 contenteditable 提取富文本（chip 转成 {{skill:名称}} 标记，保留位置用于气泡交织渲染） */
   const extractRichContent = useCallback((): string => {
@@ -1923,6 +2785,21 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           return;
         }
       }
+      // bugfix 2026092201 bug001 子问题 3：`/goal`（不带目标正文——handleSubmit 精确输入
+      // `/goal` 回车，或 insertComposerToken 在建议菜单选中后立即走到这里）与 `/plan` 对齐，
+      // 选中/回车即"武装"、立刻显示"目标"tag，不再只插入一个占位 chip、什么状态都不改。
+      // 带目标正文的 `/goal set <objective>`、`/goal <objective>` 一次性单发用法不受影响，
+      // args 非空会跳过这里、继续走下面 command.execute 的正常解析。互斥判断统一走
+      // goalModeGate，和"+"菜单的目标开关共用同一套决策层，不再各自定制。
+      if (command.name === 'goal' && args.trim() === '') {
+        const decision = evaluateGoalArm(activeSessionId, true);
+        if (!decision.ok) {
+          if (decision.reason) pushAttachmentAlert(t(decision.reason));
+          return;
+        }
+        applyGoalArm(activeSessionId, true);
+        return;
+      }
       if (command.name !== 'compact') {
         await command.execute(context, args);
         return;
@@ -1932,11 +2809,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       if (compactingSessionIdsRef.current.has(sessionId)) return;
 
       compactingSessionIdsRef.current.add(sessionId);
+      compactStartedAtRef.current.set(sessionId, Date.now());
       setCompactingSessionIds(new Set(compactingSessionIdsRef.current));
       try {
         await command.execute(context, args);
       } finally {
         compactingSessionIdsRef.current.delete(sessionId);
+        compactStartedAtRef.current.delete(sessionId);
         setCompactingSessionIds(new Set(compactingSessionIdsRef.current));
       }
     },
@@ -1944,56 +2823,48 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   );
 
   const handleSubmit = useCallback(() => {
-    if (composerDisabled) return;
+    if (composerDisabled || isListening || isTranscribing || modelGroupSendBlocked) return;
 
     // 用富文本（含 chip 标记）作为发送内容，气泡可交织渲染技能
     const richContent = extractRichContent();
     const trimmedBase = richContent.trim();
 
     // 拦截当前模式支持的斜杠命令：控制命令不走 chat.send / 队列 / 中断逻辑。
-    // Team 仅支持全局 /new，其余注册命令仍以普通文本发送。
+    // Team 模式下注册命令仍以普通文本发送。
     if (trimmedBase.startsWith('/')) {
       const { name, args } = parseSlashLine(trimmedBase);
       const cmd = findSlashCommand(name);
       const slashSid = useChatStore.getState().activeSessionId;
       const slashMode = useSessionStore.getState().getRuntime(slashSid)?.mode ?? mode;
       if (cmd && shouldExecuteRegisteredSlashCommand(name, args, slashMode)) {
+        if (!canUseSlashCommand(cmd, Boolean(slashSid && slashSid !== NEW_CONVERSATION_ID))) {
+          pushAttachmentAlert(t('chat.commandRequiresSession'));
+          return;
+        }
         if (cmd.name === 'goal' && parseGoalSlashArgs(args).action === 'set' && readyMediaItems.length > 0) {
           pushAttachmentAlert(t('chat.goalAttachmentsBlocked'));
           return;
         }
         if (slashSid) useChatStore.getState().setInputValue(slashSid, '');
+        releaseUnsentUploads(attachmentsRef.current);
         setAttachments([]);
         setAttachmentAlerts([]);
         if (inputRef.current) inputRef.current.innerHTML = '';
         setComposerSuggestion(null);
-        // requiresSession=false 的命令（如 /plan 纯本地开关）无需真实会话，欢迎页也能用
-        if (cmd.requiresSession === false || (slashSid && slashSid !== NEW_CONVERSATION_ID)) {
-          void executeSlashCommand(
-            cmd,
-            {
-              sessionId: slashSid ?? NEW_CONVERSATION_ID,
-              mode: slashMode,
-              inputLine: trimmedBase,
-              addMessage: useChatStore.getState().addMessage,
-              submitMessage: onSubmit,
-              startNewConversation: onNewSession,
-              forkConversation: onForkSession,
-              startSideConversation: onStartSideConversation,
-              runGoalAction: runGoalSlashAction,
-              confirmGoalOverwrite: (currentObjective, requestedObjective) =>
-                window.confirm(t('goal.overwriteConfirm', { currentObjective, requestedObjective })),
-            },
-            args,
-          );
-        } else {
-          useChatStore.getState().addMessage(slashSid ?? NEW_CONVERSATION_ID, {
-            id: `slash-sys-${Date.now()}`,
-            role: 'system',
-            content: '请先开始一个对话再使用该指令。',
-            timestamp: new Date().toISOString(),
-          });
-        }
+        void executeSlashCommand(
+          cmd,
+          {
+            sessionId: slashSid ?? NEW_CONVERSATION_ID,
+            mode: slashMode,
+            inputLine: trimmedBase,
+            addMessage: useChatStore.getState().addMessage,
+            submitMessage: onSubmit,
+            forkConversation: onForkSession,
+            runGoalAction: runGoalSlashAction,
+            confirmGoalOverwrite,
+          },
+          args,
+        );
         return;
       }
     }
@@ -2002,16 +2873,30 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         attachment.status === 'ready' &&
         (Boolean(pickString(attachment.persistedMediaItem?.path)) || Boolean(attachment.base64Data)),
     );
+    // @名称 -> 文件路径的引用笔记不在这里加：这条消息可能还在往后端落盘（欢迎页第一条消息甚至
+    // 连 session 都还没建），此刻能查到的已登记素材是不完整的。真正的笔记在 useWebSocket.sendMessage
+    // 里、落盘拿到路径之后统一补，同时也覆盖本会话之前已经登记过的素材。
     const trimmed = buildSubmitContent(trimmedBase, readyDrafts);
+    // Materialize skill markers when the store holds a selection that the
+    // editor DOM does not reflect (e.g. insertSkillChip skipped during IME
+    // composition). Without this, a skill-only send produces an empty
+    // `trimmed`, which the team onSubmit / plain-text onInterrupt channels
+    // silently drop, and the post-send clear below swallows the selection.
+    const submitContent = selectedSkills.reduce(
+      (content, skill) => (content.includes(`{{skill:${skill}}}`) ? content : `${content}{{skill:${skill}}}`),
+      trimmed,
+    );
     const hasReadyMedia = readyMediaItems.length > 0;
-    // Block only when there is neither text nor a ready attachment to send.
-    if ((!trimmedBase && !hasReadyMedia) || hasUploadingAttachments || hasAttachmentErrors) return;
+    // Block only when there is neither text, a ready attachment, nor a
+    // selected skill to send.
+    if ((!trimmedBase && !hasReadyMedia && selectedSkills.length === 0) || hasUploadingAttachments || hasAttachmentErrors || isPreparingFiles) return;
     // In agent mode attachments queue with the task (taskQueue carries mediaItems).
     // Other non-team modes still go through the text-only onInterrupt channel where
     // attachments would be lost, so keep blocking there.
     if (isInterruptible && !isTeamMode && !isAgentMode && hasReadyMedia) return;
 
     const sid = useChatStore.getState().activeSessionId;
+    let sentViaTaskQueue = false;
     if (goalArmed && trimmedBase && sid && onSetGoal && sid !== NEW_CONVERSATION_ID) {
       // command.goal carries a text objective only; silently dropping attachments
       // would make users believe they were sent, so block explicitly with an alert.
@@ -2026,9 +2911,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } else if (goalArmed && trimmedBase && sid === NEW_CONVERSATION_ID) {
       // 欢迎页尚无真实 session，armed 状态先保留，交给 App.tsx 的 handleSendMessage
       // 在 session.create 成功、拿到真实 session id 后再落地消息 + 调 onSetGoal
-      onSubmit(trimmed, readyMediaItems);
+      onSubmit(submitContent, readyMediaItems);
     } else if (isTeamMode) {
-      onSubmit(trimmed, readyMediaItems);
+      onSubmit(submitContent, readyMediaItems);
     } else if (queuePaused && isAgentMode && sid) {
       // 队列已暂停时，弹窗提示用户选择
       const queueLen = useChatStore.getState().getRuntime(sid)?.taskQueue.length ?? 0;
@@ -2037,23 +2922,25 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         // 清空队列并发送
         useChatStore.getState().clearTaskQueue(sid);
         useChatStore.getState().setQueuePaused(sid, false);
-        onSubmit(trimmed, readyMediaItems);
+        onSubmit(submitContent, readyMediaItems);
       } else {
         // 保持队列，新消息加入队列
-        useChatStore.getState().addToTaskQueue(sid, trimmed, readyMediaItems);
+        useChatStore.getState().addToTaskQueue(sid, submitContent, readyMediaItems);
+        sentViaTaskQueue = true;
       }
     } else if (isInterruptible) {
       if (isAgentMode) {
         if (sid) {
-          useChatStore.getState().addToTaskQueue(sid, trimmed, readyMediaItems);
+          useChatStore.getState().addToTaskQueue(sid, submitContent, readyMediaItems);
+          sentViaTaskQueue = true;
           // 目标 active 但当前没有任务在处理时，常规的自动排空触发点不会命中，主动兜底一次
           onDrainTaskQueueIfIdle?.(sid);
         }
       } else {
-        onInterrupt(trimmed);
+        onInterrupt(submitContent);
       }
     } else {
-      onSubmit(trimmed, readyMediaItems);
+      onSubmit(submitContent, readyMediaItems);
     }
     if (sid) {
       useChatStore.getState().setInputValue(sid, '');
@@ -2065,20 +2952,43 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     if (inputRef.current) {
       inputRef.current.innerHTML = '';
     }
+    // Clear selected skills from the store so canSubmit stays in sync with
+    // the editor DOM (chips were cleared above). Without this, the send
+    // button remains enabled on an empty input because selectedSkills still
+    // holds stale entries.
+    //
+    // Skip clearing for two paths where sendMessage reads selectedSkills
+    // asynchronously (after an await), which would race with this clear:
+    //  - NEW_CONVERSATION_ID: App.tsx migrates selectedSkills from 'new' to
+    //    the real session id after `await createConversationSession`. Clearing
+    //    here would wipe them before the migration at App.tsx.
+    //  - Task-queue paths (sentViaTaskQueue, including the paused "keep
+    //    queue" branch): drainTaskQueueIfIdle calls sendMessage later, which
+    //    reads selectedSkills from the session store. Clearing here would
+    //    wipe them before the drain.
+    // For direct onSubmit paths, sendMessage reads selectedSkills synchronously
+    // before its first await, so clearing here is safe.
+    const queuedToNewConversation = sid === NEW_CONVERSATION_ID;
+    if (sid && !queuedToNewConversation && !sentViaTaskQueue) {
+      clearSelectedSkills(sid);
+    }
     setComposerSuggestion(null);
   }, [
     attachments,
+    clearSelectedSkills,
     executeSlashCommand,
     extractRichContent,
     readyMediaItems,
     hasUploadingAttachments,
     hasAttachmentErrors,
+    isPreparingFiles,
     composerDisabled,
+    isListening,
+    isTranscribing,
+    modelGroupSendBlocked,
     isInterruptible,
     onSubmit,
-    onNewSession,
     onForkSession,
-    onStartSideConversation,
     runGoalSlashAction,
     onInterrupt,
     mode,
@@ -2089,6 +2999,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onSetGoal,
     onDrainTaskQueueIfIdle,
     pushAttachmentAlert,
+    releaseUnsentUploads,
+    selectedSkills,
     t,
   ]);
 
@@ -2098,30 +3010,35 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // preparing a follow-up. A pending approval keeps Stop available and blocks Send.
   const hasDraft = hasTextDraft || attachments.length > 0 || isListening || isTranscribing;
   const isImageInterruptBlocked = isInterruptible && !isTeamMode && !isAgentMode && readyMediaItems.length > 0;
-  const showStop = isProcessing && !isPaused && (!hasDraft || hasPendingQuestion);
+  const hasRunningWork = (isProcessing && !isPaused) || ownerOrganizationIsProcessing;
+  const showStop = !designLandingSubmitting && hasRunningWork && (!hasDraft || hasPendingQuestion);
   const hasReadyMedia = readyMediaItems.length > 0;
   const canSubmit =
     showStop ||
     (!composerDisabled &&
-      (hasTextDraft || hasReadyMedia) &&
+      !isListening &&
+      !isTranscribing &&
+      !modelGroupSendBlocked &&
+      (hasTextDraft || hasReadyMedia || selectedSkills.length > 0) &&
       !isLoadingHistory &&
       !isImageInterruptBlocked &&
       !hasUploadingAttachments &&
-      !hasAttachmentErrors);
+      !hasAttachmentErrors &&
+      !isPreparingFiles);
 
   const handleSendButtonClick = useCallback(() => {
+    if (designLandingSubmitting) return;
     if (showStop) {
       onCancel();
       return;
     }
 
     handleSubmit();
-  }, [handleSubmit, showStop, onCancel]);
+  }, [designLandingSubmitting, handleSubmit, showStop, onCancel]);
 
   const fullDuplexActionEligible =
     !showStop &&
     !composerDisabled &&
-    !hasTextDraft &&
     attachments.length === 0 &&
     !isListening &&
     !isTranscribing &&
@@ -2138,6 +3055,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     beforeRange.selectNodeContents(el);
     beforeRange.setEnd(range.endContainer, range.endOffset);
     const beforeText = beforeRange.toString().replace(/\u200B/g, '');
+    const skillSuggestion = getSkillArgumentSuggestion(beforeText);
+    if (skillSuggestion) return skillSuggestion;
     const slashMatch = beforeText.match(/(?:^|\s)(\/)([a-zA-Z][\w-]*)?$/);
     if (slashMatch) {
       return { kind: 'slash', query: slashMatch[2] ?? '' };
@@ -2158,12 +3077,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       return;
     }
     // slash 指令不依赖团队成员，即便没有可 @ 的成员也照常弹出
-    if (trigger.kind !== 'slash' && mentionableMembers.length === 0) {
+    if (trigger.kind !== 'slash' && trigger.kind !== 'skill' && mentionCandidates.length === 0) {
       setComposerSuggestion(null);
       return;
     }
     setComposerSuggestion(trigger);
-  }, [getCurrentComposerTrigger, mentionableMembers.length]);
+  }, [getCurrentComposerTrigger, mentionCandidates.length]);
 
   const setRangeStartByTextOffset = useCallback((range: Range, root: HTMLElement, offset: number) => {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -2188,7 +3107,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       kind: ComposerSuggestionKind,
       value: string,
       label: string,
-      slashItemKind?: 'command' | 'skill',
+      slashItemKind?: 'command' | 'skill' | 'asset',
       slashTakesArgs?: boolean,
     ) => {
       const el = inputRef.current;
@@ -2197,9 +3116,49 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const range = selection.getRangeAt(0);
       if (!el.contains(range.commonAncestorContainer)) return;
 
+      if (kind === 'skill') {
+        const trigger = getCurrentComposerTrigger();
+        if (trigger?.kind !== 'skill') return;
+        const beforeRange = range.cloneRange();
+        beforeRange.selectNodeContents(el);
+        beforeRange.setEnd(range.endContainer, range.endOffset);
+        const caret = beforeRange.toString().replace(/\u200B/g, '').length;
+        const edit = getSkillArgumentReplacement(extractPlainText(), caret, trigger, value);
+        const endRange = range.cloneRange();
+        setRangeStartByTextOffset(endRange, el, edit.end);
+        range.setEnd(endRange.startContainer, endRange.startOffset);
+        setRangeStartByTextOffset(range, el, edit.start);
+        range.deleteContents();
+        const text = document.createTextNode(edit.text);
+        range.insertNode(text);
+        range.setStartAfter(text);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        const sid = useChatStore.getState().activeSessionId;
+        if (sid) useChatStore.getState().setInputValue(sid, extractPlainText());
+        setComposerSuggestion(null);
+        el.focus();
+        return;
+      }
+
       // slash 选中
       if (kind === 'slash') {
         if (slashItemKind === 'skill') {
+          const slashSid = useChatStore.getState().activeSessionId;
+          const slashRuntime = slashSid ? useSessionStore.getState().getRuntime(slashSid) : undefined;
+          if (
+            slashSid &&
+            isAgentGroupSelected(
+              slashRuntime?.mode,
+              slashRuntime?.agentGroupSelectionIntent,
+              slashRuntime?.agentGroupBinding,
+              slashRuntime?.agentGroupBindingPending,
+            )
+          ) {
+            setComposerSuggestion(null);
+            return;
+          }
           const trigger = getCurrentComposerTrigger();
           if (trigger) {
             const beforeRange = range.cloneRange();
@@ -2211,7 +3170,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             range.deleteContents();
           }
           savedRangeRef.current = range.cloneRange();
-          const slashSid = useChatStore.getState().activeSessionId;
           if (slashSid) useSessionStore.getState().addSelectedSkill(slashSid, value);
           insertSkillChipRef.current(value);
           setComposerSuggestion(null);
@@ -2224,9 +3182,18 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setComposerSuggestion(null);
           return;
         }
-        // 无参命令（/new、/fork、/plan、/compact）：选中即执行，不插入文本、不再等回车。
+        if (!canUseSlashCommand(slashCmd, Boolean(slashSid && slashSid !== NEW_CONVERSATION_ID))) {
+          pushAttachmentAlert(t('chat.commandRequiresSession'));
+          return;
+        }
+        // 无参命令（/fork、/plan、/compact）：选中即执行，不插入文本、不再等回车。
         // `/fork title`、`/plan hi` 这类手工输入不走此选中路径，提交时会被当作普通消息。
-        if (slashCmd && slashTakesArgs === false) {
+        // `/goal` 后端元数据是 takesArgs:true（要支持 `/goal <objective>` 一次性单发），但
+        // "不带正文、从建议菜单选中"这一种情况要跟 /plan 对齐——选中即武装、清空输入框，不再
+        // 插入占位 chip（bugfix 2026092201 bug001 子问题 3），所以这里单独把 'goal' 也纳入
+        // 这条"选中即执行"分支；executeSlashCommand 内部会按 args 是否为空区分"武装"还是
+        // 走 goalCommand 正常解析。
+        if (slashCmd && (slashTakesArgs === false || slashCmd.name === 'goal')) {
           const trigger = getCurrentComposerTrigger();
           if (trigger) {
             const beforeRange = range.cloneRange();
@@ -2237,43 +3204,25 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             setRangeStartByTextOffset(range, el, Math.max(0, beforeTextLength - triggerLength));
             range.deleteContents();
           }
-          if (slashCmd.name === 'new') {
-            if (slashSid) useChatStore.getState().setInputValue(slashSid, '');
-            setAttachments([]);
-            setAttachmentAlerts([]);
-            el.innerHTML = '';
-          } else if (slashSid) {
+          if (slashSid) {
             useChatStore.getState().setInputValue(slashSid, extractPlainText());
           }
           setComposerSuggestion(null);
           el.focus();
-          // requiresSession=false 的命令（如 /plan 纯本地开关）无需真实会话，欢迎页也能用
-          if (slashCmd.requiresSession === false || (slashSid && slashSid !== NEW_CONVERSATION_ID)) {
-            void executeSlashCommand(
-              slashCmd,
-              {
-                sessionId: slashSid ?? NEW_CONVERSATION_ID,
-                mode: slashMode,
-                inputLine: `/${value}`,
-                addMessage: useChatStore.getState().addMessage,
-                submitMessage: onSubmit,
-                startNewConversation: onNewSession,
-                forkConversation: onForkSession,
-                startSideConversation: onStartSideConversation,
-                runGoalAction: runGoalSlashAction,
-                confirmGoalOverwrite: (currentObjective, requestedObjective) =>
-                  window.confirm(t('goal.overwriteConfirm', { currentObjective, requestedObjective })),
-              },
-              '',
-            );
-          } else {
-            useChatStore.getState().addMessage(slashSid ?? NEW_CONVERSATION_ID, {
-              id: `slash-sys-${Date.now()}`,
-              role: 'system',
-              content: '请先开始一个对话再使用该指令。',
-              timestamp: new Date().toISOString(),
-            });
-          }
+          void executeSlashCommand(
+            slashCmd,
+            {
+              sessionId: slashSid ?? NEW_CONVERSATION_ID,
+              mode: slashMode,
+              inputLine: `/${value}`,
+              addMessage: useChatStore.getState().addMessage,
+              submitMessage: onSubmit,
+              forkConversation: onForkSession,
+              runGoalAction: runGoalSlashAction,
+              confirmGoalOverwrite,
+            },
+            '',
+          );
           return;
         }
         // 有参命令（如 /persist）：把 "/query" 替换成蓝色原子 chip。提取文本时再还原为
@@ -2351,7 +3300,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       chip.className = `chat-input-chip-inline chat-input-chip-inline--${kind}`;
       chip.setAttribute('contenteditable', 'false');
       chip.dataset.composerToken = kind;
+      chip.dataset.composerItemKind = slashItemKind ?? kind;
       chip.dataset.value = value;
+      chip.setAttribute('data-testid', 'chat-panel-composer-token');
+      chip.dataset.variant = value;
 
       const prefix = document.createElement('span');
       prefix.className = 'chat-input-chip-inline__prefix';
@@ -2402,19 +3354,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       executeSlashCommand,
       extractPlainText,
       getCurrentComposerTrigger,
+      releaseUnsentUploads,
       mode,
-      onNewSession,
       onForkSession,
-      onStartSideConversation,
       onSubmit,
       runGoalSlashAction,
+      pushAttachmentAlert,
       setRangeStartByTextOffset,
       t,
     ],
   );
 
   const notifyKVCInputIntent = useCallback(() => {
-    if (!activeSessionId || activeSessionId === NEW_CONVERSATION_ID) return;
+    if (!activeSessionId) return;
     onInputIntent?.(activeSessionId);
   }, [activeSessionId, onInputIntent]);
 
@@ -2450,13 +3402,47 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
         if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey) {
           if (isImeCompositionKey(e.nativeEvent, isComposingRef.current)) return;
-          e.preventDefault();
           const item = composerSuggestionItems[composerSuggestionIndex];
+          if (composerSuggestion.kind === 'skill' && !item) {
+            setComposerSuggestion(null);
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              handleSubmit();
+            }
+            return;
+          }
+          e.preventDefault();
+          if (e.key === 'Enter' && composerSuggestion.kind === 'slash') {
+            // 完整受限命令优先走提交守卫，避免过滤后误选名称/描述匹配的技能。
+            const content = extractRichContent();
+            const { name, args } = parseSlashLine(content);
+            const command = findSlashCommand(name);
+            const slashSid = useChatStore.getState().activeSessionId;
+            const slashMode = useSessionStore.getState().getRuntime(slashSid)?.mode ?? mode;
+            if (
+              command &&
+              shouldExecuteRegisteredSlashCommand(name, args, slashMode) &&
+              (!item || !canUseSlashCommand(command, Boolean(slashSid && slashSid !== NEW_CONVERSATION_ID)))
+            ) {
+              handleSubmit();
+              return;
+            }
+            if (!item && !content.trimStart().startsWith('/')) {
+              handleSubmit();
+              return;
+            }
+          }
           if (item && !item.disabled) {
             insertComposerToken(composerSuggestion.kind, item.id, item.label, item.itemKind, item.takesArgs);
           }
           return;
         }
+      }
+
+      if ((e.key === 'Tab' || e.key === 'ArrowRight') && !e.shiftKey && !isImeCompositionKey(e.nativeEvent, isComposingRef.current)
+          && !extractPlainText().trim() && onEmptyComposerTab?.()) {
+        e.preventDefault();
+        return;
       }
 
       if (e.key !== 'Enter' || e.shiftKey) return;
@@ -2468,10 +3454,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       composerSuggestion,
       composerSuggestionIndex,
       composerSuggestionItems,
+      extractRichContent,
       handleSubmit,
       insertComposerToken,
+      mode,
       moveComposerSuggestionHighlight,
       notifyKVCInputIntent,
+      onEmptyComposerTab,
     ],
   );
 
@@ -2495,7 +3484,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     const sid = useChatStore.getState().activeSessionId;
     if (!sid) return;
     // 提取纯文本
-    const text = extractPlainText();
+    let text = extractPlainText();
+    const editor = inputRef.current;
+    // Browsers leave empty line-break wrappers after deletion, preventing :empty placeholders.
+    if (editor && !isComposingRef.current && !text.trim()
+      && !editor.querySelector('[contenteditable="false"], img')) {
+      editor.replaceChildren();
+      text = '';
+    }
     useChatStore.getState().setInputValue(sid, text);
     if (text.trim() && sid !== NEW_CONVERSATION_ID) {
       notifyKVCInputIntent();
@@ -2532,6 +3528,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handleFileInputChange = useCallback(
     (event: ChangeEvent<HTMLInputElement>) => {
+      setIsPreparingFiles(false);
       const files = event.target.files;
       if (files) {
         void appendAttachmentFiles(files);
@@ -2591,14 +3588,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLDivElement>) => {
-      const hasText = Boolean(event.clipboardData.getData('text/plain').trim());
+      const text = event.clipboardData.getData('text/plain');
+      const hasText = text.length > 0;
       if (hasText) {
         notifyKVCInputIntent();
       }
       if (handleDesktopFilePaste(event)) return;
 
-      const imageFiles = getClipboardImageFiles(event.clipboardData);
-      if (imageFiles.length && !hasText) {
+      const { files: imageFiles, hasUnsupportedFiles } = inspectClipboardImageFiles(event.clipboardData);
+      if (hasUnsupportedFiles) {
+        event.preventDefault();
+        pushAttachmentAlert(t('chat.unsupportedImagePaste'));
+      }
+      if (imageFiles.length) {
         event.preventDefault();
         if (shouldAlertImagePasteDisabled(imageInputDisabled, true)) {
           pushAttachmentAlert(t(IMAGE_INPUT_DISABLED_ALERT_KEY));
@@ -2610,6 +3612,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
       if (clipboardHasFileItems(event.clipboardData) && !hasText) {
         event.preventDefault();
+        return;
+      }
+      if (hasText) {
+        event.preventDefault();
+        insertPlainText(event.currentTarget, text);
       }
     },
     [appendAttachmentFiles, handleDesktopFilePaste, imageInputDisabled, notifyKVCInputIntent, pushAttachmentAlert, t],
@@ -2627,6 +3634,25 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     document.addEventListener('paste', onDocumentPaste);
     return () => document.removeEventListener('paste', onDocumentPaste);
   }, [handleDesktopFilePaste, isDesktopBridgeReady]);
+
+  useEffect(() => {
+    // Context-menu Paste has no ClipboardEvent; desktop menu dispatches image blobs here.
+    const onDesktopClipboardImages = (event: Event) => {
+      const files = (event as CustomEvent<DesktopClipboardImagesEventDetail>).detail?.files;
+      if (!files?.length) return;
+      if (shouldAlertImagePasteDisabled(imageInputDisabled, true)) {
+        pushAttachmentAlert(t(IMAGE_INPUT_DISABLED_ALERT_KEY));
+        return;
+      }
+      if (imageInputDisabled) return;
+      appendAttachmentFiles(files);
+    };
+
+    window.addEventListener(DESKTOP_CLIPBOARD_IMAGES_EVENT, onDesktopClipboardImages as EventListener);
+    return () => {
+      window.removeEventListener(DESKTOP_CLIPBOARD_IMAGES_EVENT, onDesktopClipboardImages as EventListener);
+    };
+  }, [appendAttachmentFiles, imageInputDisabled, pushAttachmentAlert, t]);
 
   const handleFileDragOver = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
@@ -2653,7 +3679,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   /** 在光标处插入技能 chip（不可编辑原子节点） */
   const insertSkillChip = useCallback(
-    (skillName: string) => {
+    (skillName: string, textOffset?: number) => {
       const el = inputRef.current;
       if (!el) return;
       // 输入法合成中不插入
@@ -2665,11 +3691,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
       // 恢复保存的光标，否则用当前光标
       let range: Range;
-      if (savedRangeRef.current && el.contains(savedRangeRef.current.commonAncestorContainer)) {
+      if (textOffset !== undefined) {
+        range = createComposerSkillRange(el, textOffset);
+      } else if (savedRangeRef.current && el.contains(savedRangeRef.current.commonAncestorContainer)) {
         range = savedRangeRef.current;
         sel.removeAllRanges();
         sel.addRange(range);
-      } else if (sel.rangeCount > 0) {
+      } else if (sel.rangeCount > 0 && el.contains(sel.getRangeAt(0).commonAncestorContainer)) {
         range = sel.getRangeAt(0);
       } else {
         // 无光标，追加到末尾
@@ -2766,57 +3794,77 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   );
 
   // 监听从 SkillPanel 发来的"跳转到聊天并插入技能"事件
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as {
-        skillName: string;
-        prefixText?: string;
-        suffixText?: string;
-        secondSkillName?: string;
-      };
-      const sid = useChatStore.getState().activeSessionId;
-      if (!sid || !inputRef.current) return;
-
-      // 清空输入框并插入前缀文本（如"帮我修改这个技能"）
-      inputRef.current.textContent = detail.prefixText || '';
-      inputRef.current.focus();
-
-      // 将光标移到末尾，确保技能 chip 插入在前缀文本之后
-      const range = document.createRange();
-      range.selectNodeContents(inputRef.current);
-      range.collapse(false);
-      const sel = window.getSelection();
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-
-      // 先更新 store 中的 selectedSkills，再插入 chip DOM
-      useSessionStore.getState().addSelectedSkill(sid, detail.skillName);
-      insertSkillChip(detail.skillName);
-
-      // 如果有后缀文本（如"帮我修改这个技能"），追加到 chip 之后
-      if (detail.suffixText) {
-        inputRef.current.appendChild(document.createTextNode(detail.suffixText));
-        // 光标移到末尾
-        const r = document.createRange();
-        r.selectNodeContents(inputRef.current);
-        r.collapse(false);
-        const s = window.getSelection();
-        s?.removeAllRanges();
-        s?.addRange(r);
-      }
-
-      // 如果有第二个技能（如被编辑的技能），追加 chip
-      if (detail.secondSkillName) {
-        useSessionStore.getState().addSelectedSkill(sid, detail.secondSkillName);
-        insertSkillChip(detail.secondSkillName);
-      }
-
-      // 同步纯文本到 store（chip 不进入纯文本，前缀/后缀文本会保留）
-      useChatStore.getState().setInputValue(sid, extractPlainText());
+  const handleInsertSkillFromPage = useCallback((e: Event) => {
+    const detail = (e as CustomEvent).detail as {
+      skillName: string;
+      prefixText?: string;
+      suffixText?: string;
+      secondSkillName?: string;
+      preserveDraft?: boolean;
     };
-    window.addEventListener('chat-input-insert-skill', handler);
-    return () => window.removeEventListener('chat-input-insert-skill', handler);
-  }, [insertSkillChip, extractPlainText]);
+    const sid = useChatStore.getState().activeSessionId;
+    if (!sid || !inputRef.current) return;
+    const runtime = useSessionStore.getState().getRuntime(sid);
+    if (
+      isAgentGroupSelected(
+        runtime?.mode,
+        runtime?.agentGroupSelectionIntent,
+        runtime?.agentGroupBinding,
+        runtime?.agentGroupBindingPending,
+      )
+    ) return;
+
+    if (detail.preserveDraft) {
+      const editor = inputRef.current;
+      const alreadyInserted = Array.from(editor.querySelectorAll<HTMLElement>('[data-skill]'))
+        .some((chip) => chip.dataset.skill === detail.skillName);
+      useSessionStore.getState().addSelectedSkill(sid, detail.skillName);
+      // A saved selection from before navigation must not replace draft text.
+      if (!alreadyInserted) insertSkillChip(detail.skillName, readComposerText(editor).length);
+      return;
+    }
+
+    // 清空输入框并插入前缀文本（如"帮我修改这个技能"）
+    inputRef.current.textContent = detail.prefixText || '';
+    inputRef.current.focus();
+
+    // 将光标移到末尾，确保技能 chip 插入在前缀文本之后
+    const range = document.createRange();
+    range.selectNodeContents(inputRef.current);
+    range.collapse(false);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+
+    // 先更新 store 中的 selectedSkills，再插入 chip DOM
+    useSessionStore.getState().addSelectedSkill(sid, detail.skillName);
+    insertSkillChip(detail.skillName);
+
+    // 如果有后缀文本（如"帮我修改这个技能"），追加到 chip 之后
+    if (detail.suffixText) {
+      inputRef.current.appendChild(document.createTextNode(detail.suffixText));
+      // 光标移到末尾
+      const r = document.createRange();
+      r.selectNodeContents(inputRef.current);
+      r.collapse(false);
+      const s = window.getSelection();
+      s?.removeAllRanges();
+      s?.addRange(r);
+    }
+
+    // 如果有第二个技能（如被编辑的技能），追加 chip
+    if (detail.secondSkillName) {
+      useSessionStore.getState().addSelectedSkill(sid, detail.secondSkillName);
+      insertSkillChip(detail.secondSkillName);
+    }
+
+    // 同步纯文本到 store（chip 不进入纯文本，前缀/后缀文本会保留）
+    useChatStore.getState().setInputValue(sid, extractPlainText());
+  }, [extractPlainText, insertSkillChip]);
+  useEffect(() => {
+    window.addEventListener('chat-input-insert-skill', handleInsertSkillFromPage);
+    return () => window.removeEventListener('chat-input-insert-skill', handleInsertSkillFromPage);
+  }, [handleInsertSkillFromPage]);
   // 外部进入新会话时可以预选技能。把 canonical session state 同步成输入框
   // 中的 chip，避免用户开始编辑后被 handleEditorInput 误判为手动移除。
   useEffect(() => {
@@ -2827,6 +3875,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         .map((node) => node.getAttribute('data-skill'))
         .filter((name): name is string => Boolean(name)),
     );
+    const positions = useChatStore.getState().runtimes[activeSessionId]?.inputSkillPositions ?? [];
+    // Restore in DOM order, including multiple skills at the same text offset.
+    for (const { name, offset } of positions) {
+      if (selectedSkills.includes(name) && !existing.has(name)) {
+        insertSkillChip(name, offset);
+        existing.add(name);
+      }
+    }
     selectedSkills.forEach((skill) => {
       if (!existing.has(skill)) insertSkillChip(skill);
     });
@@ -2886,10 +3942,31 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const handleModeSwitch = useCallback(
     async (targetMode: AgentMode) => {
-      if (isProcessing || hasHistory || mode === targetMode) return;
+      if (modeLocked || mode === targetMode) return;
+      // Draft-session in-place mode switch: skills picked for the previous
+      // mode no longer apply, so drop them from the store and remove their
+      // inline chips from the editor. (Switching from a real session enters a
+      // fresh conversation instead, whose rebuilt runtime starts without
+      // skills, so the old session keeps its picks.)
+      const sid = activeSessionId;
+      if (sid && sid === NEW_CONVERSATION_ID) {
+        clearSelectedSkills(sid);
+        const el = inputRef.current;
+        if (el) {
+          el.querySelectorAll('[data-skill]').forEach((chip) => {
+            // Also drop the zero-width-space spacer after the chip.
+            const next = chip.nextSibling;
+            if (next && next.nodeType === Node.TEXT_NODE && next.textContent === '\u200B') {
+              next.remove();
+            }
+            chip.remove();
+          });
+          useChatStore.getState().setInputValue(sid, extractPlainText());
+        }
+      }
       onSwitchMode(targetMode);
     },
-    [isProcessing, hasHistory, mode, onSwitchMode],
+    [activeSessionId, clearSelectedSkills, extractPlainText, hasHistory, isProcessing, mode, onSwitchMode],
   );
 
   const handleModeSelect = useCallback(
@@ -2981,7 +4058,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const currentMode = AGENT_MODE_OPTIONS.find((item) => item.value === mode) ?? AGENT_MODE_OPTIONS[0];
   const evolutionLabel = getEvolutionPillLabel(mode, evolutionStatus, t);
   const attachmentAlertPortalTarget = inputRef.current?.closest<HTMLElement>('.chat-panel-shell');
-  const showSlashSuggestionBelow = showWorkContextRow && composerSuggestion?.kind === 'slash';
+  const showSlashSuggestionBelow =
+    showWorkContextRow && (composerSuggestion?.kind === 'slash' || composerSuggestion?.kind === 'skill');
 
   return (
     <>
@@ -3026,14 +4104,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           >
             <Loader2 className="chat-input-compact-progress__spinner" size={16} strokeWidth={1.8} aria-hidden="true" />
             <span>{t('chat.contextCompressionCommandRunning')}</span>
+            {compactElapsedSeconds !== undefined && (
+              <span
+                className="chat-input-compact-progress__elapsed context-compression-elapsed"
+                data-testid="chat-panel-input-compact-elapsed"
+              >
+                {contextCompressionElapsedText(t, compactElapsedSeconds)}
+              </span>
+            )}
           </div>
         )}
         <div
           className={cx(
             'chat-input-container',
+            enterprise && 'chat-input-container--enterprise',
             showWorkContextRow && 'chat-input-container--work-home',
             (isModeMenuOpen || workMenuOpen) && 'chat-input-container--menu-open',
-            composerSuggestion && !showSlashSuggestionBelow && 'chat-input-container--suggestion-open',
+            composerSuggestion && 'chat-input-container--suggestion-open',
             isListening && 'chat-input-container--recording',
             isCompactRunning && 'chat-input-container--command-pending',
           )}
@@ -3055,7 +4142,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           )}
 
           <div className="chat-input-body" data-testid="chat-panel-input-body">
-            {attachments.length > 0 && (
+            {(attachments.length > 0 || referencedAssetCards.length > 0 || isPreparingFiles) && (
               <div className="chat-input-attachment-panel" data-testid="chat-panel-input-attachment-panel">
                 <div
                   className={cx(
@@ -3064,6 +4151,51 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   )}
                   data-testid="chat-panel-input-attachment-grid"
                 >
+                  {isPreparingFiles && (
+                    <div
+                      className="chat-input-attachment-card chat-input-attachment-card--uploading"
+                      data-testid="chat-panel-input-attachment-preparing"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <div
+                        className="chat-input-attachment-preview"
+                        aria-hidden="true"
+                        data-testid="chat-panel-input-attachment-preparing-preview"
+                      >
+                        <Loader2 className="chat-input-attachment-spin" size={20} strokeWidth={2} />
+                      </div>
+                      <div
+                        className="chat-input-attachment-main"
+                        data-testid="chat-panel-input-attachment-preparing-main"
+                      >
+                        <div
+                          className="chat-input-attachment-name"
+                          data-testid="chat-panel-input-attachment-preparing-name"
+                        >
+                          <span className="chat-input-attachment-name-text">
+                            {t('chat.inputAttachment.preparingFiles')}
+                          </span>
+                        </div>
+                        <div
+                          className="chat-input-attachment-meta"
+                          data-testid="chat-panel-input-attachment-preparing-meta"
+                        >
+                          <span>{t('chat.inputAttachment.preparingFilesHint')}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="chat-input-attachment-remove"
+                        data-testid="chat-panel-input-attachment-preparing-dismiss"
+                        title={t('chat.inputAttachment.cancelPreparing')}
+                        aria-label={t('chat.inputAttachment.cancelPreparing')}
+                        onClick={() => setIsPreparingFiles(false)}
+                      >
+                        <X size={12} strokeWidth={2} />
+                      </button>
+                    </div>
+                  )}
                   {attachments.map((attachment) => (
                     <div
                       className={cx(
@@ -3090,13 +4222,54 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                         )}
                       </div>
                       <div className="chat-input-attachment-main" data-testid="chat-panel-input-attachment-main">
-                        <div
-                          className="chat-input-attachment-name"
-                          title={attachment.filename}
-                          data-testid="chat-panel-input-attachment-name"
-                        >
-                          {attachment.filename}
-                        </div>
+                        {renamingAttachmentId === attachment.id ? (
+                          <input
+                            autoFocus
+                            className="chat-input-attachment-name-input"
+                            value={attachmentRenameDraft}
+                            maxLength={60}
+                            aria-label={t('sessionAssets.rename')}
+                            data-testid="chat-panel-input-attachment-rename-input"
+                            onChange={(event) => setAttachmentRenameDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              event.stopPropagation();
+                              if (event.key === 'Enter') void commitAttachmentRename(attachment);
+                              if (event.key === 'Escape') setRenamingAttachmentId(null);
+                            }}
+                            onBlur={() => void commitAttachmentRename(attachment)}
+                          />
+                        ) : (
+                          <div
+                            className="chat-input-attachment-name"
+                            data-testid="chat-panel-input-attachment-name"
+                            onDoubleClick={() => {
+                              setAttachmentRenameDraft(attachment.assetName ?? attachment.filename);
+                              setRenamingAttachmentId(attachment.id);
+                            }}
+                          >
+                            {/* 文件名单独放一个可截断的 span：名字和"编辑"按钮各占各的，名字再长
+                                也不会把按钮挤到 overflow:hidden 的裁切区之外而看不见。 */}
+                            <span className="chat-input-attachment-name-text" title={attachment.assetName ?? attachment.filename}>
+                              {attachment.assetName ?? attachment.filename}
+                            </span>
+                            {attachment.status === 'ready' ? (
+                              <button
+                                type="button"
+                                className="chat-input-attachment-rename"
+                                title={t('sessionAssets.rename')}
+                                aria-label={t('sessionAssets.rename')}
+                                data-testid="chat-panel-input-attachment-rename"
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => {
+                                  setAttachmentRenameDraft(attachment.assetName ?? attachment.filename);
+                                  setRenamingAttachmentId(attachment.id);
+                                }}
+                              >
+                                <Pencil size={12} strokeWidth={2} />
+                              </button>
+                            ) : null}
+                          </div>
+                        )}
                         <div className="chat-input-attachment-meta" data-testid="chat-panel-input-attachment-meta">
                           {attachment.status === 'uploading' ? (
                             <>
@@ -3115,7 +4288,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                               >
                                 {t('chat.uploadFailed')}
                               </span>
-                              {attachment.file && (
+                              {canRetryAttachmentDraft(attachment) && (
                                 <button
                                   type="button"
                                   className="chat-input-attachment-retry"
@@ -3193,6 +4366,32 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                         )}
                     </div>
                   ))}
+                  {referencedAssetCards.map((card) => (
+                    <div
+                      className="chat-input-attachment-card chat-input-attachment-card--reference"
+                      key={card.key}
+                      data-testid="chat-panel-input-reference-card"
+                      data-variant={card.key}
+                    >
+                      <div
+                        className="chat-input-attachment-preview chat-input-attachment-preview--image"
+                        aria-hidden="true"
+                        data-testid="chat-panel-input-reference-preview"
+                      >
+                        {card.previewUrl ? <img src={card.previewUrl} alt="" /> : <FileIcon fileName={card.name} size={32} />}
+                      </div>
+                      <div className="chat-input-attachment-main" data-testid="chat-panel-input-reference-main">
+                        <div className="chat-input-attachment-name" data-testid="chat-panel-input-reference-name">
+                          <span className="chat-input-attachment-name-text" title={`@${card.name}`}>
+                            {card.name}
+                          </span>
+                        </div>
+                        <div className="chat-input-attachment-meta" data-testid="chat-panel-input-reference-meta">
+                          <span>{t('sessionAssets.reference')}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
@@ -3209,12 +4408,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 }}
                 onPick={insertComposerToken}
                 loading={slashCatalogLoading}
-                slashSkillsOnly={false}
+                slashSkillsOnly={isTeamMode || composerSuggestion.kind === 'skill'}
               />
             )}
             <div
               ref={inputRef}
               contentEditable={!composerDisabled}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
               aria-disabled={composerDisabled}
               suppressContentEditableWarning
               onBeforeInput={handleEditorBeforeInput}
@@ -3229,16 +4431,24 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               onBlur={saveSelection}
               onPaste={handlePaste}
               data-placeholder={
-                isCompactRunning
+                organizationTeamUnavailable
+                  ? t('chat.teamSelect.unavailableHint')
+                  : agentGroupUnavailable
+                  ? t('chat.placeholderAgentGroupDeleted')
+                  : isCompactRunning
                   ? t('chat.placeholderCompacting')
                   : hasPendingQuestion
                     ? t('chat.placeholderAwaitingApproval')
                     : isListening
                       ? t('chat.placeholderVoice')
-                      : isTeamMode
-                        ? isInterruptible && !isPaused
-                          ? t('chat.placeholderTeamModeProcessing')
-                          : t('chat.placeholderTeamMode')
+                      : designLandingSubmitting
+                        ? t('chat.placeholder')
+                        : suggestionPlaceholder
+                          ? suggestionPlaceholder
+                        : isTeamMode
+                          ? (isInterruptible || ownerOrganizationIsProcessing) && !isPaused
+                            ? t('chat.placeholderTeamModeProcessing')
+                            : t('chat.placeholderTeamMode')
                         : isAutoHarnessMode
                           ? t('autoHarness.inputPlaceholder')
                           : isAgentMode && isInterruptible
@@ -3253,6 +4463,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
             <div className="chat-input-toolbar" data-testid="chat-panel-input-toolbar">
               <div className="chat-input-toolbar-left" data-testid="chat-panel-input-toolbar-left">
+                {isTeamMode && organizationUiEnabled && (
+                  <TeamSelector sessionId={activeSessionId} isProcessing={isProcessing} groups={groupOptions} />
+                )}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -3275,7 +4488,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       if (!attachMenuOpen && attachMenuRef.current) {
                         const rect = attachMenuRef.current.getBoundingClientRect();
                         setAttachMenuAnchor(rect);
-                        setAttachMenuDirection(window.innerHeight - rect.bottom >= 200 ? 'down' : 'up');
+                        setAttachMenuDirection(resolveMenuDirection(rect.bottom, ATTACH_MENU_ESTIMATED_HEIGHT));
                       }
                       setAttachMenuOpen((open) => !open);
                       setExtensionPanelOpen(false);
@@ -3287,16 +4500,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       attachTriggerDisabled && 'chat-input-btn--disabled',
                       attachMenuOpen && 'chat-input-btn--menu-open',
                     )}
-                    title={attachTriggerDisabled ? t('chat.addFileDisabled') : undefined}
                     aria-label={attachTriggerDisabled ? t('chat.addFileDisabled') : t('chat.addFile')}
                     aria-haspopup="menu"
                     aria-expanded={attachMenuOpen}
-                    data-tooltip={attachTriggerDisabled ? t('chat.addFileDisabled') : t('chat.addFileTooltip')}
+                    data-tooltip={
+                      attachTriggerDisabled
+                        ? t('chat.addFileDisabled')
+                        : isDesignLanding
+                          ? t('chat.addFile')
+                          : t('chat.addFileTooltip')
+                    }
                     {...attachTooltipHandlers}
                   >
                     <Plus className="chat-input-btn-icon" strokeWidth={1.8} />
                   </button>
                   {attachTooltipNode}
+                  {uploadLimitsTooltipNode}
                   {attachMenuOpen &&
                     attachMenuAnchor &&
                     createPortal(
@@ -3327,7 +4546,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           role="menuitem"
                           data-testid="chat-panel-input-attach-menu-file"
                           disabled={imageInputDisabled}
-                          title={imageInputDisabled ? t('chat.addFileDisabled') : undefined}
+                          data-tooltip={imageInputDisabled ? t('chat.addFileDisabled') : uploadLimitsTooltip}
+                          {...uploadLimitsTooltipHandlers}
                           onClick={() => {
                             void openAttachmentPicker();
                           }}
@@ -3339,6 +4559,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                             <span className="chat-mode-select__label">{t('chat.addFile')}</span>
                           </span>
                         </button>
+                        {!isDesignLanding && (
+                        <>
                         <div className="chat-attach-menu-item-anchor">
                           <button
                             type="button"
@@ -3390,7 +4612,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                           <button type="button" role="tab" aria-selected={pickerTab === 'agent'} aria-disabled={agentSelectionDisabled} className={pickerTab === 'agent' ? 'is-active' : ''} disabled={agentSelectionDisabled} data-testid="chat-panel-agent-picker-agent-tab" title={agentSelectionDisabled ? t('chat.agentOnlyInSingleAgentMode') : undefined} onClick={() => { setPickerTab('agent'); setAgentPickerQuery(''); }}>{t('chat.agent')}</button>
                                         ) : null}
                                         {!isAgentMode ? (
-                                          <button type="button" role="tab" aria-selected={pickerTab === 'group'} aria-disabled={agentGroupSelectionDisabled} className={pickerTab === 'group' ? 'is-active' : ''} disabled={agentGroupSelectionDisabled} data-testid="chat-panel-agent-picker-agent-group-tab" title={isAgentMode ? t('chat.agentGroupOnlyInTeamMode') : existingTeamGroupSelectionDisabled ? t('chat.agentGroupFirstBuildOnly') : agentGroupLocked ? t('chat.agentGroupBinding') : undefined} onClick={() => { setPickerTab('group'); setAgentPickerQuery(''); }}>{t('chat.agentGroup')}</button>
+                                          <button type="button" role="tab" aria-selected={pickerTab === 'group'} aria-disabled={agentGroupSelectionDisabled} className={pickerTab === 'group' ? 'is-active' : ''} disabled={agentGroupSelectionDisabled} data-testid="chat-panel-agent-picker-agent-group-tab" title={isAgentMode ? t('chat.agentGroupOnlyInTeamMode') : teamSkillSelectionActive ? t('chat.teamSkillsGroupLocked') : existingTeamGroupSelectionDisabled ? t('chat.agentGroupFirstBuildOnly') : agentGroupLocked ? t('chat.agentGroupBinding') : undefined} onClick={() => { setPickerTab('group'); setAgentPickerQuery(''); }}>{t('chat.agentGroup')}</button>
                                         ) : null}
                                       </div>
                                     ) : null
@@ -3421,7 +4643,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                       data-testid="chat-panel-agent-picker-state"
                                       data-variant="loading"
                                     >
-                                      {t('common.loading')}
+                                      {agentPodNotice === 'starting' ? t('experts.podStarting') : t('common.loading')}
                                     </div>
                                   ) : pickerTab === 'agent' && agentOptionsStatus === 'error' ? (
                                 <div
@@ -3429,7 +4651,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                   data-testid="chat-panel-agent-picker-state"
                                   data-variant="error"
                                 >
-                                  {t('agentManagement.states.loadError')}
+                                  {agentPodNotice === 'timeout' ? t('experts.podStartTimeout') : t('agentManagement.states.loadError')}
                                 </div>
                               ) : pickerTab === 'agent' && filteredAgentOptions.length === 0 ? (
                                 <div
@@ -3445,6 +4667,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                 filteredAgentOptions.map((item) => {
                                   const avatarUrl = getAgentAvatarUrl(item);
                                   const isSelected = isSameAgentOption(item, selectedAgentId);
+                                  const externalSwitchBlocked =
+                                    externalAgentSwitchBlocked && isExternalHarnessCatalogItem(item);
                                   return (
                                     <button
                                       key={item.id}
@@ -3452,21 +4676,27 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                       className={clsx(
                                         'chat-agent-picker__item',
                                         isSelected && 'is-selected',
-                                        agentSelectionDisabled && 'is-locked',
+                                        (agentSelectionDisabled || externalSwitchBlocked) && 'is-locked',
                                       )}
                                       role="menuitemradio"
                                       aria-checked={isSelected}
-                                      aria-disabled={agentSelectionDisabled}
+                                      aria-disabled={agentSelectionDisabled || externalSwitchBlocked}
                                       data-testid="chat-panel-agent-picker-item"
                                       data-variant={item.id}
                                       data-tooltip={
                                         agentSelectionDisabled
                                           ? t('chat.agentOnlyInSingleAgentMode')
-                                          : item.description || undefined
+                                          : externalSwitchBlocked
+                                            ? t('chat.externalAgentRequiresNewSession')
+                                            : item.description || undefined
                                       }
                                       {...agentTooltipHandlers}
                                       onClick={() => {
                                         if (!activeSessionId || agentSelectionDisabled) return;
+                                        if (externalSwitchBlocked) {
+                                          setExternalAgentSwitchNotice(t('chat.externalAgentRequiresNewSession'));
+                                          return;
+                                        }
                                         useSessionStore.getState().setMode(activeSessionId, 'agent');
                                         setAgentSelectionIntent(activeSessionId, { kind: 'select', id: item.id });
                                         setAttachMenuOpen(false);
@@ -3523,7 +4753,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                 </div>
                               ) : (
                                 filteredGroupOptions.map((item) => {
-                                  const isSelected = selectedGroupId === item.id;
+                                  const isSelected = selectedGroupId === item.name;
                                   const groupAvatarUrl =
                                     item.avatarUrl && !failedGroupAvatarIds.has(item.id) ? item.avatarUrl : null;
                                   return (
@@ -3543,15 +4773,36 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                       data-tooltip={
                                         isAgentMode
                                           ? t('chat.agentGroupOnlyInTeamMode')
-                                          : existingTeamGroupSelectionDisabled
+                                          : teamSkillSelectionActive
+                                            ? t('chat.teamSkillsGroupLocked')
+                                            : existingTeamGroupSelectionDisabled
                                             ? t('chat.agentGroupFirstBuildOnly')
-                                            : item.description || t('chat.agentGroupBinding')
+                                            : item.description || t('chat.agentGroupNoDescription')
                                       }
                                       {...agentTooltipHandlers}
-                                      onClick={() => {
+                                      onClick={async () => {
                                         if (agentGroupSelectionDisabled || !activeSessionId) return;
+                                        try {
+                                          const result = await webRequest<{ group?: { disabledRuntimes?: string[] } }>(
+                                            'agent_groups.show', { id: item.id },
+                                          );
+                                          const disabled = result.group?.disabledRuntimes ?? [];
+                                          if (disabled.length > 0) {
+                                            setGroupRuntimeNotice(t('chat.agentGroupRuntimeDisabled', {
+                                              agents: disabled.map((name) => {
+                                                if (name === 'claude') return 'Claude';
+                                                if (name === 'codex') return 'Codex';
+                                                return name;
+                                              }).join(', '),
+                                            }));
+                                            return;
+                                          }
+                                        } catch (error) {
+                                          setGroupRuntimeNotice(String(error));
+                                          return;
+                                        }
                                         useSessionStore.getState().setMode(activeSessionId, 'team');
-                                        setAgentGroupSelectionIntent(activeSessionId, { kind: 'select', id: item.id });
+                                        setAgentGroupSelectionIntent(activeSessionId, { kind: 'select', id: item.name });
                                         setAgentSelectionIntent(activeSessionId, { kind: 'clear' });
                                         clearSelectedSkills(activeSessionId);
                                         setAttachMenuOpen(false);
@@ -3591,6 +4842,18 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                               )}
                             </PickerPanel>
                           )}
+                          {externalAgentSwitchNotice ? (
+                            <div className="app-toast-wrapper app-toast-wrapper--top-center">
+                              <div
+                                className="app-session-toast"
+                                role="status"
+                                aria-live="polite"
+                                data-testid="chat-panel-external-agent-switch-notice"
+                              >
+                                {externalAgentSwitchNotice}
+                              </div>
+                            </div>
+                          ) : null}
                           {agentTooltipNode}
                         </div>
                         {/* 插件/MCP 装备目前后端在集群模式下不生效（JiuWenSwarmDeepAdapter
@@ -3638,7 +4901,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                             />
                           )}
                         </div>
-                        {!isTeamMode && (
+                        {!enterprise && !isTeamMode && (
                           <div className="chat-attach-menu-item-anchor">
                             <button
                               type="button"
@@ -3732,7 +4995,57 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                               </div>
                             );
                           })()}
-                        {isTeamMode &&
+                        {isTeamMode && teamScheduledDispatchEnabled && (
+                          <div
+                            className={cx(
+                              'chat-mode-select__option',
+                              teamDispatchToggleDisabled && 'chat-mode-select__option--disabled',
+                            )}
+                            role="menuitem"
+                            data-testid="chat-panel-input-attach-menu-team-dispatch"
+                            title={t(teamDispatchToggleDisabled ? 'teamDispatch.readonlyHint' : 'teamDispatch.toggleHint')}
+                            onClick={() => setTeamDispatchScheduled(!teamDispatchScheduled)}
+                          >
+                            <span className="chat-mode-select__option-main">
+                              <span className="chat-mode-select__icon" aria-hidden="true">
+                                <ListChecks className="w-4 h-4" />
+                              </span>
+                              <span className="chat-mode-select__label">{t('teamDispatch.toggleLabel')}</span>
+                            </span>
+                            <Switch
+                              checked={teamDispatchScheduled}
+                              disabled={teamDispatchToggleDisabled}
+                              onChange={setTeamDispatchScheduled}
+                            />
+                          </div>
+                        )}
+                        {isTeamMode && teamScheduledDispatchEnabled && teamDispatchScheduled && (
+                          <div
+                            className={cx(
+                              'chat-mode-select__option',
+                              'chat-mode-select__option--sub',
+                              teamDispatchToggleDisabled && 'chat-mode-select__option--disabled',
+                            )}
+                            role="menuitem"
+                            data-testid="chat-panel-input-attach-menu-team-bootstrap"
+                            title={t(teamDispatchToggleDisabled ? 'teamBootstrap.readonlyHint' : 'teamBootstrap.toggleHint')}
+                            onClick={() => setTeamBootstrapFramework(!teamBootstrapFramework)}
+                          >
+                            <span className="chat-mode-select__option-main">
+                              <span className="chat-mode-select__icon" aria-hidden="true">
+                                <Rocket className="w-4 h-4" />
+                              </span>
+                              <span className="chat-mode-select__label">{t('teamBootstrap.toggleLabel')}</span>
+                            </span>
+                            <Switch
+                              checked={teamBootstrapFramework}
+                              disabled={teamDispatchToggleDisabled}
+                              onChange={setTeamBootstrapFramework}
+                            />
+                          </div>
+                        )}
+                        {!enterprise &&
+                          isTeamMode &&
                           (() => {
                             const toggleSwarmflow = (next: boolean) => {
                               if (!activeSessionId || swarmflowToggleDisabled) return;
@@ -3781,8 +5094,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       if (!swarmflowActive) return;
-                                      if (!swarmflowConfigPanelOpen && swarmflowConfigBtnRef.current) {
-                                        setSwarmflowConfigAnchor(swarmflowConfigBtnRef.current.getBoundingClientRect());
+                                      if (!swarmflowConfigPanelOpen) {
+                                        if (swarmflowConfigBtnRef.current) {
+                                          setSwarmflowConfigAnchor(
+                                            swarmflowConfigBtnRef.current.getBoundingClientRect(),
+                                          );
+                                        }
                                       }
                                       setSwarmflowConfigPanelOpen((open) => !open);
                                     }}
@@ -3800,33 +5117,31 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           })()}
                         {canUseGoalMenu &&
                           (() => {
-                            // Goal 和 Plan 互斥：已有真正生效的计划时不能再选目标；"打开"方向沿用原逻辑，
-                            // "关闭"方向不受限制（跟输入框旁边现有的目标 chip 关闭按钮一致，随时可关）。
+                            // Goal 和 Plan 互斥：已有真正生效的计划时不能再选目标。能否武装/解除武装统一走
+                            // goalModeGate（evaluateGoalArm/applyGoalArm）——`/goal` 斜杠命令选中即武装、
+                            // 目标 tag 关闭按钮也调同一套决策层，不再各自定制一份判断（bugfix 2026092201
+                            // bug001；第2轮补上关闭方向的会话忙态保护）。
                             const goalChecked = goalArmed || hasUnfinishedGoal;
-                            const goalDisabledOn = hasUnfinishedGoal || planCommitted;
-                            const goalDisabledOnTitle = hasUnfinishedGoal
-                              ? t('goal.toolbarUnavailable')
-                              : planCommitted
-                                ? t('goal.toolbarUnavailablePlan')
-                                : undefined;
-                            const goalDisabled = goalChecked ? false : goalDisabledOn;
-                            const goalTitle = goalChecked ? undefined : goalDisabledOnTitle;
+                            // bugfix 2026092201 bug001 第2轮：开、关两个方向分别求 evaluateGoalArm 的决策——
+                            // 之前"已勾选就永远不 disabled"会导致目标真正执行期间（goalChecked 恒为 true）
+                            // 这个开关完全没有保护，随手一点 `next=false` 就会把执行中的目标清掉、会话跟着
+                            // 停摆。现在关闭方向也要过 evaluateGoalArm 的忙态检查，跟"计划"开关关闭时受
+                            // planModeGate 保护的做法对齐。
+                            const goalOffDecision = evaluateGoalArm(activeSessionId, false);
+                            const goalOnDecision = evaluateGoalArm(activeSessionId, true);
+                            const goalDisabled = goalChecked ? !goalOffDecision.ok : !goalOnDecision.ok;
+                            const goalActiveDecision = goalChecked ? goalOffDecision : goalOnDecision;
+                            const goalTitle = goalActiveDecision.reason ? t(goalActiveDecision.reason) : undefined;
                             const toggleGoal = (next: boolean) => {
                               if (!activeSessionId) return;
                               if (next) {
-                                if (goalDisabledOn) return;
-                                // 走到这里 planCommitted 一定是 false（否则上面已 disabled），所以 planActive
-                                // 为 true 时只可能是"刚打开开关、还没发过消息"的未提交态，可以放心顶掉。
-                                // 内部互斥复位（非用户主动退出计划模式），直接 setActive、不过 planModeGate。
-                                if (planActive) {
-                                  usePlanStore.getState().setActive(activeSessionId, false);
-                                }
-                                useGoalStore.getState().setArmed(activeSessionId, true);
-                              } else {
-                                if (currentGoal) {
-                                  onClearGoal?.(activeSessionId);
-                                }
-                                useGoalStore.getState().setArmed(activeSessionId, false);
+                                applyGoalArm(activeSessionId, true);
+                                return;
+                              }
+                              const applied = applyGoalArm(activeSessionId, false);
+                              if (!applied) return;
+                              if (currentGoal) {
+                                onClearGoal?.(activeSessionId);
                               }
                               // 不关闭菜单：用户拨动开关后保持菜单打开，便于看到开关状态变化并继续操作。
                             };
@@ -3857,7 +5172,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                               </div>
                             );
                           })()}
-                        {personalContextMasterEnabled && (
+                          {!enterprise && personalContextMasterEnabled && (
                           <div
                             className="chat-mode-select__option"
                             role="menuitem"
@@ -3876,10 +5191,29 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                             />
                           </div>
                         )}
+                        </>
+                        )}
                       </div>,
                       document.body,
                     )}
                 </div>
+                {workMode === 'design' && showWorkContextRow && (
+                  <div className="chat-mode-select" data-testid="chat-panel-video-generation">
+                    <div
+                      className="chat-mode-select__trigger chat-mode-select__trigger--feature-on chat-mode-select__trigger--current"
+                      data-testid="chat-panel-video-generation-trigger"
+                    >
+                      <span className="chat-mode-select__value">
+                        <span className="chat-mode-select__icon" aria-hidden="true">
+                          <SquarePlay className="w-4 h-4" />
+                        </span>
+                        <span className="chat-mode-select__label">{t('chat.videoGeneration')}</span>
+                      </span>
+                    </div>
+                  </div>
+                )}
+                {workMode !== 'design' && (
+                <>
                 <div
                   ref={modeMenuRef}
                   className={clsx('chat-mode-select', isModeMenuOpen && 'chat-mode-select--open')}
@@ -3891,7 +5225,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     data-testid="chat-panel-mode-select-trigger"
                     data-variant={currentMode.value}
                     onClick={() => {
-                      if (hasHistory || isProcessing) return;
+                      if (modeLocked) return;
                       if (!isModeMenuOpen && modeMenuRef.current) {
                         const rect = modeMenuRef.current.getBoundingClientRect();
                         setMenuDirection(resolveMenuDirection(rect.bottom, 160));
@@ -3899,9 +5233,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       }
                       setIsModeMenuOpen((open) => !open);
                     }}
-                    aria-haspopup="menu"
-                    aria-expanded={isModeMenuOpen}
-                    style={hasHistory || isProcessing ? { cursor: 'default' } : undefined}
+                    disabled={enterprise}
+                    aria-haspopup={enterprise ? undefined : 'menu'}
+                    aria-expanded={enterprise ? undefined : isModeMenuOpen}
+                    style={modeLocked ? { cursor: 'default' } : undefined}
                   >
                     <span className="chat-mode-select__value" data-testid="chat-panel-mode-select-value">
                       <span className="chat-mode-select__icon" aria-hidden="true">
@@ -3909,7 +5244,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       </span>
                       <span className="chat-mode-select__label">{t(currentMode.i18nKey)}</span>
                     </span>
-                    {!hasHistory && !isProcessing && (
+                    {!modeLocked && (
                       <svg
                         className="chat-mode-select__chevron"
                         viewBox="0 0 20 20"
@@ -3923,7 +5258,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     )}
                   </button>
 
-                  {isModeMenuOpen &&
+                  {!enterprise &&
+                    isModeMenuOpen &&
                     modeMenuAnchor &&
                     createPortal(
                       <div
@@ -3993,7 +5329,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       </div>,
                       document.body,
                     )}
-                  {isModeMenuOpen &&
+                  {!enterprise &&
+                    isModeMenuOpen &&
                     hoveredOptionDesc &&
                     hoveredOptionRect &&
                     createPortal(
@@ -4012,12 +5349,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       document.body,
                     )}
                 </div>
-                {!isTeamMode && (
+                {!enterprise && !isTeamMode && (
                   <PermissionSelector
                     mode={mode}
                     permissionProfile={permissionProfile}
                     onSavePermission={onSavePermission}
                   />
+                )}
+                </>
                 )}
 
                 {selectedAgentId && (
@@ -4033,17 +5372,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     <button
                       type="button"
                       className="chat-agent-tag__close"
-                      title={t('chat.agentRemove')}
                       aria-label={t('chat.agentRemove')}
                       onClick={() => {
                         if (activeSessionId) setAgentSelectionIntent(activeSessionId, { kind: 'clear' });
                       }}
                     >
-                      <X size={16} strokeWidth={2.5} aria-hidden="true" />
+                      <WorkIcon name="close" />
                     </button>
                   </div>
                 )}
-                {selectedGroupId && isTeamMode && (
+                {displayedGroupId && isTeamMode && (
                   <div
                     className={clsx(
                       'chat-agent-tag chat-agent-group-tag',
@@ -4059,22 +5397,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     }
                   >
                     <span className="chat-agent-tag__avatar" aria-hidden="true">
-                      {selectedGroup?.avatarUrl && !failedGroupAvatarIds.has(selectedGroup.id) ? (
+                      {displayedGroup?.avatarUrl && !failedGroupAvatarIds.has(displayedGroup.id) ? (
                         <img
-                          src={selectedGroup.avatarUrl}
+                          src={displayedGroup.avatarUrl}
                           alt=""
                           onError={() =>
                             setFailedGroupAvatarIds((current) =>
-                              current.has(selectedGroup.id) ? current : new Set([...current, selectedGroup.id]),
+                              current.has(displayedGroup.id) ? current : new Set([...current, displayedGroup.id]),
                             )
                           }
                         />
                       ) : (
-                        (selectedGroup?.displayName || selectedGroupId).trim().slice(0, 1).toUpperCase() || '?'
+                        displayedGroupName?.trim().slice(0, 1).toUpperCase() || '?'
                       )}
                     </span>
                     <span className="chat-agent-tag__label" data-testid="chat-panel-agent-group-tag-label">
-                      {selectedGroup?.displayName || selectedGroupId}
+                      {displayedGroupName}
                     </span>
                     {agentGroupLocked || existingTeamGroupSelectionDisabled ? (
                       <Lock className="chat-agent-tag__lock" size={12} strokeWidth={2} aria-hidden="true" />
@@ -4083,44 +5421,51 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       <button
                         type="button"
                         className="chat-agent-tag__close"
-                        title={t('chat.agentGroupRemove')}
                         aria-label={t('chat.agentGroupRemove')}
                         data-testid="chat-panel-agent-group-tag-close"
-                        onClick={() => {
-                          if (activeSessionId) clearAgentGroupSelectionIntent(activeSessionId);
-                        }}
-                      >
-                        <X size={16} strokeWidth={2.5} aria-hidden="true" />
-                      </button>
+                          onClick={() => {
+                            if (activeSessionId) clearAgentGroupSelectionIntent(activeSessionId);
+                          }}
+                        >
+                          <WorkIcon name="close" />
+                        </button>
                     )}
                   </div>
                 )}
-                {goalTagVisible && (
-                  <div className="chat-agent-tag" data-testid="chat-panel-goal-tag">
-                    <span className="chat-agent-tag__avatar chat-agent-tag__avatar--plain" aria-hidden="true">
-                      <GoalIcon aria-hidden="true" />
-                    </span>
-                    <span className="chat-agent-tag__label" data-testid="chat-panel-goal-tag-label">
-                      {t('goal.toolbarTag')}
-                    </span>
-                    <button
-                      type="button"
-                      className="chat-agent-tag__close"
-                      data-testid="chat-panel-goal-tag-close"
-                      title={t('goal.closeTag')}
-                      aria-label={t('goal.closeTag')}
-                      onClick={() => {
-                        if (!activeSessionId) return;
-                        if (currentGoal) {
-                          onClearGoal?.(activeSessionId);
-                        }
-                        useGoalStore.getState().setArmed(activeSessionId, false);
-                      }}
-                    >
-                      <X size={16} strokeWidth={2.5} aria-hidden="true" />
-                    </button>
-                  </div>
-                )}
+                {goalTagVisible &&
+                  (() => {
+                    // 关闭「目标」tag 与"+"菜单目标开关、evaluateGoalArm 共用同一套忙态保护
+                    // （bugfix 2026092201 bug001 第2轮）：目标真正执行期间不能被随手关掉/清除，
+                    // 跟「计划」chip 关闭按钮受 planModeGate 保护的做法对齐。
+                    const goalCloseBlocked = !evaluateGoalArm(activeSessionId, false).ok;
+                    return (
+                      <div className="chat-agent-tag" data-testid="chat-panel-goal-tag">
+                        <span className="chat-agent-tag__avatar chat-agent-tag__avatar--plain" aria-hidden="true">
+                          <GoalIcon aria-hidden="true" />
+                        </span>
+                        <span className="chat-agent-tag__label" data-testid="chat-panel-goal-tag-label">
+                          {t('goal.toolbarTag')}
+                        </span>
+                        <button
+                          type="button"
+                          className="chat-agent-tag__close"
+                          data-testid="chat-panel-goal-tag-close"
+                          disabled={goalCloseBlocked}
+                          aria-label={goalCloseBlocked ? t('goal.closeTagDisabled') : t('goal.closeTag')}
+                          onClick={() => {
+                            if (!activeSessionId) return;
+                            const applied = applyGoalArm(activeSessionId, false);
+                            if (!applied) return;
+                            if (currentGoal) {
+                              onClearGoal?.(activeSessionId);
+                            }
+                          }}
+                        >
+                          <WorkIcon name="close" />
+                        </button>
+                      </div>
+                    );
+                  })()}
 
                 {planTagVisible && (
                   <div className="chat-agent-tag" data-testid="chat-panel-plan-tag">
@@ -4140,16 +5485,49 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           className="chat-agent-tag__close"
                           data-testid="chat-panel-plan-tag-close"
                           disabled={closeBlocked}
-                          title={closeBlocked ? t('plan.closeTagDisabled') : t('plan.closeTag')}
                           aria-label={closeBlocked ? t('plan.closeTagDisabled') : t('plan.closeTag')}
                           onClick={() => {
                             applyPlanToggle(activeSessionId, false);
                           }}
                         >
-                          <X size={16} strokeWidth={2.5} aria-hidden="true" />
+                          <WorkIcon name="close" />
                         </button>
                       );
                     })()}
+                  </div>
+                )}
+
+                {persistTagVisible && (
+                  // 永续会话标记：persist_session 是 session.create 的一次性参数，会话存续期间
+                  // 后端没有关闭入口。会话还没有任何消息时展示 ×、点击仅本地隐藏（切走再切回
+                  // 会随会话记录回灌回来），hover 沿用 agent-tag「图标换 ×」的交换交互；一旦
+                  // 发过消息（hasHistory）直接不渲染 ×，并加 --static 修饰让图标 hover 常显，
+                  // 避免悬停时图标消失又没有 × 补位、标签视觉上缺一块。
+                  <div
+                    className={hasHistory ? 'chat-agent-tag chat-agent-tag--static' : 'chat-agent-tag'}
+                    data-testid="chat-panel-persist-tag"
+                  >
+                    <span className="chat-agent-tag__avatar chat-agent-tag__avatar--plain" aria-hidden="true">
+                      <InfinityIcon size={16} aria-hidden="true" />
+                    </span>
+                    <span className="chat-agent-tag__label" data-testid="chat-panel-persist-tag-label">
+                      {t('persistSession.toolbarTag')}
+                    </span>
+                    {!hasHistory && (
+                      <button
+                        type="button"
+                        className="chat-agent-tag__close"
+                        data-testid="chat-panel-persist-tag-close"
+                        aria-label={t('persistSession.closeTag')}
+                        title={t('persistSession.closeTag')}
+                        onClick={() => {
+                          if (!activeSessionId) return;
+                          useSessionStore.getState().setPersistSession(activeSessionId, false);
+                        }}
+                      >
+                        <WorkIcon name="close" />
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -4225,13 +5603,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
                 {(isAgentMode || isTeamMode) && <ContextUsageIndicator />}
 
-                <ChatModelSelector
+                {isListening ? <RecordingWaveform level={audioLevel} /> : <ChatModelSelector
                   disabled={
                     isProcessing || composerDisabled || (!isAgentMode && activeSessionId !== NEW_CONVERSATION_ID)
                   }
-                />
+                  includeModelGroups={!isDesignLanding}
+                />}
 
-                <button
+                {taskAsrEnabled && <button
                   type="button"
                   onClick={toggleRecording}
                   disabled={composerDisabled || isTranscribing || !taskAsrSupported}
@@ -4240,7 +5619,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     isListening && 'chat-input-btn--recording',
                     (composerDisabled || isTranscribing || !taskAsrSupported) && 'chat-input-btn--disabled',
                   )}
-                  aria-label={isListening ? t('chat.stopRecording') : t('chat.startRecording')}
+                  aria-label={isTranscribing ? t('chat.transcribing') : isListening ? t('chat.stopRecording') : t('chat.startRecording')}
                   aria-pressed={isListening}
                   data-tooltip={
                     isTranscribing
@@ -4260,14 +5639,17 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       strokeWidth={1.8}
                       aria-hidden="true"
                     />
+                  ) : isListening ? (
+                    <Square className="chat-input-btn-icon" fill="currentColor" strokeWidth={1.8} aria-hidden="true" />
                   ) : (
                     <Mic className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
                   )}
-                </button>
+                </button>}
                 {micTooltipNode}
 
                 <ApplicationPluginTaskInputActions
-                  eligible={fullDuplexActionEligible}
+                  eligible={fullDuplexActionEligible && (!isTeamMode || isDesignLanding)}
+                  hasTextDraft={hasTextDraft}
                   sessionId={activeSessionId}
                   ensureSession={onEnsureSession}
                   labels={{
@@ -4286,12 +5668,18 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           showStop && 'chat-input-btn--stop',
                           canSubmit ? 'chat-input-btn--send-active' : 'chat-input-btn--disabled',
                         )}
-                        data-tooltip={showStop ? t('chat.stop') : t('chat.send')}
+                        data-tooltip={designLandingSubmitting ? undefined : showStop ? t('chat.stop') : t('chat.send')}
                         {...sendTooltipHandlers}
                         data-testid="chat-panel-input-send"
-                        data-variant={showStop ? 'stop' : 'send'}
+                        data-variant={designLandingSubmitting ? 'submitting' : showStop ? 'stop' : 'send'}
                       >
-                        {showStop ? (
+                        {designLandingSubmitting ? (
+                          <Loader2
+                            className="chat-input-btn-icon chat-input-btn-icon--spin"
+                            strokeWidth={1.8}
+                            aria-hidden="true"
+                          />
+                        ) : showStop ? (
                           <Square
                             className="chat-input-btn-icon"
                             fill="currentColor"
@@ -4330,7 +5718,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   }}
                   onPick={insertComposerToken}
                   loading={slashCatalogLoading}
-                  slashSkillsOnly={false}
+                  slashSkillsOnly={isTeamMode || composerSuggestion.kind === 'skill'}
                   placement="below"
                 />
               )}
@@ -4714,18 +6102,58 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                         </>
                       );
                     })()}
-                    {swarmflowToggleDisabled && (
-                      <span className="chat-swarmflow-config-panel__readonly-hint">
-                        {t('swarmflow.configReadonlyHint')}
-                      </span>
-                    )}
                   </div>
+                  {swarmflowToggleDisabled && (
+                    <span className="chat-swarmflow-config-panel__readonly-hint">
+                      {t('swarmflow.configReadonlyHint')}
+                    </span>
+                  )}
                 </div>,
                 document.body,
               );
             })()}
         </div>
       </div>
+
+      <Dialog
+        open={groupRuntimeNotice !== null}
+        titleId="group-runtime-notice-title"
+        className="chat-group-runtime-dialog"
+        onCancel={() => setGroupRuntimeNotice(null)}
+        onBackdropClick={() => setGroupRuntimeNotice(null)}
+      >
+        <div className="chat-group-runtime-dialog__header" data-testid="chat-panel-group-runtime-notice-header">
+          <h2 id="group-runtime-notice-title">{t('chat.agentGroupRuntimeDisabledTitle')}</h2>
+          <CloseButton
+            testId="chat-panel-group-runtime-notice-close"
+            ariaLabel={t('common.close')}
+            onClick={() => setGroupRuntimeNotice(null)}
+          />
+        </div>
+        <p className="chat-group-runtime-dialog__message" data-testid="chat-panel-group-runtime-notice">
+          {groupRuntimeNotice}
+        </p>
+        <div className="chat-group-runtime-dialog__actions" data-testid="chat-panel-group-runtime-notice-actions">
+          <Button variant="primary" data-testid="chat-panel-group-runtime-notice-confirm"
+            onClick={() => setGroupRuntimeNotice(null)}>
+            {t('chat.agentGroupRuntimeDisabledConfirm')}
+          </Button>
+        </div>
+      </Dialog>
+      {goalOverwriteRequest && (
+        <OverwriteGoalConfirmModal
+          currentObjective={goalOverwriteRequest.currentObjective}
+          requestedObjective={goalOverwriteRequest.requestedObjective}
+          onConfirm={() => {
+            goalOverwriteRequest.resolve(true);
+            setGoalOverwriteRequest(null);
+          }}
+          onCancel={() => {
+            goalOverwriteRequest.resolve(false);
+            setGoalOverwriteRequest(null);
+          }}
+        />
+      )}
     </>
   );
 });
@@ -4757,6 +6185,65 @@ function ProjectAddSubmenu({ onCreate }: { onCreate: (mode: ProjectCreateMode) =
   );
 }
 
+/**
+ * @ 素材候选里的缩略图。
+ *
+ * - 图片：直接显示真图；
+ * - 视频：没有现成缩略图，用 `<video preload="metadata">` + `#t=` 让浏览器解出第一帧。
+ *   先摆类型图标占位，解出帧再换成真帧——服务端不支持 Range，拿不到帧时会一直是图标，
+ *   不会出现一个黑方块。
+ * - 其余情况（读不到图、不是媒体）退回文件图标；图标按**路径**判类型，因为素材名常常
+ *   没有扩展名，只看名字会退成灰向号。
+ */
+function AssetSuggestionThumb({ src, label, kind, path }: {
+  src?: string;
+  label: string;
+  kind?: string;
+  path?: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  const [frameReady, setFrameReady] = useState(false);
+  useEffect(() => {
+    setFailed(false);
+    setFrameReady(false);
+  }, [src]);
+
+  const fallback = <FileIcon fileName={path || label} size={18} />;
+
+  if (!src || failed) return fallback;
+
+  if (kind === 'video') {
+    return (
+      <>
+        <video
+          className="chat-composer-suggestion__asset-thumb"
+          src={`${src}#t=0.1`}
+          preload="metadata"
+          muted
+          playsInline
+          onLoadedData={() => setFrameReady(true)}
+          onError={() => setFailed(true)}
+          style={frameReady ? undefined : { display: 'none' }}
+        />
+        {frameReady ? null : fallback}
+      </>
+    );
+  }
+
+  if (kind === 'image') {
+    return (
+      <img
+        src={src}
+        alt=""
+        className="chat-composer-suggestion__asset-thumb"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+
+  return fallback;
+}
+
 function ComposerSuggestionMenu({
   suggestion,
   items,
@@ -4779,14 +6266,14 @@ function ComposerSuggestionMenu({
     kind: ComposerSuggestionKind,
     value: string,
     label: string,
-    slashItemKind?: 'command' | 'skill',
+    slashItemKind?: 'command' | 'skill' | 'asset',
     slashTakesArgs?: boolean,
   ) => void;
   loading: boolean;
   slashSkillsOnly: boolean;
   placement?: 'above' | 'below';
 }) {
-  const isSlash = suggestion.kind === 'slash';
+  const isSlash = suggestion.kind === 'slash' || suggestion.kind === 'skill';
   const tokenPrefix = suggestion.kind === 'role' ? '$' : '@';
   const { t } = useTranslation();
   const commandCount = items.filter((item) => item.itemKind === 'command').length;
@@ -4848,7 +6335,7 @@ function ComposerSuggestionMenu({
       {!isSlash && (
         <div className="chat-composer-suggestion__header" data-testid="chat-panel-composer-suggestion-header">
           <AtSign size={14} />
-          <span>{t('chat.selectTeamMembers')}</span>
+          <span>{items.length > 0 && items.every((item) => item.itemKind === 'asset') ? t('sessionAssets.pickTitle') : t('chat.selectTeamMembers')}</span>
         </div>
       )}
       <div
@@ -4862,11 +6349,11 @@ function ComposerSuggestionMenu({
             {isSlash
               ? loading
                 ? slashSkillsOnly
-                  ? '正在加载技能…'
-                  : '正在加载指令与技能…'
+                  ? t('chat.slashPicker.loadingSkills')
+                  : t('chat.slashPicker.loadingCommandsAndSkills')
                 : slashSkillsOnly
-                  ? '没有匹配的技能'
-                  : '没有匹配的指令或技能'
+                  ? t('chat.slashPicker.noMatchingSkills')
+                  : t('chat.slashPicker.noMatchingCommandsOrSkills')
               : t('chat.noTeamMembersAvailable')}
           </div>
         ) : (
@@ -4877,7 +6364,9 @@ function ComposerSuggestionMenu({
               <Fragment key={`${suggestion.kind}:${item.itemKind}:${item.id}`}>
                 {showSectionTitle && (
                   <div className="chat-composer-suggestion__section-title">
-                    <span>{item.itemKind === 'command' ? '指令' : '技能'}</span>
+                    <span data-testid="chat-panel-composer-suggestion-section-label" data-variant={item.itemKind}>
+                      {item.itemKind === 'command' ? t('chat.slashPicker.commands') : t('chat.slashPicker.skills')}
+                    </span>
                     <span>({sectionCount})</span>
                   </div>
                 )}
@@ -4915,13 +6404,35 @@ function ComposerSuggestionMenu({
                         )}
                         aria-hidden="true"
                       >
-                        {item.itemKind === 'command' ? '/' : null}
+                        {item.itemKind === 'command' ? <CommandIcon /> : null}
                       </span>
                       <span className="chat-composer-suggestion__text">
                         <span className="chat-composer-suggestion__label">{item.label}</span>
                         {item.description ? (
-                          <span className="chat-composer-suggestion__meta">{item.description}</span>
+                          <span
+                            className="chat-composer-suggestion__meta"
+                            title={item.description}
+                            data-testid="chat-panel-composer-suggestion-description"
+                            data-variant={item.id}
+                          >
+                            {item.description}
+                          </span>
                         ) : null}
+                      </span>
+                    </>
+                  ) : item.itemKind === 'asset' ? (
+                    <>
+                      <span className="chat-composer-suggestion__avatar" aria-hidden="true">
+                        <AssetSuggestionThumb
+                          src={item.previewUrl}
+                          label={item.label}
+                          kind={item.status}
+                          path={item.assetPath}
+                        />
+                      </span>
+                      <span className="chat-composer-suggestion__text">
+                        <span className="chat-composer-suggestion__label">{item.label}</span>
+                        <span className="chat-composer-suggestion__meta">{`${tokenPrefix}${item.id}`}</span>
                       </span>
                     </>
                   ) : (

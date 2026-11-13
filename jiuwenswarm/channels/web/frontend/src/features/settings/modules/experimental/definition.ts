@@ -2,12 +2,15 @@ import { settingsNavigationIcons } from '../../../../assets/settings';
 import type { SettingsModuleDefinition } from '../../registry/types';
 import {
   A2UISetting,
-  ExternalCliSettingsItem,
-  ProactiveLimitsSetting,
+  ExternalCliCustomAgentsItem,
   RSISetting,
+  TaskAsrSetting,
   TaskFullDuplexSetting,
-  TrajectoryUiSetting,
+  TrajectoryDiagnosisSetting,
 } from './ExperimentalSettings';
+import { CollaborationVerifierInterval } from './MultiModelCollaborationSettings';
+import { A4PSettings } from './A4PSettings';
+import { MusicGenSettings } from '../agent/AgentSettings';
 
 export const experimentalModule: SettingsModuleDefinition = {
   id: 'experimental',
@@ -18,11 +21,7 @@ export const experimentalModule: SettingsModuleDefinition = {
     {
       id: 'asr',
       titleKey: 'settingsPanel.experimental.taskAsr',
-      items: [
-        { id: 'asr-api-base', component: 'input', key: 'asr_api_base' },
-        { id: 'asr-api-key', component: 'input', key: 'asr_api_key', inputType: 'password' },
-        { id: 'asr-model', component: 'input', key: 'asr_model' },
-      ],
+      items: [{ id: 'task-asr-enabled', component: 'custom', render: TaskAsrSetting }],
     },
     {
       id: 'task-full-duplex',
@@ -30,9 +29,9 @@ export const experimentalModule: SettingsModuleDefinition = {
       items: [{ id: 'task-full-duplex-enabled', component: 'custom', render: TaskFullDuplexSetting }],
     },
     {
-      id: 'external-cli-agents',
+      id: 'external-cli-custom-agents',
       titleKey: 'settingsPanel.experimental.externalCliAgents',
-      items: [{ id: 'external-cli-agents', component: 'custom', render: ExternalCliSettingsItem }],
+      items: [{ id: 'external-cli-custom-agents', component: 'custom', render: ExternalCliCustomAgentsItem }],
     },
     {
       id: 'rsi',
@@ -45,9 +44,17 @@ export const experimentalModule: SettingsModuleDefinition = {
       items: [{ id: 'a2ui', component: 'custom', render: A2UISetting }],
     },
     {
+      id: 'a4p',
+      titleKey: 'a4pSettings.title',
+      separatedRows: true,
+      items: [{ id: 'a4p-settings', component: 'custom', render: A4PSettings }],
+    },
+    {
       id: 'trajectory-ui',
       titleKey: 'settingsPanel.experimental.trajectoryUi',
-      items: [{ id: 'trajectory-ui-enabled', component: 'custom', render: TrajectoryUiSetting }],
+      items: [
+        { id: 'trajectory-diagnosis-enabled', component: 'custom', render: TrajectoryDiagnosisSetting },
+      ],
     },
     {
       id: 'skill-pack',
@@ -72,19 +79,84 @@ export const experimentalModule: SettingsModuleDefinition = {
       ],
     },
     {
-      id: 'proactive-recommendation',
-      titleKey: 'settingsPanel.experimental.proactive',
+      id: 'team-organization',
+      titleKey: 'settingsPanel.experimental.teamOrganization',
+      items: [{ id: 'team-organization-ui-enabled', component: 'switch', key: 'team_organization_ui_enabled' }],
+    },
+    {
+      id: 'team-scheduled-dispatch',
+      titleKey: 'settingsPanel.experimental.teamScheduledDispatch',
       items: [
         {
-          id: 'proactive-recommendation',
+          id: 'team-scheduled-dispatch-enabled',
           component: 'switch',
-          key: 'proactive_recommendation_enabled',
+          key: 'team_scheduled_dispatch_enabled',
           subItems: {
             show: 'always',
             disabled: 'when-parent-unchecked',
-            items: [{ id: 'proactive-limits', component: 'custom', render: ProactiveLimitsSetting }],
+            uncheckWithParent: true,
+            items: [
+              { id: 'team-task-verification-enabled', component: 'switch', key: 'team_task_verification_enabled' },
+              { id: 'team-member-messaging-enabled', component: 'switch', key: 'team_member_messaging_enabled' },
+              { id: 'team-member-subtasks-enabled', component: 'switch', key: 'team_member_subtasks_enabled' },
+            ],
           },
         },
+      ],
+    },
+    {
+      id: 'multi-model-collaboration',
+      titleKey: 'settingsPanel.experimental.multiModelCollaboration',
+      items: [
+        {
+          id: 'multi-model-collaboration-enabled',
+          component: 'switch',
+          key: 'multi_model_collaboration_enabled',
+          subItems: {
+            show: 'when-parent-checked',
+            disabled: 'never',
+            items: [
+              { id: 'collaboration-jev-enabled', component: 'switch', key: 'moa_jev_enabled', errorDisplay: 'inline' },
+              { id: 'multi-model-verification', component: 'custom', render: CollaborationVerifierInterval },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: 'tool-optimize',
+      titleKey: 'settingsPanel.experimental.toolOptimize',
+      items: [
+        {
+          id: 'progressive-tool-optimize-enabled',
+          component: 'switch',
+          key: 'progressive_tool_optimize',
+        },
+      ],
+    },
+    {
+      id: 'computer-control',
+      titleKey: 'settingsPanel.experimental.computerControl',
+      items: [
+        {
+          id: 'cua-agent-enabled',
+          component: 'switch',
+          key: 'cua_agent_enabled',
+          availableWhen: 'cua_backend_available',
+          unavailableReasonKey: 'cua_backend_unavailable_reason',
+        },
+      ],
+    },
+    {
+      id: 'design-mode',
+      titleKey: 'settingsPanel.experimental.designMode',
+      items: [
+        {
+          id: 'comfyui-workflow-enabled',
+          component: 'switch',
+          key: 'comfyui_workflow_enabled',
+        },
+        { id: 'music-gen-settings', component: 'custom', render: MusicGenSettings },
       ],
     },
   ],

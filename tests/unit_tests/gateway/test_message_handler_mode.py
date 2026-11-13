@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from jiuwenswarm.common.mode_matrix import (
+from agent_gateway.common.mode_matrix import (
     DEPRECATION_MAP,
     MODE_ALIASES,
     NEW_AGENT_WORK_NORMAL,
@@ -30,13 +30,13 @@ from jiuwenswarm.common.mode_matrix import (
     NEW_TEAM_CODE_PLAN,
     NEW_CANONICAL_MODES,
 )
-from jiuwenswarm.gateway.message_handler.message_handler import (
+from agent_gateway.message_handler.message_handler import (
     ChannelControlState,
     ChannelMode,
     MessageHandler,
     _VALID_MODE_INPUTS,
 )
-from jiuwenswarm.common.schema.message import Message
+from openjiuwen_protocol.message import Message
 
 
 class _FakeAgentClient:
@@ -100,6 +100,11 @@ class _TestMessageHandler(MessageHandler):
         # legacy 别名经 canonicalize → DEPRECATION_MAP 两步映射
         ("team.plan", "team.work.plan"),   # team.plan → team.plan.normal → team.work.plan
         ("team.code", "team.code.normal"),  # team.code → code.team → team.code.normal
+        # issue #4168: shorthand names work for /mode too
+        ("team.work", "team.work.normal"),
+        ("team.normal", "team.work.normal"),
+        ("agent.work", "agent.work.normal"),
+        ("agent.code", "agent.code.normal"),
     ],
 )
 def test_mode_switch_uses_deprecation_map(input_mode: str, expected_state: str) -> None:
@@ -134,7 +139,7 @@ def test_valid_mode_inputs_covers_new_and_legacy() -> None:
     assert NEW_CANONICAL_MODES <= _VALID_MODE_INPUTS
     assert set(DEPRECATION_MAP.keys()) <= _VALID_MODE_INPUTS
     assert set(MODE_ALIASES.keys()) <= _VALID_MODE_INPUTS
-    # 额外 sanity：8 + 10 + 2 = 20（DEPRECATION_MAP 含裸 code），三集合互不相交
+    # 额外 sanity：8 + 10 + 6 = 24（DEPRECATION_MAP 含裸 code），三集合互不相交
     assert len(_VALID_MODE_INPUTS) == (
         len(NEW_CANONICAL_MODES)
         + len(DEPRECATION_MAP.keys())
@@ -338,7 +343,7 @@ async def test_session_creation_failure_hides_internal_error(
     monkeypatch.setattr(handler, "_allocate_channel_session", _allocate)
     monkeypatch.setattr(handler, "send_channel_notice", _notice)
     target_logger = logging.getLogger(
-        "jiuwenswarm.gateway.message_handler.message_handler"
+        "agent_gateway.message_handler.message_handler"
     )
     target_logger.addHandler(caplog.handler)
     caplog.set_level(logging.ERROR, logger=target_logger.name)

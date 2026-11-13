@@ -49,6 +49,18 @@ _TEAM_HISTORY_FRAME_OVERHEAD_BYTES = 1024
 _WORKFLOW_AGENT_FIELD_PART_BYTES = 32 * 1024
 _WORKFLOW_LIST_DEFAULT_LIMIT = 50
 _WORKFLOW_LIST_MAX_LIMIT = 200
+# Verify-group card fields carried in the phase summary (get_workflow): the
+# tree header needs identity + verdict; per-vote feedback is heavy text and
+# only arrives via get_agent, so it is not slimmed here.
+_VERIFY_GROUP_SUMMARY_KEYS = (
+    "id", "label", "verify_id", "status", "threshold", "reviewers",
+    "reviewer_labels", "reviewer_roles", "verdict", "started_at", "settled_at",
+    "outcome",
+)
+# Per-vote fields kept in the summary: join keys + verdict chips only.
+_VERIFY_VOTE_SUMMARY_KEYS = (
+    "name", "agent_id", "kind", "role", "decision", "score", "voted",
+)
 _WORKFLOW_PHASE_DEFAULT_LIMIT = 20
 _WORKFLOW_PHASE_MAX_LIMIT = 100
 _WORKFLOW_AGENT_DEFAULT_LIMIT = 50
@@ -67,6 +79,9 @@ _HISTORY_RESTORABLE_ASSISTANT_EVENT_TYPES = frozenset(
         "chat.subagent_activity",
         "chat.usage_summary",
         "chat.file",
+        "chat.ask_user_question",
+        "chat.ask_user_answer",
+        "chat.error",
         "team.message",
         "context.usage",
         "context.compact_boundary",
@@ -113,6 +128,10 @@ _WORKFLOW_LIST_SUMMARY_KEEP_KEYS = (
     # Cold-start marker: the list row is what the tree renders first after a
     # session reopen, and the buttons key their greying on it.
     "recovered",
+    # Run attribution (None = no team context): the executor badge renders
+    # from the list row on a cold reopen — the same cold-start argument as
+    # "recovered"; the detail view shares these keep keys.
+    "executor",
 )
 
 
@@ -221,6 +240,21 @@ def _minimal_history_record_for_wire(record: dict[str, Any]) -> dict[str, Any]:
     return minimal
 
 
+def _restore_mcp_app_block(original: dict[str, Any], sanitized: dict[str, Any]) -> None:
+    """Keep an MCP App tool result (``raw_output.mcp_app``) byte-for-byte.
+
+    The app's ``structuredContent`` is data the app parses; depth/list/string
+    truncation would hand it values like ``"<truncated>"`` where it expects
+    numbers and crash it on history restore. The per-record size budget below
+    still applies: an oversized record collapses and drops the block entirely.
+    """
+    raw_output = original.get("raw_output")
+    block = raw_output.get("mcp_app") if isinstance(raw_output, dict) else None
+    sanitized_raw = sanitized.get("raw_output")
+    if isinstance(block, dict) and isinstance(sanitized_raw, dict):
+        sanitized_raw["mcp_app"] = block
+
+
 def _sanitize_history_record_for_wire(record: Any) -> dict[str, Any]:
     """Sanitize one history record, collapsing if it exceeds the per-record budget."""
     if not isinstance(record, dict):
@@ -228,6 +262,7 @@ def _sanitize_history_record_for_wire(record: Any) -> dict[str, Any]:
     sanitized = _sanitize_history_wire_value(record)
     if not isinstance(sanitized, dict):
         return {"content": str(sanitized), "truncated": True}
+    _restore_mcp_app_block(record, sanitized)
     if _json_wire_size(sanitized) <= _HISTORY_WIRE_RECORD_MAX_BYTES:
         return sanitized
     return _collapse_oversized_history_record(sanitized)
@@ -445,6 +480,25 @@ def _workflow_phase_summary(phase: dict[str, Any]) -> dict[str, Any]:
     for opt_key in ("phase_type", "parent_phase", "nested_phase", "iteration"):
         if opt_key in phase:
             out[opt_key] = phase[opt_key]
+    # Verify group cards ride on the summary so a page refresh still renders
+    # the containers. Per-vote feedback is heavy text — strip it; the tree
+    # header only needs label/status/threshold/reviewer_labels/verdict and
+    # the votes' join keys.
+    groups = phase.get("verify_groups")
+    if isinstance(groups, list) and groups:
+        slim_groups = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            slim: dict[str, Any] = {
+                k: g[k] for k in _VERIFY_GROUP_SUMMARY_KEYS if g.get(k) is not None
+            }
+            slim["votes"] = [
+                {k: v[k] for k in _VERIFY_VOTE_SUMMARY_KEYS if v.get(k) is not None}
+                for v in g.get("votes", []) if isinstance(v, dict)
+            ]
+            slim_groups.append(slim)
+        out["verify_groups"] = slim_groups
     out["detail_pending"] = True
     return out
 
@@ -454,10 +508,18 @@ def _workflow_phase_summary(phase: dict[str, Any]) -> dict[str, Any]:
 # get_agent is the universal layer for full agent content. A short preview
 # (~200 chars) of outcome/error is carried so the tree row can show a
 # one-line stub without a per-agent RPC; the full text is still get_agent.
+# Token split / cache and the fork-lineage keys ride along so the tree row's
+# chips and fork badge survive a refresh (the summary is what the page load
+# renders from).
 _WORKFLOW_AGENT_SUMMARY_KEEP_KEYS = (
     "id", "name", "status", "model", "kind", "node_type",
     "started_at", "completed_at", "duration_ms", "token_count",
-    "correlation_id",
+    "input_token_count", "output_token_count", "cache_token_count",
+    "correlation_id", "member_name", "parent_session_id",
+    # Node identity the tree renders the avatar / subtitle from; a cold restore
+    # rebuilds every row from this summary, so losing them repaints experts and
+    # third-party nodes as plain workers.
+    "agent_type", "agent_template", "display_name",
 )
 _WORKFLOW_AGENT_SUMMARY_PREVIEW_CHARS = 200
 

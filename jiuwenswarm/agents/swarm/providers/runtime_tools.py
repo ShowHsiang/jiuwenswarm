@@ -34,14 +34,57 @@ from openjiuwen.agent_teams.harness.manifest import (
 
 from jiuwenswarm.agents.harness.common.tools.cron.cron_runtime import CronRuntimeBridge
 from jiuwenswarm.agents.harness.common.tools.send_file_to_user import SendFileToolkit
+from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (
+    SessionMessagingToolkit,
+)
 from jiuwenswarm.agents.harness.common.tools.file_delivery_policy import is_send_file_enabled
 from jiuwenswarm.agents.swarm.context import SwarmBuildContext
+from jiuwenswarm.common.cron_session import is_cron_execution_context
 
 logger = logging.getLogger(__name__)
 
 # Provider name constants; namespaced under the shared "swarm." prefix.
 CRON_TOOLS = "swarm.cron_tools"
 SEND_FILE = "swarm.send_file"
+SESSION_MESSAGING_TOOLS = "swarm.session_messaging_tools"
+ORGANIZATION_MODEL_TOOLS = "swarm.organization_model_tools"
+ORGANIZATION_OWNER_INBOX_TOOLS = "swarm.organization_owner_inbox_tools"
+
+
+@harness_element(kind=ElementKind.TOOL, name=ORGANIZATION_OWNER_INBOX_TOOLS,
+                 description="Owner-only durable result acknowledgement.")
+def build_organization_owner_inbox_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any]:
+    from jiuwenswarm.agents.harness.team.expert_org.inbox_tool import OrgAckOwnerResultTool
+
+    if str(ctx.role) != "leader":
+        return []
+    return [OrgAckOwnerResultTool(ctx.team_id, ctx.session_id)]
+
+
+@harness_element(kind=ElementKind.TOOL, name=ORGANIZATION_MODEL_TOOLS,
+                 description="Leader-only persistent expert-Team model control.")
+def build_organization_model_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any]:
+    from jiuwenswarm.agents.harness.team.expert_org.model_tool import OrgSetTeamModelTool
+
+    if str(ctx.role) != "leader":
+        return []
+    return [OrgSetTeamModelTool(ctx.team_id, ctx.session_id)]
+
+
+@harness_element(
+    kind=ElementKind.TOOL,
+    name=SESSION_MESSAGING_TOOLS,
+    description="Leader-only durable cross-Session messaging toolkit.",
+)
+def build_session_messaging_tools(
+    params: dict[str, Any],
+    ctx: SwarmBuildContext,
+) -> list[Any]:
+    """Build Session messaging tools only for the Team leader."""
+    _ = params
+    if str(getattr(ctx, "role", "") or "") != "leader":
+        return []
+    return list(SessionMessagingToolkit().get_tools())
 
 
 class CronToolsInput(ConstructionInput):
@@ -97,6 +140,7 @@ def build_cron_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any
     # use the caller's project (especially code-mode projects), rather than
     # silently falling back to the work default project.
     metadata = dict(inp.request_metadata or {})
+    session_metadata: dict[str, Any] | None = None
     if isinstance(inp.session_id, str) and inp.session_id.strip():
         try:
             from jiuwenswarm.server.runtime.session.session_metadata import (
@@ -117,8 +161,13 @@ def build_cron_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any
                     if isinstance(model, str) and model.strip():
                         metadata["model_name"] = model.strip()
         except Exception as exc:  # noqa: BLE001 - cron retains legacy fallback
-            logger.debug(
-                "[swarm.cron_tools] failed to load session project binding: %s", exc
+            # The same read feeds the cron gate; on failure the gate falls back
+            # to request signals and may re-expose cron tools, so log it.
+            logger.warning(
+                "[swarm.cron_tools] session metadata lookup failed; cron gate "
+                "falls back to request signals session_id=%s: %s",
+                inp.session_id,
+                exc,
             )
     cron_context = SimpleNamespace(
         tool_scope=f"team_member_{agent_id or 'unknown'}",
@@ -130,6 +179,36 @@ def build_cron_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> list[Any
         # the same runtime mode as the originating team conversation.
         mode=str(getattr(ctx, "mode", "") or "team"),
     )
+    # cron 执行会话全面禁止操作 cron：成员工具集整体不下发（连 list/get
+    # 等只读管理也不暴露，与单 Agent 链路 _ensure_cron_tools_registered 的
+    # 全面下架对齐），心跳工具同样不挂（见 member_rails 的 swarm.heartbeat）。
+    #
+    # 判定必须包含会话里持久化的 ``cron_id``：Web 定时任务的执行会话由
+    # ``_allocate_execution_session`` 以 web 渠道创建，会话 ID 是普通的
+    # ``web_<ts>_<rand>``，既没有 ``cron_`` 前缀也不是 ``__cron__`` 渠道；
+    # 调度器的 ``request_metadata["cron"]`` 只存在于触发那一轮请求上。用户
+    # 进入该执行会话继续对话、会话运行时被回收后重建时，请求上没有任何
+    # cron 标记，若再只看请求信号，成员会重新拿到完整的 cron 工具集，
+    # ``cron_create_job`` 就能在定时任务会话里再建任务（issue #6188）。
+    # 单 Agent 链路一直通过 ``_is_cron_execution_session`` 读这份元数据，
+    # team 链路这里必须对齐，见 ``common/cron_session.py``。
+    #
+    # 远端成员可能读不到该会话的元数据，leader 会在 bootstrap 时把归属作为
+    # ``cron_session`` 转发过来；它与 ``cron`` 分开，避免把"本轮由调度器
+    # 触发"的语义带给审批/A4P 等消费者，见 remote_member_bootstrap。
+    cron_execution_session = is_cron_execution_context(
+        inp.session_id,
+        channel_id=inp.channel_id,
+        request_metadata=inp.request_metadata,
+        session_metadata=session_metadata,
+    )
+    if cron_execution_session:
+        logger.info(
+            "[swarm.cron_tools] skip cron tools for cron execution session "
+            "agent_id=%s",
+            agent_id,
+        )
+        return []
     try:
         cron_tools = CronRuntimeBridge().build_tools(
             context=cron_context,
@@ -261,6 +340,10 @@ def build_send_file_tools(params: dict[str, Any], ctx: SwarmBuildContext) -> lis
 __all__ = [
     "CRON_TOOLS",
     "SEND_FILE",
+    "SESSION_MESSAGING_TOOLS",
+    "ORGANIZATION_MODEL_TOOLS",
+    "build_organization_model_tools",
     "build_cron_tools",
     "build_send_file_tools",
+    "build_session_messaging_tools",
 ]

@@ -1,18 +1,21 @@
-import SimpleSelect from '../CronPanel/SimpleSelect';
+import { matchesAssetName } from '../../features/assetNameSearch';
 import { InstallationFilterSelect, matchesInstallation, type InstallationFilter } from '../marketplace/InstallationFilterSelect';
 import { catalogCacheOf } from '../../features/catalogCache';
 import { CatalogCacheNotice } from '../marketplace/CatalogCacheNotice';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Plus, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react';
+// 深引入而非 ../ui barrel：本组件经 esbuild 独立打包进测试
+import { LoadingSpinner } from '../ui/LoadingSpinner/LoadingSpinner';
 import { useConnectorStore } from '../../stores/connectorStore';
 import { usePluginPackageStore } from '../../stores/pluginPackageStore';
-import { localizedText } from '../../types/pluginPackage';
+import { connectorApi } from '../../services/connectorApi';
+import { pluginPackagesApi } from '../../services/pluginPackagesApi';
+import { localizedText, type PluginPackageSummary } from '../../types/pluginPackage';
 import { MarketCard } from './MarketCard';
 import { MyMarketCard } from './MyMarketCard';
 import { ConnectTokenModal } from './ConnectTokenModal';
 import { CliAuthModal } from './CliAuthModal';
-import type { ConnectorConnectResponse } from '../../types/connector';
+import type { ConnectorConnectResponse, ConnectorSummary } from '../../types/connector';
 import {
   deriveCardState,
   derivePluginCardState,
@@ -21,7 +24,7 @@ import {
 } from './mcpState';
 import { useClickOutside } from './useClickOutside';
 import { usePendingConnectorFlow, PendingConnectorModals } from './usePendingConnectorFlow';
-import { PageToolbarSearch, PageHeader, CategoryTabs, Tabs } from '../ui';
+import { PageToolbarSearch, PageHeader, CategoryTabs, Tabs, EmptyState } from '../ui';
 
 export type MarketKind = 'plugin' | 'mcp';
 export type TopTab = MarketKind | 'my';
@@ -44,7 +47,6 @@ interface MarketplacePageProps {
   onCreateWithSkill: () => void;
   onCreateWithUpload: () => void;
   onRegisterCustomMcp: () => void;
-  onOpenApplicationPlugins: () => void;
 }
 
 // 2026-08-07：backend-requests.md 需求8 已解决——plugin_packages.list/show 现在真的下发单值
@@ -60,120 +62,11 @@ interface MarketplacePageProps {
 // CATEGORIES` 这个写死的枚举已从 types/connector.ts 删除。
 const CATEGORY_TOP_N = 6;
 
-const PAGE_SIZE_ALL = -1;
-const PAGE_SIZE_OPTIONS = [30, 50, PAGE_SIZE_ALL];
-const DEFAULT_PAGE_SIZE = 30;
+/** 首批渲染数量；触底后每批追加同数量（列表数据在内存中，这里做增量展示）。 */
+const MARKET_BATCH_SIZE = 30;
+/** 触底判定余量：距滚动底部不足该像素即视为到底。 */
+const LOAD_MORE_THRESHOLD_PX = 40;
 
-function buildPageList(current: number, total: number): (number | 'ellipsis')[] {
-  if (total <= 7) {
-    return Array.from({ length: total }, (_, i) => i + 1);
-  }
-  const pages: (number | 'ellipsis')[] = [1];
-  const start = Math.max(2, current - 1);
-  const end = Math.min(total - 1, current + 1);
-  if (start > 2) pages.push('ellipsis');
-  for (let p = start; p <= end; p++) pages.push(p);
-  if (end < total - 1) pages.push('ellipsis');
-  pages.push(total);
-  return pages;
-}
-
-interface PaginationBarProps {
-  currentPage: number;
-  totalPages: number;
-  pageSize: number;
-  totalCount: number;
-  onPageChange: (page: number) => void;
-  onPageSizeChange: (size: number) => void;
-}
-
-function PaginationBar({
-  currentPage,
-  totalPages,
-  pageSize,
-  totalCount,
-  onPageChange,
-  onPageSizeChange,
-}: PaginationBarProps) {
-  const { t } = useTranslation();
-  const pageSizeOptions = useMemo(
-    () =>
-      PAGE_SIZE_OPTIONS.map((n) => ({
-        value: String(n),
-        label: n === PAGE_SIZE_ALL ? t('connectorMarket.pagination.all') : String(n),
-      })),
-    [t],
-  );
-  const pages = useMemo(() => buildPageList(currentPage, totalPages), [currentPage, totalPages]);
-  const showAll = pageSize === PAGE_SIZE_ALL;
-  const rangeStart = totalCount === 0 ? 0 : showAll ? 1 : (currentPage - 1) * pageSize + 1;
-  const rangeEnd = showAll ? totalCount : Math.min(currentPage * pageSize, totalCount);
-
-  return (
-    <div
-      className="mt-4 flex flex-wrap items-center justify-between gap-3 text-[13px] text-text-muted"
-      data-testid="connector-market-pagination"
-    >
-      <div className="flex items-center gap-2">
-        <span>{t('connectorMarket.pagination.pageSize')}</span>
-        <SimpleSelect
-          value={String(pageSize)}
-          onChange={(v) => onPageSizeChange(Number(v))}
-          options={pageSizeOptions}
-          className="w-20"
-          menuPlacement="up"
-        />
-        <span data-testid="connector-market-pagination-range-info">
-          {t('connectorMarket.pagination.rangeInfo', { start: rangeStart, end: rangeEnd, total: totalCount })}
-        </span>
-      </div>
-      {totalPages > 1 && (
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            disabled={currentPage <= 1}
-            onClick={() => onPageChange(currentPage - 1)}
-            aria-label={t('connectorMarket.pagination.prev') ?? undefined}
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
-            data-testid="connector-market-pagination-prev"
-          >
-            <ChevronLeft size={14} />
-          </button>
-          {pages.map((p, idx) =>
-            p === 'ellipsis' ? (
-              <span key={`ellipsis-${idx}`} className="px-1.5 text-text-muted">
-                …
-              </span>
-            ) : (
-              <button
-                key={p}
-                type="button"
-                onClick={() => onPageChange(p)}
-                data-testid="connector-market-pagination-page"
-                data-variant={p}
-                className={`flex h-7 min-w-7 items-center justify-center rounded-md px-1.5 text-[13px] ${
-                  p === currentPage ? 'bg-text font-bold text-text-inverse' : 'text-text hover:bg-bg-hover'
-                }`}
-              >
-                {p}
-              </button>
-            ),
-          )}
-          <button
-            type="button"
-            disabled={currentPage >= totalPages}
-            onClick={() => onPageChange(currentPage + 1)}
-            aria-label={t('connectorMarket.pagination.next') ?? undefined}
-            className="flex h-7 w-7 items-center justify-center rounded-md border border-border text-text hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
-            data-testid="connector-market-pagination-next"
-          >
-            <ChevronRight size={14} />
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
 
 export function MarketplacePage({
   topTab,
@@ -187,18 +80,21 @@ export function MarketplacePage({
   onCreateWithSkill,
   onCreateWithUpload,
   onRegisterCustomMcp,
-  onOpenApplicationPlugins,
 }: MarketplacePageProps) {
   const { t, i18n } = useTranslation();
   const [category, setCategory] = useState<string>('all');
   const [pluginCategory, setPluginCategory] = useState<string>('all');
   const [query, setQuery] = useState('');
+  const [marketConnectorResults, setMarketConnectorResults] = useState<ConnectorSummary[] | null>(null);
+  const [marketPluginResults, setMarketPluginResults] = useState<PluginPackageSummary[] | null>(null);
+  const [marketSearchLoading, setMarketSearchLoading] = useState(false);
+  const marketSearchRevisionRef = useRef(0);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const createMenuRef = useRef<HTMLDivElement>(null);
   useClickOutside(createMenuRef, () => setCreateMenuOpen(false));
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-  const [currentPage, setCurrentPage] = useState(1);
+  const marketSentinelRef = useRef<HTMLDivElement | null>(null);
+  const [marketVisibleCount, setMarketVisibleCount] = useState(MARKET_BATCH_SIZE);
 
   const [tokenTarget, setTokenTarget] = useState<{
     name: string;
@@ -234,6 +130,40 @@ export function MarketplacePage({
   const pluginIsLoading = usePluginPackageStore((s) => s.isLoading);
   const pluginInstallPendingMap = usePluginPackageStore((s) => s.installPendingMap);
   const clearPluginInstallPending = usePluginPackageStore((s) => s.clearInstallPending);
+
+  useEffect(() => {
+    const searchQuery = query.trim();
+    const isMarketplace = topTab === 'plugin' || topTab === 'mcp';
+    const revision = ++marketSearchRevisionRef.current;
+    if (!isMarketplace || !searchQuery) {
+      setMarketConnectorResults(null);
+      setMarketPluginResults(null);
+      setMarketSearchLoading(false);
+      return;
+    }
+
+    setMarketSearchLoading(true);
+    const timer = window.setTimeout(() => {
+      const search = topTab === 'mcp'
+        ? connectorApi.list('builtin', searchQuery)
+        : pluginPackagesApi.list('builtin+hub', searchQuery);
+      void search
+        .then((items) => {
+          if (revision !== marketSearchRevisionRef.current) return;
+          if (topTab === 'mcp') setMarketConnectorResults(items as ConnectorSummary[]);
+          else setMarketPluginResults(items as PluginPackageSummary[]);
+        })
+        .catch(() => {
+          if (revision !== marketSearchRevisionRef.current) return;
+          if (topTab === 'mcp') setMarketConnectorResults([]);
+          else setMarketPluginResults([]);
+        })
+        .finally(() => {
+          if (revision === marketSearchRevisionRef.current) setMarketSearchLoading(false);
+        });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [query, topTab]);
 
   // 派生 MCP 卡片态（见 mcpState.ts）。busy 用 busyMap[name]。这份 map 供下方 MCP 卡片渲染 +
   // statusFilter 共用，避免每个渲染点各自内联判断。
@@ -385,7 +315,11 @@ export function MarketplacePage({
     // 头注释），前端不用再按 source 二次过滤——2026-08-17 用户已确认按 MCP 接口文档 v2 实现，
     // 2026-08-10"我的 vs 广场只看 source、与连接状态无关"的旧结论作废：一个已连接的预置 MCP
     // 现在会同时出现在两个 tab 里。分类筛选（category）只在"广场"视角适用，"我的"没有分类 tab。
-    const base = topTab === 'my' ? myConnectors : builtinConnectors;
+    const base = topTab === 'my'
+      ? myConnectors
+      : q
+        ? marketConnectorResults ?? []
+        : builtinConnectors;
     return base.filter((connector) => {
       if (!matchesInstallation(connector.installed, installationFilter)) return false;
       if (topTab !== 'my' && category !== 'all') {
@@ -393,7 +327,7 @@ export function MarketplacePage({
         if (category === 'other' ? mcpTopCategorySet.has(cat) : cat !== category) return false;
       }
 
-      if (q && !connector.displayName.toLowerCase().includes(q)) return false;
+      if (topTab === 'my' && q && !matchesAssetName(query, [connector.displayName])) return false;
       return true;
     });
   }, [
@@ -406,6 +340,7 @@ export function MarketplacePage({
     query,
     mcpCardStates,
     installationFilter,
+    marketConnectorResults,
   ]);
 
   const filteredPlugins = useMemo(() => {
@@ -414,7 +349,11 @@ export function MarketplacePage({
     // "我的插件"vs"插件广场"现在也由后端 filter 参数分好（builtin/local，见上面 packages/
     // localPackages 的注释），跟 filteredConnectors 同款，不用再按 pkg.source 二次过滤。分类
     // 筛选（category）只在"广场"视角适用，"我的"没有分类 tab。
-    const base = topTab === 'my' ? localPackages : packages;
+    const base = topTab === 'my'
+      ? localPackages
+      : q
+        ? marketPluginResults ?? []
+        : packages;
     return base.filter((pkg) => {
       if (!matchesInstallation(!!installed[pkg.id], installationFilter)) return false;
       if (topTab !== 'my' && pluginCategory !== 'all') {
@@ -422,8 +361,7 @@ export function MarketplacePage({
         if (pluginCategory === 'other' ? pluginTopCategorySet.has(cat) : cat !== pluginCategory) return false;
       }
 
-      const title = localizedText(pkg.displayName, i18n.language);
-      if (q && !title.toLowerCase().includes(q)) return false;
+      if (topTab === 'my' && !matchesAssetName(query, [localizedText(pkg.displayName, i18n.language)])) return false;
       return true;
     });
   }, [
@@ -437,6 +375,7 @@ export function MarketplacePage({
     installed,
     pluginConnectionStateMap,
     query,
+    marketPluginResults,
     i18n.language,
   ]);
 
@@ -454,36 +393,71 @@ export function MarketplacePage({
   // 列表为空时要分清"数据还没回来"和"回来了但真的没有"——首次/切 tab 的非静默 loadList() 会把
   // 对应 store 的 isLoading 短暂置 true，10s 静默轮询不影响它（见两个 store 的 loadList 实现），
   // 用它区分空态文案该显示"加载中"还是"没有找到匹配的结果"。
-  const activeIsLoading = activeKindForEmpty === 'mcp' ? connectorIsLoading : pluginIsLoading;
+  const activeIsLoading = topTab !== 'my' && query.trim()
+    ? marketSearchLoading
+    : activeKindForEmpty === 'mcp'
+      ? connectorIsLoading
+      : pluginIsLoading;
 
-  // 切换 tab/子筛选/分类/状态筛选/搜索词都会让 activeList 变成一份新列表，统一重置回第1页，
-  // 避免停留在一个对新列表来说已经越界的页码上看到空白（同款处理见 CronPanel/index.tsx 的
-  // "搜索内容变化时重置回第 1 页"）。
+  // 切换 tab/子筛选/分类/状态筛选/搜索词都会让 activeList 变成一份新列表，统一回到首批
+  //（对齐原分页的重置行为，同款处理见 CronPanel/index.tsx 的"搜索内容变化时重置回第 1 页"）。
   useEffect(() => {
-    setCurrentPage(1);
+    setMarketVisibleCount(MARKET_BATCH_SIZE);
   }, [topTab, myKind, category, pluginCategory, query, installationFilter]);
 
-  const totalPages = pageSize === PAGE_SIZE_ALL ? 1 : Math.max(1, Math.ceil(activeList.length / pageSize));
+  const hasMoreMarketItems = marketVisibleCount < activeList.length;
+  const visibleConnectors = filteredConnectors.slice(0, marketVisibleCount);
+  const visiblePlugins = filteredPlugins.slice(0, marketVisibleCount);
 
-  // 列表变短（比如删除/卸载后仍留在原页）导致当前页码越界时钳制回合法范围
+  const appendNextMarketBatch = useCallback(() => {
+    setMarketVisibleCount((count) => Math.min(count + MARKET_BATCH_SIZE, activeList.length));
+  }, [activeList.length]);
+
+  // 时间戳节流：滚动/IntersectionObserver 高频触发，100ms 内只允许追加一次
+  //（三层机制对齐 CatalogPage/GroupCatalogPage/PickerListRegion）。
+  const lastAppendAtRef = useRef(0);
+  const tryAppendMarketBatch = useCallback(() => {
+    const now = performance.now();
+    if (now - lastAppendAtRef.current < 100) return;
+    lastAppendAtRef.current = now;
+    appendNextMarketBatch();
+  }, [appendNextMarketBatch]);
+
+  // 第 2 层滚动触底兜底（IntersectionObserver 为主路径）：快速滑动越过哨兵时覆盖。
+  const handleListScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || !hasMoreMarketItems) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - LOAD_MORE_THRESHOLD_PX) tryAppendMarketBatch();
+  }, [hasMoreMarketItems, tryAppendMarketBatch]);
+
+  // 第 1 层主路径：底部加载组件（哨兵）进入视口即追加下一批；rootMargin 提前
+  // LOAD_MORE_THRESHOLD_PX 触发。jsdom 等无布局环境没有 IntersectionObserver，
+  // 跳过（由 onScroll + 兜底 effect 覆盖）。hasMore 翻转时哨兵会卸载/重挂，
+  // 依赖带上它让 observer 重新挂到新节点。
   useEffect(() => {
-    setCurrentPage((p) => (p > totalPages ? totalPages : p));
-  }, [totalPages]);
+    if (typeof IntersectionObserver === 'undefined') return;
+    const root = scrollRef.current;
+    const sentinel = marketSentinelRef.current;
+    if (!root || !sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) tryAppendMarketBatch();
+      },
+      { root, rootMargin: `0px 0px ${LOAD_MORE_THRESHOLD_PX}px 0px` },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMoreMarketItems, tryAppendMarketBatch]);
 
-  const pageStart = pageSize === PAGE_SIZE_ALL ? 0 : (currentPage - 1) * pageSize;
-  const pageEnd = pageSize === PAGE_SIZE_ALL ? undefined : pageStart + pageSize;
-  const paginatedConnectors = filteredConnectors.slice(pageStart, pageEnd);
-  const paginatedPlugins = filteredPlugins.slice(pageStart, pageEnd);
-
-  function goToPage(page: number) {
-    setCurrentPage(page);
-    scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-  }
-
-  function changePageSize(size: number) {
-    setPageSize(size);
-    setCurrentPage(1);
-  }
+  // 第 3 层兜底：首批没撑出滚动条（大屏/卡片较小）时 onScroll 永不触发、哨兵恒在
+  // 视口内但 IntersectionObserver 不会再回调（已处于相交态），这里持续追加直到
+  // 出现滚动条或加载完。clientHeight === 0（无布局，如 jsdom）时跳过，避免误判。
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !hasMoreMarketItems) return;
+    if (el.clientHeight === 0 || el.scrollHeight > el.clientHeight) return;
+    appendNextMarketBatch();
+  }, [hasMoreMarketItems, appendNextMarketBatch, marketVisibleCount]);
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="connector-market-marketplace">
@@ -498,13 +472,11 @@ export function MarketplacePage({
 
         <div className="page-toolbar" data-testid="page-toolbar">
           <div className="flex min-h-[34px] items-stretch">
-            {/* "应用插件"不是可选中页签：作为 Tabs 动作项混排（onClick 直连，不经过 onChange、
-              永远无选中态），交互与原独立按钮一致 */}
             <Tabs
               role="tablist"
               wrapperTestId="connector-market-tabs"
               itemTestId="connector-market-tab"
-              className="text-base"
+              className="page-tabs"
               value={topTab}
               onChange={onTopTabChange}
               items={[
@@ -512,24 +484,19 @@ export function MarketplacePage({
                   value: tab,
                   label: t(tab === 'my' ? 'connectorMarket.tabs.my' : `connectorMarket.tabs.${tab}Market`),
                 })),
-                {
-                  value: 'application-plugins',
-                  label: t('connectorMarket.tabs.applicationPlugins'),
-                  onClick: onOpenApplicationPlugins,
-                },
               ]}
             />
           </div>
 
           <div className="flex items-center gap-3">
-            <InstallationFilterSelect value={installationFilter} onChange={value => { setInstallationFilter(value); setCurrentPage(1); }} />
+            <InstallationFilterSelect value={installationFilter} onChange={setInstallationFilter} />
             <PageToolbarSearch
               wrapperTestId="connector-market-search"
               inputTestId="connector-market-search-input"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               onClear={() => setQuery('')}
-              placeholder={topTab === 'my' ? (i18n.language.startsWith('zh') ? (myKind === 'plugin' ? '搜索我的插件' : '搜索我的连接器') : (myKind === 'plugin' ? 'Search my plugins' : 'Search my connectors')) : t(`connectorMarket.search.${topTab}`)}
+              placeholder={topTab === 'my' ? t('common.searchName') : t(`connectorMarket.search.${topTab}`)}
             />
 
             {topTab === 'my' && (
@@ -538,11 +505,18 @@ export function MarketplacePage({
                   type="button"
                   onClick={() => setCreateMenuOpen((v) => !v)}
                   data-testid="connector-market-create-menu"
-                  className="flex h-8 shrink-0 items-center gap-1 rounded-lg bg-text px-3 text-[12px] text-text-inverse"
+                  className="flex items-center justify-center gap-1 h-8 w-[96px] rounded-[16px] text-sm text-text-inverse bg-control-emphasis hover:opacity-80"
                 >
-                  <Plus size={13} />
                   {t('connectorMarket.create.menuLabel')}
-                  <ChevronDown size={13} />
+                  <svg
+                    className={`w-3.5 h-3.5 transition-transform ${createMenuOpen ? 'rotate-180' : ''}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    strokeWidth={2}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                  </svg>
                 </button>
                 {createMenuOpen && (
                   <div className="dropdown-menu" role="menu" data-testid="connector-market-create-menu-popover">
@@ -627,12 +601,12 @@ export function MarketplacePage({
         </div>
       )}
 
-<CatalogCacheNotice cache={catalogCacheOf(topTab === 'my' ? (myKind === 'mcp' ? myConnectors : localPackages) : topTab === 'mcp' ? builtinConnectors : packages)} />
-<div ref={scrollRef} className="page-scroll min-h-0 flex-1 overflow-y-auto">
-<div className="card-grid-auto" data-testid="connector-market-card-list">
+          <CatalogCacheNotice cache={catalogCacheOf(topTab === 'my' ? (myKind === 'mcp' ? myConnectors : localPackages) : topTab === 'mcp' ? builtinConnectors : packages)} />
+          <div ref={scrollRef} className="page-scroll min-h-0 flex-1 overflow-y-auto" onScroll={handleListScroll}>
+            <div className="card-grid-auto" data-testid="connector-market-card-list">
         {topTab === 'my'
           ? myKind === 'mcp'
-            ? paginatedConnectors.map((connector) => {
+            ? visibleConnectors.map((connector) => {
                 const cs = mcpCardStates[connector.runtimePackageName];
                 // "我的MCP"卡片列表可达性：customize（我的MCP）恒可达，built_in 一旦不是从未
                 // 连接过的 idle 态也可达——见 mcpState.ts deriveMcpAvailability。
@@ -653,7 +627,7 @@ export function MarketplacePage({
                   />
                 );
               })
-            : paginatedPlugins.map((pkg) => {
+            : visiblePlugins.map((pkg) => {
                 const pluginInstalled = !!installed[pkg.id];
                 const pluginConnected = (pluginConnectionStateMap[pkg.id] ?? 'disconnected') === 'connected';
                 return (
@@ -680,7 +654,7 @@ export function MarketplacePage({
                 );
               })
           : topTab === 'mcp'
-            ? paginatedConnectors.map((connector) => {
+            ? visibleConnectors.map((connector) => {
                 const cs = mcpCardStates[connector.runtimePackageName];
                 const { installed: mcpInstalled } = deriveMcpAvailability(connector.installed, cs);
                 return (
@@ -699,7 +673,7 @@ export function MarketplacePage({
                   />
                 );
               })
-            : paginatedPlugins.map((pkg) => {
+            : visiblePlugins.map((pkg) => {
                 const pluginInstalled = !!installed[pkg.id];
                 const pluginConnected = (pluginConnectionStateMap[pkg.id] ?? 'disconnected') === 'connected';
                 return (
@@ -724,40 +698,39 @@ export function MarketplacePage({
                 );
               })}
         {isEmpty && (
-          <div
-            className="col-span-full flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border py-16 text-[13px] text-text-muted"
-            data-testid="connector-market-empty"
-          >
-            {activeIsLoading
-              ? t(
-                  topTab === 'my'
-                    ? myKind === 'mcp'
-                      ? 'connectorMarket.empty.loadingMyMcp'
-                      : 'connectorMarket.empty.loadingMyPlugin'
-                    : topTab === 'mcp'
-                      ? 'connectorMarket.empty.loadingMcp'
-                      : 'connectorMarket.empty.loadingPlugin',
-                )
-              : topTab === 'my'
-                ? t(myKind === 'mcp' ? 'connectorMarket.empty.myMcp' : 'connectorMarket.empty.myPlugin')
-                : t('connectorMarket.empty.searchNoResult')}
-          </div>
+          <EmptyState
+            id="connector-market-empty"
+            className="col-span-full"
+            text={
+                activeIsLoading
+                  ? t(
+                      topTab === 'my'
+                        ? myKind === 'mcp'
+                          ? 'connectorMarket.empty.loadingMyMcp'
+                          : 'connectorMarket.empty.loadingMyPlugin'
+                        : topTab === 'mcp'
+                          ? 'connectorMarket.empty.loadingMcp'
+                          : 'connectorMarket.empty.loadingPlugin',
+                    )
+                  : topTab === 'my'
+                    ? t(myKind === 'mcp' ? 'connectorMarket.empty.myMcp' : 'connectorMarket.empty.myPlugin')
+                    : t('connectorMarket.empty.searchNoResult')}
+          />
         )}
+        {hasMoreMarketItems ? (
+          <div
+            ref={marketSentinelRef}
+            className="flex items-center justify-center gap-2 py-4"
+            role="status"
+            aria-label={t('connectorMarket.loadMore')}
+            data-testid="connector-market-load-more"
+          >
+            <LoadingSpinner size={16} testId="connector-market-load-more-spinner" />
+            <span className="text-sm text-text-muted">{t('connectorMarket.loadMore')}</span>
+          </div>
+        ) : null}
         </div>
       </div>
-
-      {!isEmpty && (
-        <div className="page-shell">
-          <PaginationBar
-            currentPage={currentPage}
-            totalPages={totalPages}
-            pageSize={pageSize}
-            totalCount={activeList.length}
-            onPageChange={goToPage}
-            onPageSizeChange={changePageSize}
-          />
-        </div>
-      )}
 
       {tokenTarget && (
         <ConnectTokenModal

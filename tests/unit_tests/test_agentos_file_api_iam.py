@@ -8,17 +8,20 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from jiuwenswarm.extensions.agentos.agentos_router.agent_manager import (
+from agent_gateway.channel_manager.base import RobotMessageRouter
+from agent_gateway.channel_manager.web.web_channel_app import build_web_channel_app
+from agent_gateway.channel_manager.web.web_connect import WebChannel, WebChannelConfig
+from agent_gateway.extensions.agentos.agentos_router.agent_manager import (
     AgentManager,
     AgentRuntime,
 )
-from jiuwenswarm.extensions.agentos.agentos_router.models import AgentInfo, AgentStatus
-from jiuwenswarm.extensions.agentos.agentos_router.router_client import AgentOSRouterClient
-from jiuwenswarm.extensions.agentos.auth.credential_authenticator import AuthContext, AuthResult
-from jiuwenswarm.extensions.yuanrong_frontend_client import AgentFileDownloadChunk, SandboxInfo
-from jiuwenswarm.gateway.channel_manager.base import RobotMessageRouter
-from jiuwenswarm.gateway.channel_manager.web.web_channel_app import build_web_channel_app
-from jiuwenswarm.gateway.channel_manager.web.web_connect import WebChannel, WebChannelConfig
+from agent_gateway.extensions.agentos.agentos_router.models import AgentInfo, AgentStatus
+from agent_gateway.extensions.agentos.agentos_router.router_client import AgentOSRouterClient
+from agent_gateway.extensions.auth.credential_authenticator import AuthContext, AuthResult
+from agent_gateway.extensions.yuanrong_frontend_client import (
+    AgentFileDownloadChunk,
+    SandboxInfo,
+)
 
 
 class _FakeRegistry:
@@ -112,6 +115,32 @@ async def test_authenticate_http_skips_when_auth_disabled() -> None:
     )
     assert result.success is True
     assert result.user_id == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_web_auth_preserves_query_identity_when_auth_disabled() -> None:
+    router = _make_router()
+    result = await router.authenticate_http(
+        path="/ws?user_id=query-user", headers={}, channel="web"
+    )
+    assert result.success is True
+    assert result.user_id == "query-user"
+
+    with_header = await router.authenticate_http(
+        path="/ws?user_id=query-user", headers={"X-User-Id": "header-user"}, channel="web"
+    )
+    assert with_header.user_id == "query-user"
+
+
+@pytest.mark.asyncio
+async def test_web_auth_rejects_missing_authenticated_identity() -> None:
+    router = _make_router()
+    _enable_auth(router, AuthResult(success=True, user_id=""))
+    result = await router.authenticate_http(
+        path="/ws?user_id=claimed-user", headers={"Authorization": "Bearer token"}, channel="web"
+    )
+    assert result.success is False
+    assert result.user_id == ""
 
 
 @pytest.mark.asyncio

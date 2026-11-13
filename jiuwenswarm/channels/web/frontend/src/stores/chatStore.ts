@@ -6,9 +6,11 @@
  */
 
 import { create } from 'zustand';
+import { mergeUniqueMessages, toOwnerTeamMessage } from '../components/ChatPanel/teamEventUtils';
 import { subscribeWithSelector } from 'zustand/middleware';
 import {
   Message,
+  OutputOrder,
   ToolCall,
   ToolResult,
   ToolExecution,
@@ -21,9 +23,12 @@ import {
   FileDownloadItem,
   ContextCompressionRuntime,
   ContextCompressionSummary,
+  MoaOperation,
+  MoaStatusPayload,
   MediaItem,
 } from '../types';
 import { useTodoStore } from './todoStore';
+import { findActiveTeamLeaderMessage } from '../features/teamLeaderMessages';
 import {
   mergeReviewerProgress,
   mergeToolResultProgress,
@@ -31,14 +36,53 @@ import {
 } from './toolResultLifecycle';
 import { mergeFileDownloadItems } from '../utils/fileDownloadDedup';
 import { parseTimestampToMs } from '../utils/timestamp';
+import { areSteerImagesReady } from '../features/sessionInputMedia';
 import {
   consumePendingQuestion as consumeQueuedQuestion,
   clearPermissionQuestions as clearQueuedPermissionQuestions,
+  dropAnsweredAskUserQuestions,
   enqueuePendingQuestions,
+  isAnsweredAskUserQuestion,
+  markQuestionsAnswered as markQueuedQuestionsAnswered,
 } from './pendingQuestionQueue';
 
 const TOOL_TIMEOUT_MS = 12_000_000;
 const EVOLUTION_STATUS_END_VISIBLE_MS = 3_000;
+
+/**
+ * 会话视图键。
+ *
+ * 一个 session 可以同时挂多个 team（后端 TeamRuntimePool 以 team_name 为键、按
+ * current_session_id 归属）。左栏对话要「切 team 就换一条思考过程」，那 messages /
+ * reasoningSegments / 流的中间态就不能只按 session 存一份——那样所有 team 的流会
+ * 汇进同一条对话，切换时看到的是同一段内容。
+ *
+ * 所以运行态按 conversationKey 存：`sessionId` 是这一轮的主视图（也是老数据的键，
+ * 不传 teamId 时行为与改造前完全一致），`sessionId::teamId` 是某个 team 自己的视图。
+ * 两边都是完整的 ChatRuntime，各自独立累积流、推理段和工具执行。
+ */
+const CONVERSATION_KEY_SEPARATOR = '::';
+
+export function conversationKey(sessionId: string, teamId?: string | null): string {
+  const team = typeof teamId === 'string' ? teamId.trim() : '';
+  if (!team) return sessionId;
+  return `${sessionId}${CONVERSATION_KEY_SEPARATOR}${team}`;
+}
+
+/** 从会话视图键拆回 (sessionId, teamId)；主视图的 teamId 为 null。 */
+export function parseConversationKey(key: string): { sessionId: string; teamId: string | null } {
+  const index = key.indexOf(CONVERSATION_KEY_SEPARATOR);
+  if (index < 0) return { sessionId: key, teamId: null };
+  return {
+    sessionId: key.slice(0, index),
+    teamId: key.slice(index + CONVERSATION_KEY_SEPARATOR.length) || null,
+  };
+}
+
+/** 会话视图键是否属于某个 session（含它名下的所有 team 视图）。 */
+export function isConversationKeyOfSession(key: string, sessionId: string): boolean {
+  return key === sessionId || key.startsWith(`${sessionId}${CONVERSATION_KEY_SEPARATOR}`);
+}
 
 let reasoningSegmentSeq = 0;
 
@@ -64,12 +108,54 @@ function resolveExecutionStatus(result: ToolResult): ToolExecutionStatus {
   return result.success ? 'completed' : 'error';
 }
 
+type TaskInputStatus = 'queued' | 'sending' | 'failed' | 'unknown';
+
+export interface TaskInputReceipt {
+  taskId: string;
+  content: string;
+  mediaItems?: MediaItem[];
+  requestId?: string;
+  status: 'sending' | 'accepted' | 'failed' | 'unknown';
+  error?: string;
+  errorCode?: string;
+  timestamp: string;
+  supplementalInput: NonNullable<Message['supplementalInput']>;
+}
+
 interface TaskItem {
   id: string;
   content: string;
   timestamp: number;
+  status: TaskInputStatus;
+  requestId?: string;
+  error?: string;
   /** Persisted attachments (images/documents, incl. PDF); dispatched with the message when the queued task is sent */
   mediaItems?: MediaItem[];
+}
+
+export interface QueuedSessionMessage {
+  messageId: string;
+  sourceSessionId: string;
+  sourceTitle: string;
+  content: string;
+}
+
+export interface QueuedSessionMessageSnapshot {
+  generation: number;
+  previous: QueuedSessionMessage[];
+}
+
+export interface A4PAuthorizationRequest {
+  originalActions?: Record<string, unknown>[];
+  preparedActionIndexes?: number[];
+  replacesRequestId?: string | null;
+  repreparing?: boolean;
+  requestId: string;
+  kind: string;
+  mandate: Record<string, unknown>;
+  signingOptions: Record<string, unknown>;
+  uiContext?: Record<string, unknown>;
+  sessionId?: string;
 }
 
 export interface HistoryPagerMeta {
@@ -87,6 +173,7 @@ export interface HistoryPagerMeta {
  * 原全局字段全部迁移到这里，按 session 隔离。
  */
 export interface ReasoningSegment {
+  outputOrder?: OutputOrder;
   id: string;
   text: string;
   startedAt: number;
@@ -103,8 +190,14 @@ export interface ReasoningSegment {
 
 export interface ChatRuntime {
   messages: Message[];
+  /** Aggregate busy state; foreground and organization lifecycles update their own flags. */
   isProcessing: boolean;
+  foregroundIsProcessing: boolean;
+  organizationIsProcessing: boolean;
+  activeExecutionId: string | null;
   executionError: string | null;
+  /** The Team session's bound AgentGroup was deleted or uninstalled. */
+  agentGroupUnavailable: boolean;
   isThinking: boolean;
   isLoadingHistory: boolean;
   historyPagerMeta: HistoryPagerMeta | null;
@@ -116,9 +209,12 @@ export interface ChatRuntime {
   isNewSession: boolean;
   currentStreamContent: string;
   currentStreamId: string | null;
+  outputPhaseId?: string;
   /** 本轮是否已按工具边界分段（chat.final 去重）。 */
   assistantStreamSplit: boolean;
   reasoningSegments: ReasoningSegment[];
+  /** 已接受补充输入；仅在下一条 reasoning 真正到达时分段。 */
+  reasoningInputBoundaryPending: boolean;
   /** 「思考中」耗时锚点：仅在可见文字产出时前移。 */
   thinkingAnchorAt: number;
   messageRenderKeySeq: number;
@@ -130,30 +226,55 @@ export interface ChatRuntime {
   orphanResults: Map<string, ToolResult>;
   contextCompressionRuntime?: ContextCompressionRuntime;
   contextCompressionSummary?: ContextCompressionSummary;
+  moaOperations: Record<string, MoaOperation>;
+  moaStatusClosed: boolean;
   toolMetrics: {
     toolCallDedupDropped: number;
     toolResultDedupDropped: number;
   };
   taskQueue: TaskItem[];
+  queuedSessionMessages: QueuedSessionMessage[];
+  canContinueQueuedSessionMessages: boolean;
+  queuedSessionMessageSnapshotGeneration: number;
+  /** A mailbox item cannot return to queued after it starts. */
+  settledQueuedSessionMessageIds: Set<string>;
+  /** Keep request ownership even after a receipt is dismissed, to isolate late ACK/errors. */
+  taskInputRequests: Record<string, { taskId: string; content: string; delivery?: 'chat' }>;
+  /** Message-level feedback survives removal from the executable queue. */
+  taskInputReceipts: Record<string, TaskInputReceipt>;
   queuePaused: boolean;
   pendingQuestions: AskUserQuestionPayload[];
+  pendingA4PAuthorization: A4PAuthorizationRequest | null;
+  retiredA4PRequestIds?: string[];
   /**
    * 忙碌时设目标：用户气泡暂存在此（界面不立刻显示）；
    * 空 chat.final / processing 结束再正式入 messages。
    */
   pendingGoalObjectiveBubble: { content: string; timestamp: string } | null;
   inputValue: string;
+  inputSkillPositions: { name: string; offset: number }[];
   /** evolutionStatus 自动清除定时器，按 session 隔离 */
   evolutionStatusClearTimer: ReturnType<typeof setTimeout> | null;
   /** interruptResult 自动清除定时器，按 session 隔离 */
   interruptResultClearTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Epoch of the last successful pause/cancel ack that settled this turn.
+   * While set, a lagging runtime-snapshot (session.get_metadata) or a synthetic
+   * resume processing event must not relight foreground processing; the next
+   * real processing_status(true) frame or a new user send clears it.
+   */
+  interruptSettledEpoch: number | null;
 }
 
 function createEmptyRuntime(): ChatRuntime {
   return {
     messages: [],
     isProcessing: false,
+    foregroundIsProcessing: false,
+    organizationIsProcessing: false,
+    activeExecutionId: null,
     executionError: null,
+    agentGroupUnavailable: false,
     isThinking: false,
     isLoadingHistory: false,
     historyPagerMeta: null,
@@ -161,12 +282,14 @@ function createEmptyRuntime(): ChatRuntime {
     isPaused: false,
     pausedTask: null,
     interruptResult: null,
+    interruptSettledEpoch: null,
     switchingMode: false,
     isNewSession: false,
     currentStreamContent: '',
     currentStreamId: null,
     assistantStreamSplit: false,
     reasoningSegments: [],
+    reasoningInputBoundaryPending: false,
     thinkingAnchorAt: Date.now(),
     messageRenderKeySeq: 0,
     error: null,
@@ -176,15 +299,25 @@ function createEmptyRuntime(): ChatRuntime {
     orphanResults: new Map(),
     contextCompressionRuntime: undefined,
     contextCompressionSummary: undefined,
+    moaOperations: {},
+    moaStatusClosed: true,
     toolMetrics: {
       toolCallDedupDropped: 0,
       toolResultDedupDropped: 0,
     },
     taskQueue: [],
+    queuedSessionMessages: [],
+    canContinueQueuedSessionMessages: false,
+    queuedSessionMessageSnapshotGeneration: 0,
+    settledQueuedSessionMessageIds: new Set(),
+    taskInputRequests: {},
+    taskInputReceipts: {},
     queuePaused: false,
     pendingQuestions: [],
+    pendingA4PAuthorization: null,
     pendingGoalObjectiveBubble: null as ChatRuntime['pendingGoalObjectiveBubble'],
     inputValue: '',
+    inputSkillPositions: [],
     evolutionStatusClearTimer: null,
     interruptResultClearTimer: null,
   };
@@ -219,6 +352,14 @@ interface ChatState {
   ensureRuntime: (sessionId: string) => ChatRuntime;
   getRuntime: (sessionId: string | null) => ChatRuntime | undefined;
   setActiveSessionId: (sessionId: string | null) => void;
+  /**
+   * 取某个 team 视图的运行态。teamId 为空时退回主视图，因此调用方不必先判空。
+   * 视图不存在时返回 undefined（不隐式创建，避免读操作产生副作用）。
+   * 当前选中 team 由 teamSelectorStore.selectedTeamId 决定，不在此 store 再存一份。
+   */
+  getTeamRuntime: (sessionId: string | null, teamId: string | null | undefined) => ChatRuntime | undefined;
+  /** 取得（必要时创建）某个 team 视图的运行态，供事件写入路径使用。 */
+  ensureTeamRuntime: (sessionId: string, teamId: string | null | undefined) => ChatRuntime;
   setGlobalTaskRunning: (running: boolean) => void;
   removeRuntime: (sessionId: string) => void;
 
@@ -229,12 +370,14 @@ interface ChatState {
   appendReasoning: (
     sessionId: string,
     content: string,
-    options?: { atMs?: number; agentTemplateName?: string },
+    options?: { atMs?: number; agentTemplateName?: string; outputOrder?: OutputOrder },
   ) => void;
   closeReasoning: (sessionId: string, options?: { atMs?: number }) => void;
   restoreReasoningSegments: (
     sessionId: string,
     items: {
+      id?: string;
+      outputOrder?: OutputOrder;
       at: string;
       text: string;
       agentTemplateName?: string;
@@ -245,7 +388,7 @@ interface ChatState {
   startStreaming: (sessionId: string, messageId: string, streamKey?: string) => void;
   stopStreaming: (sessionId: string, streamKey?: string) => void;
   finalizeStreamSegment: (sessionId: string, streamKey?: string) => void;
-  finalizeTeamLeaderSegment: (sessionId: string) => void;
+  finalizeTeamLeaderSegment: (sessionId: string, requestId?: string) => void;
   clearStreamSplit: (sessionId: string) => void;
   collapseTurnFinal: (
     sessionId: string,
@@ -259,14 +402,28 @@ interface ChatState {
   ) => void;
   bumpThinkingAnchor: (sessionId: string) => void;
   setExecutionError: (sessionId: string, error: string | null) => void;
+  setAgentGroupUnavailable: (sessionId: string, unavailable: boolean) => void;
   setProcessing: (sessionId: string, status: boolean) => void;
+  setOrganizationProcessing: (sessionId: string, status: boolean) => void;
+  setActiveExecutionId: (sessionId: string, executionId: string) => void;
   setThinking: (sessionId: string, status: boolean) => void;
   setLoadingHistory: (sessionId: string, status: boolean) => void;
   setHistoryPagerMeta: (sessionId: string, meta: HistoryPagerMeta | null) => void;
   setEvolutionStatus: (sessionId: string, status: EvolutionStatusPayload | null) => void;
   setPaused: (sessionId: string, paused: boolean, task?: string | null) => void;
   setQueuePaused: (sessionId: string, paused: boolean) => void;
+  setCanContinueQueuedSessionMessages: (sessionId: string, canContinue: boolean) => void;
+  upsertQueuedSessionMessage: (sessionId: string, message: QueuedSessionMessage) => void;
+  removeQueuedSessionMessage: (sessionId: string, messageId: string) => void;
+  beginQueuedSessionMessageSnapshot: (sessionId: string) => QueuedSessionMessageSnapshot;
+  reconcileQueuedSessionMessageSnapshot: (
+    sessionId: string,
+    snapshot: QueuedSessionMessageSnapshot,
+    messages: QueuedSessionMessage[]
+  ) => void;
   setInterruptResult: (sessionId: string, result: InterruptResultPayload | null) => void;
+  markInterruptSettled: (sessionId: string) => void;
+  clearInterruptSettled: (sessionId: string) => void;
   setSwitchingMode: (sessionId: string, switching: boolean) => void;
   setNewSession: (sessionId: string, isNew: boolean) => void;
   addToolCall: (
@@ -289,17 +446,37 @@ interface ChatState {
   clearCurrentTurnData: (sessionId: string, requestId?: string) => void;
   prependMessages: (sessionId: string, olderFirst: Message[]) => void;
   addToTaskQueue: (sessionId: string, content: string, mediaItems?: MediaItem[]) => void;
+  claimQueuedTask: (sessionId: string, taskId?: string) => TaskItem | undefined;
+  claimTaskInput: (sessionId: string, taskId: string) => TaskItem | undefined;
+  bindTaskInputRequest: (sessionId: string, taskId: string, requestId: string) => void;
+  settleTaskInput: (
+    sessionId: string,
+    taskId: string,
+    requestId: string | undefined,
+    status: 'accepted' | 'failed' | 'unknown',
+    error?: string,
+    errorCode?: string,
+    delivery?: 'chat' | 'stream',
+  ) => void;
+  setOutputPhase: (sessionId: string, phaseId: string) => void;
   clearTaskQueue: (sessionId: string) => void;
   removeFromTaskQueue: (sessionId: string, id: string) => void;
   reorderTaskQueue: (sessionId: string, fromIndex: number, toIndex: number) => void;
   enqueuePendingQuestion: (sessionId: string, question: AskUserQuestionPayload) => void;
   consumePendingQuestion: (sessionId: string, question: AskUserQuestionPayload) => void;
+  /** 登记已答的 ask_user request_id，并移除队列中对应的过期问题。 */
+  markQuestionsAnswered: (sessionId: string, requestIds: Iterable<string>) => void;
   clearPendingQuestions: (sessionId: string) => void;
+  setPendingA4PAuthorization: (
+    sessionId: string,
+    request: A4PAuthorizationRequest | null,
+    terminatedRequestId?: string,
+  ) => void;
   setPendingGoalObjectiveBubble: (sessionId: string, content: string | null) => void;
   flushPendingGoalObjectiveBubble: (sessionId: string) => void;
   queueOrAddGoalObjectiveMessage: (sessionId: string, content: string) => void;
   clearPermissionQuestions: (sessionId: string) => void;
-  setInputValue: (sessionId: string, value: string) => void;
+  setInputValue: (sessionId: string, value: string, skillPositions?: { name: string; offset: number }[]) => void;
   setSessionError: (sessionId: string, error: string | null) => void;
   setUsageSummary: (sessionId: string, messageId: string, usage: UsageSummary) => void;
   addFileItems: (
@@ -312,6 +489,8 @@ interface ChatState {
     runtime?: ContextCompressionRuntime,
     summary?: ContextCompressionSummary
   ) => void;
+  updateMoaStatus: (sessionId: string, payload: MoaStatusPayload) => void;
+  clearMoaStatus: (sessionId: string) => void;
 }
 
 export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get) => ({
@@ -331,7 +510,40 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
 
   getRuntime: (sessionId) => {
     if (!sessionId) return undefined;
+    // 只认主视图。未迁移的读点（会话列表、历史分页、导出等）拿到的仍是改造前那一份，
+    // 所以切 team 不会让它们读到别的视图。要看 team 视图的调用方走 getTeamRuntime。
     return get().runtimes[sessionId];
+  },
+
+  setOutputPhase: (sessionId, phaseId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime) return state;
+      return { runtimes: { ...state.runtimes, [sessionId]: { ...runtime, outputPhaseId: phaseId } } };
+    });
+  },
+  /**
+   * 某个 team 视图的运行态；teamId 为空时退回主视图。
+   *
+   * 这里**不**回退到主视图的另一层含义：team 视图尚未建立（还没收到这个 team 的
+   * 任何一帧）时返回 undefined，让调用方用 `?? []` 之类的默认值渲染空对话，而不是
+   * 把主视图的内容借过来——后者正是「切了 team 但看到同一段对话」的来源。
+   */
+  getTeamRuntime: (sessionId, teamId) => {
+    if (!sessionId) return undefined;
+    const key = conversationKey(sessionId, teamId);
+    return get().runtimes[key];
+  },
+
+  ensureTeamRuntime: (sessionId, teamId) => {
+    const key = conversationKey(sessionId, teamId);
+    const existing = get().runtimes[key];
+    if (existing) return existing;
+    const runtime = createEmptyRuntime();
+    set((state) => ({
+      runtimes: { ...state.runtimes, [key]: runtime },
+    }));
+    return runtime;
   },
 
   setActiveSessionId: (sessionId) => {
@@ -344,13 +556,17 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
 
   removeRuntime: (sessionId) => {
     set((state) => {
-      const runtime = state.runtimes[sessionId];
-      if (runtime) {
+      // 连同这个 session 名下所有 team 视图一起清掉，否则删会话后 team 视图会
+      // 留在 runtimes 里变成孤儿（键前缀匹配，主视图 key 恰好等于 sessionId）。
+      const next: Record<string, ChatRuntime> = {};
+      for (const [key, runtime] of Object.entries(state.runtimes)) {
+        if (!isConversationKeyOfSession(key, sessionId)) {
+          next[key] = runtime;
+          continue;
+        }
         if (runtime.evolutionStatusClearTimer) clearTimeout(runtime.evolutionStatusClearTimer);
         if (runtime.interruptResultClearTimer) clearTimeout(runtime.interruptResultClearTimer);
       }
-      const next = { ...state.runtimes };
-      delete next[sessionId];
       return {
         runtimes: next,
         activeSessionId: state.activeSessionId === sessionId ? null : state.activeSessionId,
@@ -390,6 +606,24 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
   },
 
   replaceHistoryMessages: (sessionId, messages) => {
+    if (!sessionId.includes(CONVERSATION_KEY_SEPARATOR)) {
+      const teams = new Map<string, Message[]>();
+      for (const message of messages) {
+        if (!message.teamId) continue;
+        const group = teams.get(message.teamId) ?? [];
+        group.push(message);
+        teams.set(message.teamId, group);
+      }
+      for (const [teamId, history] of teams) {
+        useChatStore.getState().ensureTeamRuntime(sessionId, teamId);
+        useChatStore.getState().replaceHistoryMessages(conversationKey(sessionId, teamId), history);
+      }
+      messages = messages.flatMap((message) => {
+        if (!message.teamId) return [message];
+        const ownerMessage = toOwnerTeamMessage(message);
+        return ownerMessage ? [ownerMessage] : [];
+      });
+    }
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
@@ -420,12 +654,16 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             orphanResults: new Map(),
             contextCompressionRuntime: undefined,
             contextCompressionSummary: undefined,
+            ...(!runtime.isProcessing ? { moaOperations: {} } : {}),
             toolMetrics: {
               toolCallDedupDropped: 0,
               toolResultDedupDropped: 0,
             },
             taskQueue: [],
-            pendingQuestions: [],
+            // pendingQuestions 是后端通过 chat.ask_user_question 实时推送的交互状态，
+            // 不属于历史消息范畴。历史恢复只重建消息列表，不应清空 pendingQuestions——
+            // 否则切到/切回一个正在等待 ask_user/权限确认的会话时，吸附条会永久消失
+            // （后端不会重发 pending question）。仅在新会话首次创建时由 clearMessages 清空。
             pendingGoalObjectiveBubble: null,
           },
         },
@@ -489,7 +727,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           ? options.atMs
           : Date.now();
       let next: ReasoningSegment[];
-      if (last && !last.closed) {
+      if (last && !last.closed && !runtime.reasoningInputBoundaryPending) {
         // 每个 delta 都推进 updatedAt，使耗时终点不依赖 closeReasoning 收尾事件
         next = segments.slice(0, -1).concat({
           ...last,
@@ -500,7 +738,16 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             : {}),
         });
       } else {
-        next = segments.concat({
+        const settledSegments =
+          last && !last.closed && runtime.reasoningInputBoundaryPending
+            ? segments.slice(0, -1).concat({
+                ...last,
+                closed: true,
+                closedAt: atMs,
+              })
+            : segments;
+        next = settledSegments.concat({
+          outputOrder: options?.outputOrder,
           id: createReasoningSegmentId(),
           text: content,
           startedAt: atMs,
@@ -512,7 +759,11 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       return {
         runtimes: {
           ...state.runtimes,
-          [sessionId]: { ...runtime, reasoningSegments: next },
+          [sessionId]: {
+            ...runtime,
+            reasoningSegments: next,
+            reasoningInputBoundaryPending: false,
+          },
         },
       };
     });
@@ -524,7 +775,15 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       if (!runtime) return state;
       const segments = runtime.reasoningSegments;
       const last = segments[segments.length - 1];
-      if (!last || last.closed) return state;
+      if (!last || last.closed) {
+        if (!runtime.reasoningInputBoundaryPending) return state;
+        return {
+          runtimes: {
+            ...state.runtimes,
+            [sessionId]: { ...runtime, reasoningInputBoundaryPending: false },
+          },
+        };
+      }
       const atMs =
         typeof options?.atMs === 'number' && Number.isFinite(options.atMs)
           ? options.atMs
@@ -540,6 +799,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
               closedAt: atMs,
               updatedAt: atMs,
             }),
+            reasoningInputBoundaryPending: false,
           },
         },
       };
@@ -554,8 +814,9 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       const seen = new Set<string>();
       items.forEach((item, index) => {
         const text = item.text?.trim();
-        if (!text || seen.has(text)) return;
-        seen.add(text);
+        const identity = item.outputOrder ? `${item.outputOrder.requestId}:${item.outputOrder.sequence}` : text;
+        if (!text || seen.has(identity)) return;
+        seen.add(identity);
         const parsed = parseTimestampToMs(item.at);
         // 历史里思考与同一步 final/tool_call 共用落盘时间；减 1ms 仅补齐缺失的独立时间戳，
         // 使时间线能分出「先思考、后动作」，不做跨步骤重排。
@@ -572,8 +833,9 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             ? replayUpdatedAt
             : startedAt;
         segments.push({
-          id: `hist-rsn-${sessionId}-${index}-${createReasoningSegmentId()}`,
+          id: item.id ?? `hist-rsn-${sessionId}-${index}-${createReasoningSegmentId()}`,
           text,
+          outputOrder: item.outputOrder,
           startedAt,
           closed: true,
           ...(item.agentTemplateName ? { agentTemplateName: item.agentTemplateName } : {}),
@@ -658,26 +920,12 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
-  finalizeTeamLeaderSegment: (sessionId) => {
+  finalizeTeamLeaderSegment: (sessionId, requestId) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
-      let latestUserIndex = -1;
-      for (let i = runtime.messages.length - 1; i >= 0; i -= 1) {
-        if (runtime.messages[i].role === 'user') {
-          latestUserIndex = i;
-          break;
-        }
-      }
-      let target: Message | undefined;
-      for (let i = runtime.messages.length - 1; i > latestUserIndex; i -= 1) {
-        const msg = runtime.messages[i];
-        if (msg.id.startsWith('team-leader-') && msg.isStreaming) {
-          target = msg;
-          break;
-        }
-      }
-      if (!target || !target.content?.trim()) return state;
+      const target = findActiveTeamLeaderMessage(runtime.messages, requestId);
+      if (!target) return state;
       const targetId = target.id;
       return {
         runtimes: {
@@ -685,7 +933,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           [sessionId]: {
             ...runtime,
             messages: runtime.messages.map((msg) =>
-              msg.id === targetId ? { ...msg, isStreaming: false } : msg
+              msg.id === targetId ? { ...msg, isStreaming: false, teamStream: undefined } : msg
             ),
             assistantStreamSplit: true,
           },
@@ -714,7 +962,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       const msgs = runtime.messages;
       let turnStart = 0;
       for (let i = msgs.length - 1; i >= 0; i -= 1) {
-        if (msgs[i].role === 'user') {
+        if (msgs[i].role === 'user' && !msgs[i].supplementalInput) {
           turnStart = i + 1;
           break;
         }
@@ -724,10 +972,12 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           ? m.role === 'system' && typeof m.id === 'string' && m.id.startsWith('team-leader-')
           : m.role === 'assistant';
       const kept: Message[] = [];
+      const removedIds = new Set<string>();
       let removed = 0;
       for (let i = 0; i < msgs.length; i += 1) {
         if (i >= turnStart && isTarget(msgs[i])) {
           removed += 1;
+          removedIds.add(msgs[i].id);
           continue;
         }
         kept.push(msgs[i]);
@@ -737,7 +987,18 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
         kind === 'team'
           ? `team.leader:${JSON.stringify({ content, timestamp: Date.parse(timestampIso) || Date.now() })}`
           : content;
-      kept.push({
+      const reboundMessages = kept.map((message) => {
+        const streamMessageId = message.supplementalInput?.streamMessageId;
+        if (!streamMessageId || !removedIds.has(streamMessageId)) return message;
+        return {
+          ...message,
+          supplementalInput: {
+            ...message.supplementalInput!,
+            streamMessageId: finalId,
+          },
+        };
+      });
+      reboundMessages.push({
         id: finalId,
         role: kind === 'team' ? 'system' : 'assistant',
         content: displayContent,
@@ -751,7 +1012,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           ...state.runtimes,
           [sessionId]: {
             ...runtime,
-            messages: kept,
+            messages: reboundMessages,
             assistantStreamSplit: false,
             currentStreamId: null,
             currentStreamContent: '',
@@ -781,7 +1042,40 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       return {
         runtimes: {
           ...state.runtimes,
-          [sessionId]: { ...runtime, executionError: error },
+          [sessionId]: { ...runtime, executionError: error, ...(error ? { moaOperations: {}, moaStatusClosed: true } : {}) },
+        },
+      };
+    });
+  },
+
+  setActiveExecutionId: (sessionId, executionId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || runtime.activeExecutionId === executionId) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            activeExecutionId: executionId,
+            moaStatusClosed: !executionId,
+            moaOperations: Object.fromEntries(
+              Object.entries(runtime.moaOperations).filter(([, operation]) => operation.executionId === executionId),
+            ),
+          },
+        },
+      };
+    });
+  },
+
+  setAgentGroupUnavailable: (sessionId, unavailable) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || runtime.agentGroupUnavailable === unavailable) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, agentGroupUnavailable: unavailable },
         },
       };
     });
@@ -792,24 +1086,46 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
       // 新一轮开始（false→true）：把「思考中」耗时锚点归到轮次起点。
-      const turnStart = status && !runtime.isProcessing;
+      const turnStart = status && !runtime.foregroundIsProcessing;
       return {
         runtimes: {
           ...state.runtimes,
           [sessionId]: {
             ...runtime,
-            isProcessing: status,
+            foregroundIsProcessing: status,
+            isProcessing: status || runtime.organizationIsProcessing,
+            ...(!status ? {
+              activeExecutionId: null,
+              reasoningInputBoundaryPending: false,
+            } : {}),
             executionError: status ? null : runtime.executionError,
             ...(status ? { error: null } : {}),
             ...(turnStart ? { thinkingAnchorAt: Date.now() } : {}),
+            ...(!status || turnStart ? { moaOperations: {}, moaStatusClosed: !status } : {}),
           },
         },
       };
     });
     // 整轮空闲：把忙碌时暂存的目标用户气泡正式入列（空 final 主路径之外的兜底）
-    if (!status) {
+    if (!get().runtimes[sessionId]?.isProcessing) {
       get().flushPendingGoalObjectiveBubble(sessionId);
     }
+  },
+
+  setOrganizationProcessing: (sessionId, status) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime) return state;
+      const isProcessing = status || runtime.foregroundIsProcessing;
+      if (runtime.organizationIsProcessing === status && runtime.isProcessing === isProcessing) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, organizationIsProcessing: status, isProcessing },
+        },
+      };
+    });
+    if (!get().runtimes[sessionId]?.isProcessing) get().flushPendingGoalObjectiveBubble(sessionId);
   },
 
   setSessionError: (sessionId, error) => {
@@ -904,7 +1220,12 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       return {
         runtimes: {
           ...state.runtimes,
-          [sessionId]: { ...runtime, isPaused: paused, pausedTask: task ?? null },
+          [sessionId]: {
+            ...runtime,
+            isPaused: paused,
+            pausedTask: task ?? null,
+            ...(paused ? { moaOperations: {}, moaStatusClosed: true } : {}),
+          },
         },
       };
     });
@@ -918,6 +1239,96 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
         runtimes: {
           ...state.runtimes,
           [sessionId]: { ...runtime, queuePaused: paused },
+        },
+      };
+    });
+  },
+
+  setCanContinueQueuedSessionMessages: (sessionId, canContinue) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId] ?? createEmptyRuntime();
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, canContinueQueuedSessionMessages: canContinue },
+        },
+      };
+    });
+  },
+
+  upsertQueuedSessionMessage: (sessionId, message) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId] ?? createEmptyRuntime();
+      if (runtime.settledQueuedSessionMessageIds.has(message.messageId)) return state;
+      const existing = runtime.queuedSessionMessages.findIndex(
+        (item) => item.messageId === message.messageId
+      );
+      const queuedSessionMessages = [...runtime.queuedSessionMessages];
+      if (existing >= 0) queuedSessionMessages[existing] = message;
+      else queuedSessionMessages.push(message);
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, queuedSessionMessages },
+        },
+      };
+    });
+  },
+
+  removeQueuedSessionMessage: (sessionId, messageId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId] ?? createEmptyRuntime();
+      if (runtime.settledQueuedSessionMessageIds.has(messageId)) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            queuedSessionMessages: runtime.queuedSessionMessages.filter(
+              (item) => item.messageId !== messageId
+            ),
+            settledQueuedSessionMessageIds: new Set([...runtime.settledQueuedSessionMessageIds, messageId]),
+          },
+        },
+      };
+    });
+  },
+
+  beginQueuedSessionMessageSnapshot: (sessionId) => {
+    const runtime = get().ensureRuntime(sessionId);
+    const snapshot = {
+      generation: runtime.queuedSessionMessageSnapshotGeneration + 1,
+      previous: runtime.queuedSessionMessages,
+    };
+    set((state) => ({
+      runtimes: {
+        ...state.runtimes,
+        [sessionId]: {
+          ...state.runtimes[sessionId],
+          queuedSessionMessageSnapshotGeneration: snapshot.generation,
+        },
+      },
+    }));
+    return snapshot;
+  },
+
+  reconcileQueuedSessionMessageSnapshot: (sessionId, snapshot, messages) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || runtime.queuedSessionMessageSnapshotGeneration !== snapshot.generation) return state;
+      const queuedSessionMessages = messages.filter(
+        (message) => !runtime.settledQueuedSessionMessageIds.has(message.messageId)
+      );
+      for (const message of runtime.queuedSessionMessages) {
+        if (snapshot.previous.includes(message)) continue;
+        const existing = queuedSessionMessages.findIndex((item) => item.messageId === message.messageId);
+        if (existing >= 0) queuedSessionMessages[existing] = message;
+        else queuedSessionMessages.push(message);
+      }
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, queuedSessionMessages },
         },
       };
     });
@@ -956,6 +1367,32 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
+  markInterruptSettled: (sessionId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, interruptSettledEpoch: Date.now() },
+        },
+      };
+    });
+  },
+
+  clearInterruptSettled: (sessionId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || runtime.interruptSettledEpoch === null) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: { ...runtime, interruptSettledEpoch: null },
+        },
+      };
+    });
+  },
+
   setSwitchingMode: (sessionId, switching) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
@@ -967,7 +1404,8 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             [sessionId]: {
               ...runtime,
               switchingMode: true,
-              isProcessing: false,
+              foregroundIsProcessing: false,
+              isProcessing: runtime.organizationIsProcessing,
               isPaused: false,
               pausedTask: null,
               interruptResult: null,
@@ -1057,6 +1495,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       const timeoutAt = computeTimeoutAt(startedAt);
       const resultStatus = orphanResult ? resolveExecutionStatus(orphanResult) : 'pending';
       nextExecutions.set(toolCall.id, {
+        outputOrder: toolCall.outputOrder,
         toolCallId: toolCall.id,
         toolCall,
         result: orphanResult,
@@ -1376,6 +1815,8 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
               orphanResults: new Map(),
               interruptResult: null,
               pendingQuestions: [],
+              pendingA4PAuthorization: null,
+              moaOperations: {},
               toolMetrics: {
                 toolCallDedupDropped: 0,
                 toolResultDedupDropped: 0,
@@ -1394,6 +1835,8 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             orphanResults: new Map(),
             interruptResult: null,
             pendingQuestions: [],
+            pendingA4PAuthorization: null,
+            moaOperations: {},
             toolMetrics: {
               toolCallDedupDropped: 0,
               toolResultDedupDropped: 0,
@@ -1406,11 +1849,34 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
   },
 
   prependMessages: (sessionId, olderFirst) => {
+    if (!sessionId.includes(CONVERSATION_KEY_SEPARATOR)) {
+      const teams = new Map<string, Message[]>();
+      for (const message of olderFirst) {
+        if (!message.teamId) continue;
+        const group = teams.get(message.teamId) ?? [];
+        group.push(message);
+        teams.set(message.teamId, group);
+      }
+      for (const [teamId, history] of teams) {
+        useChatStore.getState().ensureTeamRuntime(sessionId, teamId);
+        useChatStore.getState().prependMessages(conversationKey(sessionId, teamId), history);
+      }
+      olderFirst = olderFirst.flatMap((message) => {
+        if (!message.teamId) return [message];
+        const ownerMessage = toOwnerTeamMessage(message);
+        return ownerMessage ? [ownerMessage] : [];
+      });
+    }
     if (!olderFirst.length) return;
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
-      const assigned = assignMessageRenderKeys(runtime, olderFirst);
+      // History pages may overlap live Team events whose transport IDs differ.
+      const existing = new Set(runtime.messages);
+      const incoming = mergeUniqueMessages([...runtime.messages, ...olderFirst])
+        .filter((message) => !existing.has(message));
+      if (!incoming.length) return state;
+      const assigned = assignMessageRenderKeys(runtime, incoming);
       return {
         runtimes: {
           ...state.runtimes,
@@ -1451,12 +1917,16 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             orphanResults: new Map(),
             contextCompressionRuntime: undefined,
             contextCompressionSummary: undefined,
+            moaOperations: {},
+            moaStatusClosed: true,
             toolMetrics: {
               toolCallDedupDropped: 0,
               toolResultDedupDropped: 0,
             },
             taskQueue: [],
+            taskInputReceipts: {},
             pendingQuestions: [],
+            pendingA4PAuthorization: null,
             pendingGoalObjectiveBubble: null,
           },
         },
@@ -1479,6 +1949,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
                 id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
                 content,
                 timestamp: Date.now(),
+                status: 'queued',
                 ...(mediaItems && mediaItems.length > 0 ? { mediaItems } : {}),
               },
             ],
@@ -1488,6 +1959,175 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
+  claimQueuedTask: (sessionId, taskId) => {
+    let claimed: TaskItem | undefined;
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (
+        !runtime ||
+        runtime.isProcessing ||
+        runtime.isPaused ||
+        runtime.pendingQuestions.length ||
+        runtime.taskQueue.some((task) => task.status === 'sending')
+      )
+        return state;
+      const task = runtime.taskQueue.find((item) =>
+        taskId ? item.id === taskId && ['queued', 'failed'].includes(item.status) : item.status === 'queued',
+      );
+      if (!task) return state;
+      claimed = task;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            taskQueue: runtime.taskQueue.filter((item) => item.id !== task.id),
+          },
+        },
+      };
+    });
+    return claimed;
+  },
+
+  claimTaskInput: (sessionId, taskId) => {
+    let claimed: TaskItem | undefined;
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (
+        !runtime ||
+        runtime.isPaused ||
+        runtime.isLoadingHistory ||
+        runtime.switchingMode ||
+        runtime.pendingQuestions.length
+      )
+        return state;
+      const task = runtime.taskQueue.find((item) => item.id === taskId);
+      if (
+        !task || !['queued', 'failed'].includes(task.status) ||
+        (!task.content.trim() && !task.mediaItems?.length) || !areSteerImagesReady(task.mediaItems)
+      )
+        return state;
+      claimed = task;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            taskQueue: runtime.taskQueue.map((item) =>
+              item.id === taskId ? { ...item, status: 'sending', requestId: undefined, error: undefined } : item,
+            ),
+            taskInputReceipts: {
+              ...runtime.taskInputReceipts,
+              [taskId]: {
+                taskId,
+                content: task.content,
+                ...(task.mediaItems?.length ? { mediaItems: task.mediaItems } : {}),
+                status: 'sending',
+                timestamp: new Date().toISOString(),
+                supplementalInput: {
+                  executionId: runtime.activeExecutionId ?? '',
+                  streamMessageId: runtime.currentStreamId ?? undefined,
+                  streamOffset: runtime.currentStreamContent.length,
+                },
+              },
+            },
+          },
+        },
+      };
+    });
+    return claimed;
+  },
+
+  bindTaskInputRequest: (sessionId, taskId, requestId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      const receipt = runtime?.taskInputReceipts[taskId];
+      if (!runtime || !receipt || receipt.status !== 'sending') return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            taskInputRequests: {
+              ...runtime.taskInputRequests,
+              [requestId]: {
+                taskId,
+                content: runtime.taskQueue.find((task) => task.id === taskId)?.content ?? '',
+              },
+            },
+            taskQueue: runtime.taskQueue.map((task) =>
+              task.id === taskId && task.status === 'sending' ? { ...task, requestId } : task,
+            ),
+            taskInputReceipts: {
+              ...runtime.taskInputReceipts,
+              [taskId]: { ...receipt, requestId },
+            },
+          },
+        },
+      };
+    });
+  },
+
+  settleTaskInput: (sessionId, taskId, requestId, status, error, errorCode, delivery) => {
+    let chatMessage: Message | undefined;
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      const receipt = runtime?.taskInputReceipts[taskId];
+      // Late responses can settle unknown delivery, but cannot affect an accepted or retried item.
+      if (!runtime || !receipt || receipt.requestId !== requestId || !['sending', 'unknown'].includes(receipt.status))
+        return state;
+      if (status === 'accepted' && delivery === 'chat') {
+        chatMessage = {
+          id: `user-steer-${taskId}`, role: 'user', content: receipt.content, timestamp: receipt.timestamp,
+          ...(receipt.mediaItems?.length ? { mediaItems: receipt.mediaItems } : {}),
+        };
+      }
+      const acceptedMessages = status === 'accepted' && !chatMessage && delivery !== 'stream'
+        ? assignMessageRenderKeys(runtime, [{
+            id: `user-steer-${taskId}`,
+            role: 'user',
+            content: receipt.content,
+            ...(receipt.mediaItems?.length ? { mediaItems: receipt.mediaItems } : {}),
+            timestamp: receipt.timestamp,
+            supplementalInput: receipt.supplementalInput,
+          }])
+        : undefined;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            ...(chatMessage && requestId ? {
+              taskInputRequests: {
+                ...runtime.taskInputRequests,
+                [requestId]: { ...runtime.taskInputRequests[requestId], delivery: 'chat' as const },
+              },
+            } : {}),
+            ...(acceptedMessages ? {
+              messages: [...runtime.messages, ...acceptedMessages.messages],
+              messageRenderKeySeq: acceptedMessages.messageRenderKeySeq,
+              reasoningInputBoundaryPending: true,
+            } : {}),
+            taskQueue:
+              status === 'accepted'
+                ? runtime.taskQueue.filter((item) => item.id !== taskId)
+                : runtime.taskQueue.map((item) => (item.id === taskId ? { ...item, status, error } : item)),
+            taskInputReceipts: {
+              ...runtime.taskInputReceipts,
+              [taskId]: { ...receipt, status, error, errorCode },
+            },
+          },
+        },
+      };
+    });
+    if (chatMessage) {
+      // Ordinary chat uses the existing user-message boundary and lifecycle, only after Runtime admission.
+      get().addMessage(sessionId, chatMessage);
+      get().setProcessing(sessionId, true);
+      get().setThinking(sessionId, true);
+    }
+  },
+
   clearTaskQueue: (sessionId) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
@@ -1495,7 +2135,11 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
       return {
         runtimes: {
           ...state.runtimes,
-          [sessionId]: { ...runtime, taskQueue: [], queuePaused: false },
+          [sessionId]: {
+            ...runtime,
+            taskQueue: runtime.taskQueue.filter((task) => ['sending', 'unknown'].includes(task.status)),
+            queuePaused: false,
+          },
         },
       };
     });
@@ -1510,7 +2154,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
           ...state.runtimes,
           [sessionId]: {
             ...runtime,
-            taskQueue: runtime.taskQueue.filter((task) => task.id !== id),
+            taskQueue: runtime.taskQueue.filter((task) => task.id !== id || task.status === 'sending'),
           },
         },
       };
@@ -1537,6 +2181,7 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
   },
 
   enqueuePendingQuestion: (sessionId, question) => {
+    if (isAnsweredAskUserQuestion(sessionId, question)) return;
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
@@ -1570,6 +2215,25 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
+  markQuestionsAnswered: (sessionId, requestIds) => {
+    markQueuedQuestionsAnswered(sessionId, requestIds);
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime) return state;
+      const pendingQuestions = dropAnsweredAskUserQuestions(sessionId, runtime.pendingQuestions);
+      if (pendingQuestions.length === runtime.pendingQuestions.length) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            pendingQuestions,
+          },
+        },
+      };
+    });
+  },
+
   clearPendingQuestions: (sessionId) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
@@ -1578,6 +2242,30 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
         runtimes: {
           ...state.runtimes,
           [sessionId]: { ...runtime, pendingQuestions: [] },
+        },
+      };
+    });
+  },
+
+  setPendingA4PAuthorization: (sessionId, request, terminatedRequestId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime) return state;
+      // Retain superseded IDs so delayed pushes cannot resurrect an old mandate.
+      const retired = new Set(runtime.retiredA4PRequestIds ?? []);
+      if (request && retired.has(request.requestId)) return state;
+      const previous = runtime.pendingA4PAuthorization;
+      if (terminatedRequestId) retired.add(terminatedRequestId);
+      const next = terminatedRequestId && previous?.requestId !== terminatedRequestId ? previous : request;
+      if (previous && previous.requestId !== next?.requestId) retired.add(previous.requestId);
+      if (request?.replacesRequestId) retired.add(request.replacesRequestId);
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime, pendingA4PAuthorization: next,
+            retiredA4PRequestIds: [...retired],
+          },
         },
       };
     });
@@ -1698,14 +2386,18 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
     });
   },
 
-  setInputValue: (sessionId, value) => {
+  setInputValue: (sessionId, value, skillPositions) => {
     set((state) => {
       const runtime = state.runtimes[sessionId];
       if (!runtime) return state;
       return {
         runtimes: {
           ...state.runtimes,
-          [sessionId]: { ...runtime, inputValue: value },
+          [sessionId]: {
+            ...runtime,
+            inputValue: value,
+            inputSkillPositions: skillPositions ?? (value === runtime.inputValue ? runtime.inputSkillPositions : []),
+          },
         },
       };
     });
@@ -1778,6 +2470,48 @@ export const useChatStore = create<ChatState>()(subscribeWithSelector((set, get)
             ),
           },
         },
+      };
+    });
+  },
+
+  updateMoaStatus: (sessionId, payload) => {
+    const operationId = typeof payload.operation_id === 'string' ? payload.operation_id.trim() : '';
+    const phase = payload.phase;
+    const status = payload.status;
+    const executionId = typeof payload.execution_id === 'string' ? payload.execution_id : undefined;
+    if (!operationId || (phase !== 'reference' && phase !== 'verification')) return;
+    if (!['started', 'completed', 'failed', 'cancelled'].includes(status)) return;
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime?.isProcessing || runtime.isPaused || runtime.moaStatusClosed) return state;
+      if (runtime.activeExecutionId && executionId !== runtime.activeExecutionId) return state;
+      const current = Object.prototype.hasOwnProperty.call(runtime.moaOperations, operationId)
+        ? runtime.moaOperations[operationId]
+        : undefined;
+      // Keep terminal operations until the turn ends so duplicate starts cannot revive a finished hint.
+      if (current && (current.status !== 'started' || current.status === status)) return state;
+      if (current?.executionId && executionId && current.executionId !== executionId) return state;
+      return {
+        runtimes: {
+          ...state.runtimes,
+          [sessionId]: {
+            ...runtime,
+            moaOperations: {
+              ...runtime.moaOperations,
+              [operationId]: { phase, status, executionId },
+            },
+          },
+        },
+      };
+    });
+  },
+
+  clearMoaStatus: (sessionId) => {
+    set((state) => {
+      const runtime = state.runtimes[sessionId];
+      if (!runtime || (runtime.moaStatusClosed && Object.keys(runtime.moaOperations).length === 0)) return state;
+      return {
+        runtimes: { ...state.runtimes, [sessionId]: { ...runtime, moaOperations: {}, moaStatusClosed: true } },
       };
     });
   },

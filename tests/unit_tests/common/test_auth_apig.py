@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from jiuwenswarm.common.auth import apig
+from agent_gateway.auth import apig
 
 
 class FakeResponse:
@@ -25,7 +25,7 @@ def apig_env(monkeypatch):
 
 def _remote(monkeypatch, *, effective=True, apig_base="https://apig.example.com",
             whitelist=None, blocklist=None, login=None, **apig_paths):
-    from jiuwenswarm.common.auth import remote_config
+    from agent_gateway.auth import remote_config
 
     remote_config.set_config_for_test(remote_config.parse_config({
         "is_effective": effective,
@@ -264,6 +264,7 @@ _SDK = "[181001] model call failed, reason: openAI API async stream error: "
          "'APIG.0202', 'request_id': 'b3844ae0aacba00b6e5187c8ee14982f'}", apig.SERVICE_UNAVAILABLE_CODE),
         ("Error code: 504 - {'error_code': 'APIG.0203', 'error_msg': 'Backend timeout'}", apig.SERVICE_UNAVAILABLE_CODE),
         ("Error code: 404 - {'error_code': 'APIG.0101'}", apig.SERVICE_UNAVAILABLE_CODE),
+        ("Error code: 404 - {'detail': 'Not Found'}", apig.SERVICE_UNAVAILABLE_CODE),
         ("Error code: 401 - {'error_code': 'APIG.0301'}", apig.SERVICE_UNAVAILABLE_CODE),
         ("Error code: 405 - {'error_code': 'APIG.0501', 'error_msg': 'App quota exhausted'}", apig.SERVICE_UNAVAILABLE_CODE),
         ("Error code: 429 - {'error_code': 'APIG.0308'}", apig.RATE_LIMITED_CODE),

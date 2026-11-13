@@ -11,6 +11,7 @@ from pathlib import Path
 from jiuwenswarm.observability.config import (
     DEFAULT_QUEUE_SIZE,
     TrajectoryStoreSettings,
+    is_trajectory_diagnosis_enabled,
     load_trajectory_store_settings,
     session_database_path,
 )
@@ -54,6 +55,62 @@ def test_config_resolves_relative_path_and_rejects_non_positive_limits(
     test_logger.info("trajectory config normalized paths and unsafe limits")
 
 
+def test_discarding_ended_spans_frames_defaults_on_and_reads_loose_booleans(
+    tmp_path: Path,
+) -> None:
+    """Nothing reads the frames of an ended span, so they go by default.
+
+    A config predating the switch still discards them; keeping them is what a
+    frame-by-frame replay of a finished answer would ask for, explicitly.
+    """
+    default = load_trajectory_store_settings({}, workspace=tmp_path)
+    assert default.discard_final_span_frames is True
+
+    kept = load_trajectory_store_settings(
+        {"trajectory_ui": {"discard_final_span_frames": "off"}},
+        workspace=tmp_path,
+    )
+    assert kept.discard_final_span_frames is False
+    test_logger.info("frame discard defaults on and accepts the usual boolean spellings")
+
+
+def test_diagnosis_switch_turns_the_data_plane_on_without_the_trajectory_view(
+    tmp_path: Path,
+) -> None:
+    diagnosis_only = load_trajectory_store_settings(
+        {"trajectory_ui": {"enabled": False, "diagnosis_enabled": True}},
+        workspace=tmp_path,
+    )
+    view_only = load_trajectory_store_settings(
+        {"trajectory_ui": {"enabled": True, "diagnosis_enabled": False}},
+        workspace=tmp_path,
+    )
+    both = load_trajectory_store_settings(
+        {"trajectory_ui": {"enabled": True, "diagnosis_enabled": True}},
+        workspace=tmp_path,
+    )
+    neither = load_trajectory_store_settings(
+        {"trajectory_ui": {"enabled": False, "diagnosis_enabled": False}},
+        workspace=tmp_path,
+    )
+
+    assert diagnosis_only.enabled is True
+    assert view_only.enabled is True
+    assert neither.enabled is False
+    # Toggling diagnosis while the view is on must not change the settings the
+    # AgentServer compares to decide whether the writer restarts.
+    assert both == view_only
+    test_logger.info("diagnosis switch enables recording independently of the view")
+
+
+def test_diagnosis_enabled_ignores_the_trajectory_view_switch() -> None:
+    assert is_trajectory_diagnosis_enabled({"trajectory_ui": {"enabled": False, "diagnosis_enabled": True}}) is True
+    assert is_trajectory_diagnosis_enabled({"trajectory_ui": {"enabled": True, "diagnosis_enabled": False}}) is False
+    assert is_trajectory_diagnosis_enabled({"trajectory_ui": {"enabled": True}}) is False
+    assert is_trajectory_diagnosis_enabled({}) is False
+    test_logger.info("diagnosis availability follows only its own switch")
+
+
 def test_session_database_path_is_deterministic_and_traversal_safe(
     tmp_path: Path,
 ) -> None:
@@ -68,3 +125,19 @@ def test_session_database_path_is_deterministic_and_traversal_safe(
     assert re.fullmatch(r"[0-9a-f]{64}\.sqlite3", first.name)
     assert "outside" not in str(first.relative_to(database_root))
     test_logger.info("session database paths contain only SHA-256 components")
+
+
+def test_zero_retention_keeps_trajectory_forever(tmp_path: Path) -> None:
+    """Zero is accepted for retention while negative values use the default."""
+    for value in (0, "0"):
+        settings = load_trajectory_store_settings(
+            {"trajectory_ui": {"retention_days": value}},
+            workspace=tmp_path,
+        )
+        assert settings.retention_days == 0
+    invalid = load_trajectory_store_settings(
+        {"trajectory_ui": {"retention_days": -1}},
+        workspace=tmp_path,
+    )
+    assert invalid.retention_days == 7
+    test_logger.info("zero retention disables automatic expiry")

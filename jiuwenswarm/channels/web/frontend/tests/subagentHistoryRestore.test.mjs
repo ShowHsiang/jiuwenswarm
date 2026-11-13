@@ -1,10 +1,15 @@
+import './fixtures/browserEnvironment.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  beginHistoryRestore,
+  fetchHistoryCursorBatch,
+  webClient,
   mergeHistoryToolReplayItems,
   parseHistoryJsonFileToTimelinePreview,
   parseSubagentHistoryReplay,
+  readDiscoveredSubagentIds,
   recoverSubagentToolHistory,
   shouldProcessHistoryPayload,
   parseHistoryJsonFileToPreviewMessages,
@@ -13,6 +18,105 @@ import {
 const sessionId = 'web_session';
 const subagentId = 'web_session_sub_general-purpose_1';
 
+test('history completion restores current totals even when the page has no usage records', () => {
+  const usage = {
+    schema_version: 1,
+    revision: 12,
+    session_id: sessionId,
+    main: { input_tokens: 300, output_tokens: 40, input_calls: 2, output_calls: 2, calls_total: 2 },
+    others: { input_tokens: 150, output_tokens: 20, input_calls: 1, output_calls: 1, calls_total: 1 },
+  };
+  const done = {
+    type: 'event',
+    event: 'history.message',
+    payload: {
+      session_id: sessionId,
+      status: 'done',
+      cursor: null,
+      next_cursor: null,
+      has_more: false,
+      snapshot_id: 'history-snapshot',
+      snapshot_end: 0,
+      session_usage: usage,
+    },
+  };
+  let restored = null;
+  const handle = beginHistoryRestore({
+    sessionId,
+    onReady: () => {},
+    onSessionTokenUsage: (snapshot) => { restored = snapshot; },
+  });
+  try {
+    webClient.dispatchEventNow(done);
+    assert.deepEqual(restored, usage);
+  } finally {
+    handle.dispose();
+  }
+
+  let batch = null;
+  const batchHandle = fetchHistoryCursorBatch({
+    sessionId,
+    cursor: null,
+    onReady: (result) => { batch = result; },
+  });
+  try {
+    webClient.dispatchEventNow(done);
+    assert.deepEqual(batch.tokenUsageSnapshot, usage);
+  } finally {
+    batchHandle.dispose();
+  }
+});
+
+test('history restore ignores zero-revision token usage snapshots', () => {
+  const emptyUsage = {
+    schema_version: 1,
+    revision: 0,
+    session_id: sessionId,
+    main: { input_tokens: null, output_tokens: null, input_calls: 0, output_calls: 0, calls_total: 0 },
+    others: { input_tokens: null, output_tokens: null, input_calls: 0, output_calls: 0, calls_total: 0 },
+  };
+  const done = {
+    type: 'event',
+    event: 'history.message',
+    payload: {
+      session_id: sessionId,
+      status: 'done',
+      cursor: null,
+      next_cursor: null,
+      has_more: false,
+      snapshot_id: 'empty-history',
+      snapshot_end: 0,
+      session_usage: emptyUsage,
+    },
+  };
+
+  let restored = null;
+  const handle = beginHistoryRestore({
+    sessionId,
+    onReady: () => {},
+    onSessionTokenUsage: (snapshot) => { restored = snapshot; },
+  });
+  try {
+    webClient.dispatchEventNow(done);
+    assert.equal(restored, null);
+  } finally {
+    handle.dispose();
+  }
+
+  let batch = null;
+  const batchHandle = fetchHistoryCursorBatch({
+    sessionId,
+    cursor: null,
+    onReady: (result) => { batch = result; },
+  });
+  try {
+    webClient.dispatchEventNow(done);
+    assert.equal(batch.tokenUsageSnapshot, null);
+  } finally {
+    batchHandle.dispose();
+  }
+});
+
 test('existing full-duplex spoken replies stay expanded after history restore without changing normal chat', () => {
   const messages = parseHistoryJsonFileToPreviewMessages([
     { id: 'ack', channel_id: 'video_duplex', role: 'assistant', event_type: 'chat.final', content: '好的，没问题，我现在就帮你生成这道题的代码。', timestamp: 1 },
@@ -20,6 +124,360 @@ test('existing full-duplex spoken replies stay expanded after history restore wi
     { id: 'normal', channel_id: 'web', role: 'assistant', event_type: 'chat.final', content: '普通对话。', timestamp: 3 },
   ], sessionId);
   assert.deepEqual(messages.map((message) => message.keepExpanded), [true, true, undefined]);
+});
+
+test('a full-duplex task restores only its clean result, not the raw Core answer with brief markers', () => {
+  const brief = '[[JIUWEN_BRIEF_BEGIN]]\n已拒绝授权。\n[[JIUWEN_BRIEF_END]]';
+  const messages = parseHistoryJsonFileToPreviewMessages([
+    { id: 'core', channel_id: 'video_tool', role: 'assistant', event_type: 'chat.final',
+      request_id: 'task-a', content: `未能完成任务：授权被拒绝。\n\n${brief}`, timestamp: 1 },
+    { id: 'receipt', channel_id: 'video_duplex', role: 'assistant', event_type: 'chat.final',
+      presentation: 'tool_result', content: '未能完成任务：授权被拒绝。', timestamp: 2 },
+  ], sessionId);
+  assert.deepEqual(messages.map((message) => message.id), ['receipt']);
+  assert.ok(messages.every((message) => !message.content.includes('JIUWEN_BRIEF')));
+});
+
+test('history restores an unmatched chat.ask_user_question as a read-only qa.summary card (no live re-prompt)', () => {
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-1',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-ask-1',
+      source: 'ask_user_interrupt',
+      questions: [
+        {
+          question: '用哪种方案?',
+          header: 'Question',
+          options: [
+            { label: '方案A', value: 'a', description: 'desc-a' },
+            { label: '方案B', value: 'b' },
+            { label: 'Other' },
+          ],
+          multi_select: false,
+        },
+      ],
+      timestamp: 1,
+    },
+  ], sessionId);
+
+  // 未答问题渲染成只读 qa.summary 卡片（QaSummaryCard 在 answers 为空时显示「—」），
+  // 不进 pendingQuestions 弹框——web 重连后后端不重发挂起中断，弹框 + resume
+  // 会报 "session has no active execution"，所以历史里的未答问题只读展示。
+  assert.equal(preview.pendingQuestions.length, 0);
+  assert.equal(preview.messages.length, 1);
+  assert.equal(preview.messages[0].role, 'assistant');
+  assert.equal(preview.messages[0].content.startsWith('qa.summary:'), true);
+  const parsed = JSON.parse(preview.messages[0].content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items, [
+    { header: 'Question', question: '用哪种方案?', answers: [] },
+  ]);
+});
+
+for (const nested of [false, true]) {
+  for (const smart of [false, true]) {
+    for (const allowed of [false, true]) {
+      test(`permission history skips QA without changing tool or reasoning records (${nested}, ${smart}, ${allowed})`, () => {
+        const question = {
+          source: 'permission_interrupt',
+          questions: [{
+            header: 'Permission', question: 'Allow this tool?', options: [],
+            ...(smart ? { card_id: 'opaque-card' } : {}),
+          }],
+        };
+        const records = [
+          { id: 'user', role: 'user', content: 'Read the file', timestamp: 1792553400001 },
+          {
+            id: 'permission', role: 'assistant', event_type: 'chat.ask_user_question',
+            request_id: 'permission-request', timestamp: 1792553400002,
+            ...(nested ? { event_payload: question } : question),
+          },
+          {
+            id: 'call', role: 'assistant', event_type: 'chat.tool_call', timestamp: 1792553400003,
+            tool_call: { tool_call_id: 'call', name: 'read_file', arguments: '{"file_path":"/sample.txt"}' },
+          },
+          {
+            id: 'result', role: 'assistant', event_type: 'chat.tool_result', timestamp: 1792553400004,
+            tool_call_id: 'call', tool_name: 'read_file', success: allowed,
+            result: allowed ? 'file contents' : 'Permission denied',
+          },
+          {
+            id: 'final', role: 'assistant', event_type: 'chat.final', timestamp: 1792553400005,
+            content: allowed ? 'Read completed' : 'Read rejected', reasoning_content: 'Check the permission',
+          },
+        ];
+        const original = structuredClone(records);
+        const expected = parseHistoryJsonFileToTimelinePreview(records.filter((record) => record.id !== 'permission'), sessionId);
+        const preview = parseHistoryJsonFileToTimelinePreview(records, sessionId);
+        assert.equal(expected.executions.length, 1);
+        assert.equal(expected.reasoningSegments.length, 1);
+        assert.deepEqual(preview, expected);
+        assert.deepEqual(records, original);
+        assert.deepEqual(parseHistoryJsonFileToPreviewMessages(records, sessionId), expected.messages);
+      });
+    }
+  }
+}
+
+for (const source of [undefined, 'unknown_interrupt', ' permission_interrupt', 'ask_user_interrupt']) {
+  test(`permission history preserves genuine and compatible questions in a mixed turn (${source})`, () => {
+    const records = [
+      {
+        id: 'permission', role: 'assistant', event_type: 'chat.ask_user_question', timestamp: 1792553400001,
+        request_id: 'permission-request', source: 'permission_interrupt',
+        questions: [{ header: 'Permission', question: 'Allow?', options: [] }],
+      },
+      {
+        id: 'answered', role: 'assistant', event_type: 'chat.ask_user_question', timestamp: 1792553400002,
+        request_id: 'answered-request', source: 'ask_user_interrupt',
+        questions: [{ header: 'Topic', question: 'Which topic?', options: [{ label: 'Streaming' }] }],
+      },
+      {
+        id: 'answer', role: 'assistant', event_type: 'chat.ask_user_answer', timestamp: 1792553400003,
+        request_id: 'answered-request', source: 'ask_user_interrupt',
+        answers: [{ question: 'Which topic?', selected_options: ['Streaming'] }],
+      },
+      {
+        id: 'unanswered', role: 'assistant', event_type: 'chat.ask_user_question', timestamp: 1792553400004,
+        request_id: 'unanswered-request', ...(source === undefined ? {} : { source }),
+        questions: [{ header: 'Details', question: 'Any details?', options: [] }],
+      },
+    ];
+    const preview = parseHistoryJsonFileToTimelinePreview(records, sessionId);
+    assert.equal(preview.pendingQuestions.length, 0);
+    assert.equal(preview.answeredQuestions.length, 1);
+    assert.deepEqual(preview.messages.map((message) => JSON.parse(message.content.slice('qa.summary:'.length)).items), [
+      [{ header: 'Topic', question: 'Which topic?', answers: ['Streaming'], answerSources: ['option'] }],
+      [{ header: 'Details', question: 'Any details?', answers: [] }],
+    ]);
+  });
+}
+
+test('history skips chat.ask_user_question with empty or missing questions', () => {
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-empty',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-ask-empty',
+      questions: [],
+      timestamp: 1,
+    },
+    {
+      id: 'ask-missing',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-ask-missing',
+      timestamp: 2,
+    },
+  ], sessionId);
+
+  assert.equal(preview.messages.length, 0);
+  assert.equal(preview.pendingQuestions.length, 0);
+});
+
+test('history pairs chat.ask_user_answer with chat.ask_user_question by request_id, rendering a qa.summary card with answers', () => {
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-1',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-pair-1',
+      source: 'ask_user_interrupt',
+      questions: [
+        { question: '用哪种方案?', header: 'Question', options: [{ label: '方案A', value: 'a' }, { label: '方案B', value: 'b' }], multi_select: false },
+        { question: '备注?', header: 'Question', options: [], multi_select: false },
+      ],
+      timestamp: 1,
+    },
+    {
+      id: 'ans-1',
+      role: 'assistant',
+      event_type: 'chat.ask_user_answer',
+      content: '',
+      request_id: 'req-pair-1',
+      source: 'ask_user_interrupt',
+      answers: [
+        { question: '用哪种方案?', selected_options: ['方案A'] },
+        { question: '备注?', selected_options: [], custom_input: '加急' },
+      ],
+      timestamp: 2,
+    },
+  ], sessionId);
+
+  // 已答：不弹框，进 messages 渲染成 qa.summary 回显卡
+  assert.equal(preview.pendingQuestions.length, 0);
+  assert.equal(preview.messages.length, 1);
+  assert.equal(preview.messages[0].role, 'assistant');
+  assert.equal(preview.messages[0].content.startsWith('qa.summary:'), true);
+  const parsed = JSON.parse(preview.messages[0].content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items, [
+    { header: 'Question', question: '用哪种方案?', answers: ['方案A'], answerSources: ['option'] },
+    { header: 'Question', question: '备注?', answers: ['加急'], answerSources: ['input'] },
+  ]);
+  assert.equal(preview.answeredQuestions.length, 1);
+  assert.equal(preview.answeredQuestions[0].payload.request_id, 'req-pair-1');
+});
+
+test('history leaves an unmatched chat.ask_user_question as a read-only qa.summary card (no answer record, no live prompt)', () => {
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-unmatched',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-unmatched',
+      source: 'ask_user_interrupt',
+      questions: [{ question: 'Q?', header: 'Question', options: [{ label: 'A', value: 'a' }], multi_select: false }],
+      timestamp: 1,
+    },
+  ], sessionId);
+
+  // 未答：渲染成只读 qa.summary 卡片（answers 为空，QaSummaryCard 显示「—」），
+  // 不进 pendingQuestions 弹框——web 重连后后端不重发挂起中断，弹框 + resume
+  // 会报 "session has no active execution"，所以历史里的未答问题只读展示。
+  assert.equal(preview.messages.length, 1);
+  assert.equal(preview.messages[0].role, 'assistant');
+  assert.equal(preview.messages[0].content.startsWith('qa.summary:'), true);
+  const parsed = JSON.parse(preview.messages[0].content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items, [
+    { header: 'Question', question: 'Q?', answers: [] },
+  ]);
+  assert.equal(preview.pendingQuestions.length, 0);
+  assert.equal(preview.answeredQuestions.length, 0);
+});
+
+test('history sinks an unanswered qa.summary card to the turn end (after chat.final), not before it', () => {
+  // 实时侧未答问题框是 LLM 那轮产出全部完成后才弹出（吸附输入框底部）。但历史里
+  // chat.ask_user_question 的落盘时刻略早于同轮收尾的 chat.final（LLM 流式产出时
+  // question chunk 先到、final 后到），直接按时间戳排序会把未答 qa.summary 卡排到
+  // chat.final 前面，与实时反过来。历史恢复必须把未答卡沉到本轮末尾（chat.final
+  // 之后），与实时位置一致。
+  // 用真实 epoch 毫秒（sink 函数靠 timestampMsToIso 重新盖章，小 timestamp 会被
+  // looksLikePlausibleEpochMs 判为不合理而跳过，无法验证 sink 行为）。
+  const base = 1789975000000; // 2026 年附近
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-unmatched-2',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-unmatched-2',
+      source: 'ask_user_interrupt',
+      questions: [{ question: 'Q?', header: 'Question', options: [{ label: 'A', value: 'a' }], multi_select: false }],
+      timestamp: base,
+    },
+    {
+      id: 'final-2',
+      role: 'assistant',
+      event_type: 'chat.final',
+      content: '好的，我来确认一下。',
+      request_id: 'req-turn-2',
+      timestamp: base + 1000,
+    },
+  ], sessionId);
+
+  // 期望顺序：[chat.final, qa.summary 卡]——qa.summary 卡沉到本轮末尾。
+  // 旧逻辑（卡用 question 时间 base）会得到 [qa.summary 卡, chat.final]，与实时反。
+  assert.equal(preview.messages.length, 2);
+  assert.equal(preview.messages[0].content, '好的，我来确认一下。');
+  assert.equal(preview.messages[1].content.startsWith('qa.summary:'), true);
+  const parsed = JSON.parse(preview.messages[1].content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items, [
+    { header: 'Question', question: 'Q?', answers: [] },
+  ]);
+  assert.equal(preview.pendingQuestions.length, 0);
+  assert.equal(preview.answeredQuestions.length, 0);
+});
+
+test('history places an answered qa.summary card at the answer-time position, not the question-time position', () => {
+  // 实时回显的 qa.summary 卡在用户点确认那一刻追加到列表末尾（答案提交时间），
+  // 而非问题出现时刻。历史恢复必须一致：已答卡用 chat.ask_user_answer 的落盘时间
+  // 定位，而非 chat.ask_user_question 的。否则卡会出现在问题后面、后续消息前面，
+  // 与实时回显位置不一致。
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'ask-1',
+      role: 'assistant',
+      event_type: 'chat.ask_user_question',
+      content: '',
+      request_id: 'req-pos-1',
+      source: 'ask_user_interrupt',
+      questions: [{ question: '用哪种方案?', header: 'Question', options: [{ label: '方案A', value: 'a' }], multi_select: false }],
+      timestamp: 1,
+    },
+    {
+      id: 'mid-msg',
+      role: 'assistant',
+      event_type: 'chat.final',
+      content: '中间这条消息不该被 qa.summary 卡越过',
+      timestamp: 2,
+    },
+    {
+      id: 'ans-1',
+      role: 'assistant',
+      event_type: 'chat.ask_user_answer',
+      content: '',
+      request_id: 'req-pos-1',
+      source: 'ask_user_interrupt',
+      answers: [{ question: '用哪种方案?', selected_options: ['方案A'] }],
+      timestamp: 3,
+    },
+  ], sessionId);
+
+  // 期望顺序：[中间消息(t2), qa.summary 卡(t3)]——qa.summary 卡在答案时间位置。
+  // 旧逻辑（卡用问题时间 t1）会得到 [qa.summary 卡, 中间消息]，与实时回显不一致。
+  assert.equal(preview.messages.length, 2);
+  assert.equal(preview.messages[0].content, '中间这条消息不该被 qa.summary 卡越过');
+  assert.equal(preview.messages[1].content.startsWith('qa.summary:'), true);
+  const parsed = JSON.parse(preview.messages[1].content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items, [
+    { header: 'Question', question: '用哪种方案?', answers: ['方案A'], answerSources: ['option'] },
+  ]);
+});
+
+test('history restores accepted supplemental user input metadata', () => {
+  const messages = parseHistoryJsonFileToPreviewMessages([
+    {
+      id: 'original:user',
+      role: 'user',
+      content: 'write 500 words',
+      timestamp: 1,
+    },
+    {
+      id: 'supplement:user',
+      role: 'user',
+      content: 'change to 200 words',
+      timestamp: 2,
+      is_supplemental_input: true,
+      supplemental_input: {
+        execution_id: 'execution-A',
+        stream_offset: 0,
+      },
+    },
+    {
+      id: 'answer:assistant',
+      role: 'assistant',
+      event_type: 'chat.final',
+      content: 'complete answer',
+      timestamp: 3,
+    },
+  ], sessionId);
+
+  assert.deepEqual(messages.map((message) => message.content), [
+    'write 500 words',
+    'change to 200 words',
+    'complete answer',
+  ]);
+  assert.deepEqual(messages[1].supplementalInput, {
+    executionId: 'execution-A',
+    streamOffset: 0,
+  });
 });
 
 test('history distinguishes a Core Agent result from Qwen acknowledgement and receipt', () => {
@@ -127,7 +585,26 @@ test('subagent history replays persisted activity without treating it as final t
   });
 });
 
-test('session history restores persisted usage summary onto the preceding assistant message', () => {
+test('session history restores persisted usage summary and session token totals', () => {
+  const sessionUsage = {
+    schema_version: 1,
+    revision: 3,
+    session_id: sessionId,
+    main: {
+      input_tokens: 210,
+      output_tokens: 40,
+      input_calls: 2,
+      output_calls: 2,
+      calls_total: 2,
+    },
+    others: {
+      input_tokens: 70,
+      output_tokens: 15,
+      input_calls: 1,
+      output_calls: 1,
+      calls_total: 1,
+    },
+  };
   const preview = parseHistoryJsonFileToTimelinePreview([
     {
       id: 'r1:user',
@@ -156,6 +633,7 @@ test('session history restores persisted usage summary onto the preceding assist
         output_cost: 0.02,
         total_cost: 0.03,
       },
+      session_usage: sessionUsage,
     },
   ], sessionId);
 
@@ -168,6 +646,29 @@ test('session history restores persisted usage summary onto the preceding assist
     output_cost: 0.02,
     total_cost: 0.03,
   });
+  assert.deepEqual(preview.tokenUsageSnapshot, sessionUsage);
+});
+
+test('session history ignores a cumulative snapshot belonging to another session', () => {
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {
+      id: 'foreign-usage-summary',
+      role: 'assistant',
+      event_type: 'chat.usage_summary',
+      timestamp: 1787019581,
+      content: '',
+      usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+      session_usage: {
+        schema_version: 1,
+        revision: 1,
+        session_id: 'another-session',
+        main: { input_tokens: 10, output_tokens: 2, input_calls: 1, output_calls: 1, calls_total: 1 },
+        others: { input_tokens: 0, output_tokens: 0, input_calls: 0, output_calls: 0, calls_total: 0 },
+      },
+    },
+  ], sessionId);
+
+  assert.equal(preview.tokenUsageSnapshot, null);
 });
 
 test('session history restores the complete context usage payload without adding a chat message', () => {
@@ -714,4 +1215,114 @@ test('history recovery ignores unknown states and failed close calls', () => {
   ], sessionId);
   assert.equal(missingSuccessClose[0].subagent.status, 'idle');
   assert.equal(missingSuccessClose[0].subagent.closed_reason, null);
+});
+
+
+for (const [format, supplementalFields] of [
+  ['legacy', { supplemental_input: { request_id: 'input-1', output_phase_id: 'p1', stream_offset: 0 } }],
+  ['compact', { request_id: 'input-1', is_supplemental_input: true }],
+]) {
+  test(`${format} phase history preserves visible bubbles and reasoning while excluding old tails`, () => {
+    const order = (sequence) => ({ request_id: 'original', sequence });
+    const records = [
+      { id: 'u1', role: 'user', content: 'original question', timestamp: 1800000000000 },
+      { id: 'a1', role: 'assistant', event_type: 'chat.final', content: 'visible prefix', timestamp: 1800000001000,
+        output_phase_id: 'p1', output_order: order(2), reasoning_content: 'same thought', reasoning_output_order: order(1) },
+      { id: 'u2', role: 'user', content: 'new instruction', timestamp: 1800000001000,
+        output_order: order(3), ...supplementalFields },
+      { id: 'old', role: 'assistant', event_type: 'chat.final', content: 'HIDDEN TAIL', timestamp: 1800000001001,
+        output_order: order(4), output_suppressed: true, reasoning_content: 'HIDDEN THOUGHT' },
+      { id: 'a2', role: 'assistant', event_type: 'chat.final', content: 'new result', timestamp: 1800000002000,
+        output_phase_id: 'p2', output_order: order(7), reasoning_content: 'same thought', reasoning_output_order: order(6) },
+    ];
+    const restored = parseHistoryJsonFileToTimelinePreview(records, sessionId);
+    assert.deepEqual(restored.messages.map((m) => m.content), [
+      'original question', 'visible prefix', 'new instruction', 'new result',
+    ]);
+    assert.equal(restored.messages[2].supplementalInput.requestId, 'input-1');
+    assert.deepEqual(restored.messages.slice(1).map((m) => m.outputOrder.sequence), [2, 3, 7]);
+    assert.deepEqual(restored.reasoningSegments.map((s) => [s.text, s.outputOrder.sequence]), [
+      ['same thought', 1], ['same thought', 6],
+    ]);
+  });
+}
+
+test('history restores chat.error as a system message with the error text', () => {
+  // Legacy records without a stable code retain their original diagnostic text.
+  const messages = parseHistoryJsonFileToPreviewMessages([
+    {
+      id: 'err-1:assistant',
+      role: 'assistant',
+      event_type: 'chat.error',
+      content: '模型调用失败：超时',
+      error_type: 'TimeoutError',
+      timestamp: 1,
+    },
+  ], sessionId);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, 'system');
+  assert.equal(messages[0].content, '模型调用失败：超时');
+});
+
+for (const nested of [false, true]) {
+  test(`history localizes persisted delivery failure from ${nested ? 'event payload' : 'top-level code'}`, () => {
+    const details = {
+      code: 'SESSION_INPUT_DELIVERY_FAILED', error_type: 'SessionInputDeliveryError',
+    };
+    const messages = parseHistoryJsonFileToPreviewMessages([{
+      id: 'req_mvqat7h5_81:assistant', role: 'assistant', event_type: 'chat.error',
+      content: 'Supplemental delivery reconciliation failed.', timestamp: 1793082219.4158866,
+      ...(nested ? { event_payload: details } : details),
+    }], sessionId);
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].role, 'system');
+    assert.equal(messages[0].content, '补充后的结果整理失败，未能完整回答原问题和补充内容。请重试。');
+    assert.equal(messages[0].timestamp, '2026-10-27T06:23:39.415Z');
+  });
+}
+
+test('history preserves diagnostics for an unknown stable error code', () => {
+  const messages = parseHistoryJsonFileToPreviewMessages([{
+    id: 'unknown-error', role: 'assistant', event_type: 'chat.error',
+    content: 'Unrecognized diagnostic text', code: 'FUTURE_ERROR_CODE', timestamp: 1,
+  }], sessionId);
+  assert.equal(messages[0].content, 'Unrecognized diagnostic text');
+});
+
+test('history skips chat.error with empty content', () => {
+  const messages = parseHistoryJsonFileToPreviewMessages([
+    {
+      id: 'err-empty:assistant',
+      role: 'assistant',
+      event_type: 'chat.error',
+      content: '',
+      error_type: 'RuntimeError',
+      timestamp: 1,
+    },
+  ], sessionId);
+  assert.equal(messages.length, 0);
+});
+
+test('history.done subagent_ids discovery parses unique non-empty ids (#4887)', () => {
+  assert.deepEqual(
+    readDiscoveredSubagentIds({
+      status: 'done',
+      subagent_ids: [' sub-a ', 'sub-b', 'sub-a', '', 12, null],
+    }),
+    ['sub-a', 'sub-b'],
+  );
+  assert.deepEqual(readDiscoveredSubagentIds({ status: 'done' }), []);
+  assert.deepEqual(readDiscoveredSubagentIds({ subagentIds: ['legacy-id'] }), ['legacy-id']);
+});
+
+test('4470 history preserves token-related choices while masking custom input', () => {
+  const question = '用哪种方式更新令牌？';
+  const preview = parseHistoryJsonFileToTimelinePreview([
+    {id:'q4470',role:'assistant',event_type:'chat.ask_user_question',content:'',request_id:'4470',source:'ask_user_interrupt',questions:[{question,options:[{label:'让你代登录'}]}],timestamp:1},
+    {id:'a4470',role:'assistant',event_type:'chat.ask_user_answer',content:'',request_id:'4470',source:'ask_user_interrupt',answers:[{question,selected_options:['让你代登录'],custom_input:'FAKE-4470'}],timestamp:2},
+  ], sessionId);
+  const summary = preview.messages.find(m=>m.content.startsWith('qa.summary:'));
+  const parsed = JSON.parse(summary.content.slice('qa.summary:'.length));
+  assert.deepEqual(parsed.items[0].answers,['让你代登录','••••••']);
+  assert.ok(!summary.content.includes('FAKE-4470'));
 });

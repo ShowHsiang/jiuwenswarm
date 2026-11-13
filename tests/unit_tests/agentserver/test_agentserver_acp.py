@@ -7,32 +7,38 @@ import types
 import pytest
 from openjiuwen.agent_teams.runtime import RunActionKind
 
-from jiuwenswarm.server import agent_ws_server as agent_ws_server_module
-from jiuwenswarm.server.runtime.agent_manager import ACP_DEFAULT_CAPABILITIES
-from jiuwenswarm.agents.harness.common.tools import acp_output_tools
-from jiuwenswarm.agents.harness.common.tools.acp_output_tools import AcpOutputRequest, get_acp_output_manager
-from jiuwenswarm.server.runtime.agent_adapter import interface_deep as interface_deep_module
-from jiuwenswarm.server.runtime.agent_adapter import team_helpers as team_helpers_module
-from jiuwenswarm.server.utils.stream_utils import parse_stream_chunk
-from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
-    _build_context_assemble_rail,
-    _build_context_processor_rail,
-)
 from jiuwenswarm.agents.harness.common.rails.symphony.retrieval_context_processor import (
     SymphonyRetrievalCompactProcessorConfig,
 )
+from jiuwenswarm.agents.harness.common.tools import acp_output_tools
+from jiuwenswarm.agents.harness.common.tools.acp_output_tools import (
+    AcpOutputRequest,
+    get_acp_output_manager,
+)
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.e2a.wire_codec import parse_agent_server_wire_unary
-from jiuwenswarm.common.schema.agent import AgentRequest
+from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
+from jiuwenswarm.observability.session_delete import trajectory_session_accepts_records
 from jiuwenswarm.runtime.session_provisioner import (
     RuntimeSessionProvisioner,
     SessionProvisionCommitTiming,
     SessionProvisionState,
     SessionSwitchResult,
 )
-from jiuwenswarm.observability.session_delete import trajectory_session_accepts_records
+from jiuwenswarm.server import agent_ws_server as agent_ws_server_module
+from jiuwenswarm.server.runtime.agent_adapter import (
+    interface_deep as interface_deep_module,
+)
+from jiuwenswarm.server.runtime.agent_adapter import team_helpers as team_helpers_module
+from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+    _build_context_assemble_rail,
+    _build_context_processor_rail,
+)
+from jiuwenswarm.server.runtime.agent_manager import ACP_DEFAULT_CAPABILITIES
 from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStoreError
+from jiuwenswarm.server.runtime.session import lifecycle as session_lifecycle
+from jiuwenswarm.server.utils.stream_utils import parse_stream_chunk
 
 
 class FakeWebSocket:
@@ -88,6 +94,18 @@ class FakeAgentManager:
             {"channel_id": channel_id, "session_id": session_id}
         )
         return False
+
+    async def release_subagent_runtime_for_session(
+        self,
+        *,
+        channel_id: str | None = "",
+        session_id: str,
+        reason: str = "",
+    ) -> bool:
+        return False
+
+    async def cancel_session_tasks(self, *, channel_id: str = "", session_id: str) -> None:
+        return None
 
 
 class FakeTeamManager:
@@ -154,31 +172,60 @@ class AgentWebSocketServerHarness(agent_ws_server_module.AgentWebSocketServer):
         self._find_team_session_ids_override = override
 
     async def handle_initialize_for_test(self, ws, request, send_lock):
-        await self._handle_initialize(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.bootstrap import handle_initialize
+
+        await handle_initialize(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_session_create_for_test(self, ws, request, send_lock):
-        await self._handle_session_create(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.bootstrap import handle_session_create
+
+        await handle_session_create(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_session_switch_for_test(self, ws, request, send_lock):
-        await self._handle_session_switch(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.session import handle_session_switch
 
-    async def handle_session_kvc_prepare_for_test(self, ws, request, send_lock):
-        await self._handle_session_kvc_prepare(ws, request, send_lock)
+        await handle_session_switch(build_ws_request_context(self, ws, request, send_lock))
+
+    async def handle_session_input_intent_for_test(self, ws, request, send_lock):
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.session import handle_session_input_intent
+
+        await handle_session_input_intent(
+            build_ws_request_context(self, ws, request, send_lock)
+        )
 
     async def handle_team_delete_for_test(self, ws, request, send_lock):
-        await self._handle_team_delete(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.team import handle_team_delete
+
+        await handle_team_delete(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_team_bindings_list_for_test(self, ws, request, send_lock):
-        await self._handle_team_bindings_list(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.team import handle_team_bindings_list
+
+        await handle_team_bindings_list(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_team_binding_create_for_test(self, ws, request, send_lock):
-        await self._handle_team_binding_create(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.team import handle_team_binding_create
+
+        await handle_team_binding_create(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_team_binding_generate_for_test(self, ws, request, send_lock):
-        await self._handle_team_binding_generate(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.team import handle_team_binding_generate
+
+        await handle_team_binding_generate(build_ws_request_context(self, ws, request, send_lock))
 
     async def handle_team_session_bind_for_test(self, ws, request, send_lock):
-        await self._handle_team_session_bind(ws, request, send_lock)
+        from jiuwenswarm.server.context import build_ws_request_context
+        from jiuwenswarm.server.handlers.team import handle_team_session_bind
+
+        await handle_team_session_bind(build_ws_request_context(self, ws, request, send_lock))
 
     async def ensure_auto_team_binding_for_chat_for_test(self, request):
         return await self._ensure_auto_team_binding_for_chat(request)
@@ -267,6 +314,26 @@ def test_interface_deep_parse_stream_chunk_preserves_tool_update():
         "tool_call_id": "call-1",
         "tool_name": "read_file",
         "status": "in_progress",
+    }
+
+
+def test_parse_stream_chunk_converts_session_budget_exhaustion_to_chat_error():
+    parsed = parse_stream_chunk(
+        types.SimpleNamespace(
+            type="answer",
+            payload={
+                "reason": "swarmflow session token budget exhausted (101/100)",
+                "exhausted_ledger": "session",
+                "output": "",
+                "result_type": "",
+            },
+        )
+    )
+
+    assert parsed == {
+        "event_type": "chat.error",
+        "code": "SWARMFLOW_SESSION_BUDGET_EXHAUSTED",
+        "error": "Session budget exhausted",
     }
 
 
@@ -784,6 +851,30 @@ def test_parse_stream_chunk_unwraps_controller_output_interaction():
     assert parsed["questions"][0]["question"] == "Need details?"
 
 
+@pytest.mark.parametrize(
+    ("kind", "source"), [("ask_user", "ask_user_interrupt"), ("permission", "permission_interrupt")],
+)
+def test_controller_output_question_keeps_its_interrupt_identity(kind, source):
+    parsed = parse_stream_chunk(
+        types.SimpleNamespace(
+            type="controller_output",
+            payload={
+                "event_type": "chat.ask_user_question",
+                "request_id": "ask-user-3",
+                "interrupt_id": "intr-3",
+                "kind": kind,
+                "questions": [{"question": "Need details?", "header": "Details", "options": []}],
+            },
+        )
+    )
+
+    assert parsed["request_id"] == "ask-user-3"
+    assert parsed["interrupt_id"] == "intr-3"
+    assert parsed["kind"] == kind
+    assert parsed["source"] == source
+    assert parsed["questions"][0]["question"] == "Need details?"
+
+
 def test_parse_stream_chunk_prefers_ask_user_when_controller_has_mixed_interactions():
     parsed = parse_stream_chunk(
         types.SimpleNamespace(
@@ -920,6 +1011,10 @@ async def test_handle_initialize_uses_agent_manager_capabilities(monkeypatch):
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     request = AgentRequest(
         request_id="req-init",
@@ -961,6 +1056,10 @@ async def test_handle_initialize_falls_back_to_default_capabilities(monkeypatch)
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     request = AgentRequest(
         request_id="req-init-default",
@@ -991,6 +1090,10 @@ async def test_handle_session_create_returns_session_id(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -1028,6 +1131,7 @@ async def test_handle_session_create_returns_session_id(monkeypatch, tmp_path):
                 "projectDir": "",
                 "workMode": "work",
                 "persist_session": False,
+                "moa_enabled": False,
                 "prewarm_hit": True,
                 "prewarm_status": "ready",
             },
@@ -1046,6 +1150,10 @@ async def test_handle_session_create_locks_persist_session(monkeypatch, tmp_path
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -1082,6 +1190,10 @@ async def test_handle_session_create_requires_boolean_persist_session(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
     request = AgentRequest(
         request_id="create-invalid-persist",
@@ -1108,6 +1220,10 @@ async def test_handle_session_create_rejects_explicit_session_id(monkeypatch, tm
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -1150,8 +1266,10 @@ async def test_handle_tui_session_create_accepts_explicit_id_without_prewarm(
     fake_ws = FakeWebSocket()
     sessions_root = tmp_path / "sessions"
     warning_messages: list[str] = []
+    import jiuwenswarm.server.handlers.bootstrap as bootstrap_handlers
+
     monkeypatch.setattr(
-        agent_ws_server_module.logger,
+        bootstrap_handlers.logger,
         "warning",
         lambda message, *args: warning_messages.append(message % args),
     )
@@ -1159,6 +1277,10 @@ async def test_handle_tui_session_create_accepts_explicit_id_without_prewarm(
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -1177,7 +1299,9 @@ async def test_handle_tui_session_create_accepts_explicit_id_without_prewarm(
     )
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.session.project_store.get_project_by_id",
-        lambda project_id, cache_bust=True: types.SimpleNamespace(work_mode="code", hidden=False),
+        lambda project_id, cache_bust=True: types.SimpleNamespace(
+            work_mode="code", hidden=False, project_dir=project_dir,
+        ),
     )
 
     request = AgentRequest(
@@ -1228,6 +1352,10 @@ async def test_handle_tui_non_explicit_create_resolves_project_in_agentserver(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, sessions_root)
     project_dir = str(tmp_path / "tui-code-project")
     monkeypatch.setattr(
@@ -1244,7 +1372,9 @@ async def test_handle_tui_non_explicit_create_resolves_project_in_agentserver(
     )
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.session.project_store.get_project_by_id",
-        lambda project_id, cache_bust=True: types.SimpleNamespace(work_mode="code", hidden=False),
+        lambda project_id, cache_bust=True: types.SimpleNamespace(
+            work_mode="code", hidden=False, project_dir=project_dir,
+        ),
     )
 
     request = AgentRequest(
@@ -1285,6 +1415,10 @@ async def test_handle_tui_explicit_session_create_is_idempotent_and_bypasses_pre
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     async def register(request_id: str):
         ws = FakeWebSocket()
@@ -1321,7 +1455,13 @@ async def test_handle_tui_existing_session_rejects_persist_session_change(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
-    from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    from jiuwenswarm.server.runtime.session.session_metadata import (
+        init_session_metadata,
+    )
 
     init_session_metadata(
         session_id="tui_persist_locked",
@@ -1353,6 +1493,10 @@ async def test_cancelled_tui_explicit_create_waiter_does_not_release_owner_lock(
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     owner_entered = asyncio.Event()
@@ -1416,8 +1560,14 @@ async def test_handle_tui_explicit_create_preserves_existing_project_binding(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     original_project_dir = str(tmp_path / "original-project")
-    from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+    from jiuwenswarm.server.runtime.session.session_metadata import (
+        init_session_metadata,
+    )
 
     init_session_metadata(
         session_id="tui_binding_stable",
@@ -1486,7 +1636,13 @@ async def test_handle_tui_explicit_create_rejects_id_owned_by_another_channel(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
-    from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    from jiuwenswarm.server.runtime.session.session_metadata import (
+        init_session_metadata,
+    )
 
     init_session_metadata(session_id="web_owned", channel_id="web", mode="agent")
     fake_ws = FakeWebSocket()
@@ -1528,6 +1684,10 @@ async def test_handle_explicit_session_create_rejects_unsupported_identity(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     request = AgentRequest(
         request_id="register-invalid",
         channel_id=channel_id,
@@ -1554,6 +1714,10 @@ async def test_handle_session_create_injected_default_work_mode_does_not_mismatc
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
@@ -1606,6 +1770,7 @@ async def test_handle_session_create_injected_default_work_mode_does_not_mismatc
                 "projectDir": code_project.project_dir,
                 "workMode": "code",
                 "persist_session": False,
+                "moa_enabled": False,
                 "prewarm_hit": True,
                 "prewarm_status": "ready",
             },
@@ -1652,6 +1817,10 @@ async def legacy_handle_session_create_acks_before_async_kvc(monkeypatch, tmp_pa
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, tmp_path)
     from jiuwenswarm.server.runtime.session.kv_cache import (
         kv_cache_product_hooks,
@@ -1692,6 +1861,7 @@ async def legacy_handle_session_create_acks_before_async_kvc(monkeypatch, tmp_pa
                 "projectDir": "",
                 "workMode": "work",
                 "persist_session": False,
+                "moa_enabled": False,
                 "prewarm_hit": True,
                 "prewarm_status": "ready",
             },
@@ -1729,6 +1899,10 @@ async def test_handle_session_create_prepares_team_before_ack(monkeypatch, tmp_p
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, sessions_root)
     monkeypatch.setattr(
         "jiuwenswarm.agents.harness.team.get_team_manager",
@@ -1761,6 +1935,7 @@ async def test_handle_session_create_prepares_team_before_ack(monkeypatch, tmp_p
                 "projectDir": "",
                 "workMode": "work",
                 "persist_session": False,
+                "moa_enabled": False,
                 "prewarm_hit": False,
                 "prewarm_status": "bypassed",
             },
@@ -1787,6 +1962,10 @@ async def test_handle_session_create_missing_token_preserves_legacy_error_wire(
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
@@ -1825,6 +2004,10 @@ async def legacy_handle_session_create_existing_metadata_fast_path_skips_owner_a
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -1894,6 +2077,10 @@ async def legacy_handle_session_create_owner_error_releases_claim_and_uses_legac
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
 
     async def _prepare(_provisioner, **_kwargs):
@@ -1951,6 +2138,10 @@ async def test_handle_session_create_metadata_is_visible_before_owner_prepare(
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -2032,6 +2223,10 @@ async def test_handle_session_create_prewarm_miss_preserves_success_contract(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
     monkeypatch.setattr(
         RuntimeSessionProvisioner,
@@ -2062,6 +2257,7 @@ async def test_handle_session_create_prewarm_miss_preserves_success_contract(
                 "projectDir": "",
                 "workMode": "work",
                 "persist_session": False,
+                "moa_enabled": False,
                 "prewarm_hit": False,
                 "prewarm_status": "warming",
             },
@@ -2135,6 +2331,10 @@ async def test_handle_session_create_preserves_project_binding_error_wire(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, tmp_path / "sessions")
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.session.project_store."
@@ -2184,6 +2384,10 @@ async def test_handle_team_binding_create_persists_team_entity(monkeypatch, tmp_
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -2252,6 +2456,10 @@ async def test_handle_team_binding_generate_uses_default_template_and_resolves_c
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     monkeypatch.setattr(team_module, "generate_team_name", fake_generate_team_name)
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.team_binding_store.get_team_binding_store",
@@ -2309,6 +2517,10 @@ async def test_handle_team_binding_generate_uses_tiny_agent_result_for_name(monk
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     generation_prompts: list[str] = []
 
     async def fake_generate_team_name(description, *, config_base, template_id):
@@ -2356,48 +2568,23 @@ async def test_handle_team_binding_generate_uses_tiny_agent_result_for_name(monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["team", "code.team", "team.plan"])
-async def test_first_team_chat_auto_binds_and_preserves_original_query(monkeypatch, tmp_path, mode):
+async def test_first_team_chat_keeps_session_unbound_for_scoped_runtime_name(
+    monkeypatch, tmp_path, mode
+):
     from jiuwenswarm.agents.harness import team as team_module
     from jiuwenswarm.server.runtime.session.session_metadata import (
         get_session_metadata,
         init_session_metadata,
     )
-    from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStore
-    from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStore
 
     sessions_root = tmp_path / "sessions"
     patch_session_roots(monkeypatch, sessions_root)
-    binding_store = TeamBindingStore(tmp_path / "teams" / "bindings.json")
-    entity_store = TeamEntityStore(tmp_path / ".agent_teams")
-    config = {
-        "modes": {
-            "team": {
-                "research": {
-                    "team_name": "template_team",
-                    "leader": {"member_name": "lead_1"},
-                }
-            }
-        }
-    }
     session_id = f"sess-auto-team-{mode.replace('.', '-')}"
     original_query = "建立一个团队，开发一个斗地主游戏"
-    generation_prompts: list[str] = []
-
-    async def fake_generate_team_name(description, *, config_base, template_id):
-        generation_prompts.append(description)
-        assert config_base is config
-        assert template_id == "research"
-        return "landlord_game_team"
-
-    monkeypatch.setattr(agent_ws_server_module, "get_config", lambda: config)
-    monkeypatch.setattr(team_module, "generate_team_name", fake_generate_team_name)
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_binding_store.get_team_binding_store",
-        lambda: binding_store,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_entity_store.get_team_entity_store",
-        lambda: entity_store,
+        team_module,
+        "generate_team_name",
+        lambda *args, **kwargs: pytest.fail("first chat must not invoke TinyAgent"),
     )
 
     init_session_metadata(
@@ -2413,110 +2600,21 @@ async def test_first_team_chat_auto_binds_and_preserves_original_query(monkeypat
         params={"mode": mode, "query": original_query},
     )
 
-    binding = await AgentWebSocketServerHarness().ensure_auto_team_binding_for_chat_for_test(request)
+    result = await AgentWebSocketServerHarness().ensure_auto_team_binding_for_chat_for_test(request)
 
-    assert binding.team_name == "landlord_game_team"
+    assert result is None
     assert request.params["query"] == original_query
-    assert request.params["team_name"] == "landlord_game_team"
-    assert generation_prompts == [original_query]
+    assert "team_name" not in request.params
     persisted = get_session_metadata(session_id, cache_bust=True)
-    assert persisted["team_name"] == "landlord_game_team"
-    assert persisted["team_template_id"] == "research"
-    assert binding_store.get("landlord_game_team").session_ids == (session_id,)
-    assert entity_store.get("landlord_game_team") is not None
-
-
-@pytest.mark.asyncio
-async def test_first_team_chat_persists_requested_agent_group_before_runtime(
-    monkeypatch, tmp_path
-):
-    from jiuwenswarm.agents.harness import team as team_module
-    from jiuwenswarm.server.runtime.session.session_metadata import (
-        get_session_metadata,
-        init_session_metadata,
-    )
-    from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStore
-    from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStore
-
-    sessions_root = tmp_path / "sessions"
-    patch_session_roots(monkeypatch, sessions_root)
-    binding_store = TeamBindingStore(tmp_path / "teams" / "bindings.json")
-    entity_store = TeamEntityStore(tmp_path / ".agent_teams")
-    config = {
-        "modes": {
-            "team": {
-                "research": {
-                    "team_name": "template_team",
-                    "leader": {"member_name": "lead_1"},
-                }
-            }
-        }
-    }
-
-    async def fake_generate_team_name(description, *, config_base, template_id):
-        assert description == "使用评审专家团"
-        assert config_base is config
-        assert template_id == "research"
-        return "group_binding_live"
-
-    monkeypatch.setattr(agent_ws_server_module, "get_config", lambda: config)
-    monkeypatch.setattr(team_module, "generate_team_name", fake_generate_team_name)
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_binding_store.get_team_binding_store",
-        lambda: binding_store,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_entity_store.get_team_entity_store",
-        lambda: entity_store,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.extension_package_manager.resolve_agent_group_dir",
-        lambda name: tmp_path / name,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.extension_package_manager.resolve_agent_group_leader_identity",
-        lambda name: {
-            "agent_template_id": "leader-template",
-            "display_name": "评审负责人",
-            "avatar": "",
-        },
-    )
-
-    init_session_metadata(
-        session_id="sess-agent-group-auto-bind",
-        channel_id="web",
-        mode="team",
-    )
-    request = AgentRequest(
-        request_id="req-agent-group-auto-bind",
-        channel_id="web",
-        session_id="sess-agent-group-auto-bind",
-        req_method=ReqMethod.CHAT_SEND,
-        params={
-            "mode": "team",
-            "query": "使用评审专家团",
-            "agent_group_name": "review-group",
-        },
-    )
-
-    binding = await AgentWebSocketServerHarness().ensure_auto_team_binding_for_chat_for_test(request)
-
-    assert binding.team_name == "group_binding_live"
-    persisted = get_session_metadata("sess-agent-group-auto-bind", cache_bust=True)
-    assert persisted["agent_group_name"] == "review-group"
-    assert persisted["team_leader_identity"] == {
-        "agent_template_id": "leader-template",
-        "display_name": "评审负责人",
-        "avatar": "",
-    }
-    assert binding_store.get("group_binding_live").session_ids == (
-        "sess-agent-group-auto-bind",
-    )
+    assert persisted["team_name"] == ""
+    assert persisted["team_template_id"] == ""
 
 
 @pytest.mark.asyncio
 async def test_non_team_chat_ignores_legacy_agent_group_field(monkeypatch, tmp_path):
-    from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+    from jiuwenswarm.server.runtime.session.session_metadata import (
+        init_session_metadata,
+    )
 
     sessions_root = tmp_path / "sessions"
     patch_session_roots(monkeypatch, sessions_root)
@@ -2547,89 +2645,11 @@ async def test_non_team_chat_ignores_legacy_agent_group_field(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_first_team_chat_continues_when_leader_identity_is_unavailable(
-    monkeypatch, tmp_path
-):
-    from jiuwenswarm.agents.harness import team as team_module
-    from jiuwenswarm.server.runtime.session.session_metadata import (
-        get_session_metadata,
-        init_session_metadata,
-    )
-    from jiuwenswarm.server.runtime.team_binding_store import TeamBindingStore
-    from jiuwenswarm.server.runtime.team_entity_store import TeamEntityStore
-
-    sessions_root = tmp_path / "sessions"
-    patch_session_roots(monkeypatch, sessions_root)
-    binding_store = TeamBindingStore(tmp_path / "teams" / "bindings.json")
-    entity_store = TeamEntityStore(tmp_path / ".agent_teams")
-    config = {
-        "modes": {
-            "team": {
-                "research": {
-                    "team_name": "template_team",
-                    "leader": {"member_name": "lead_1"},
-                }
-            }
-        }
-    }
-
-    async def fake_generate_team_name(description, *, config_base, template_id):
-        assert description == "使用暂时不可解析身份的专家团"
-        assert config_base is config
-        assert template_id == "research"
-        return "identity_fallback_team"
-
-    def fail_identity(_name):
-        raise OSError("leader manifest temporarily unavailable")
-
-    monkeypatch.setattr(agent_ws_server_module, "get_config", lambda: config)
-    monkeypatch.setattr(team_module, "generate_team_name", fake_generate_team_name)
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_binding_store.get_team_binding_store",
-        lambda: binding_store,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.team_entity_store.get_team_entity_store",
-        lambda: entity_store,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.extension_package_manager.resolve_agent_group_dir",
-        lambda name: tmp_path / name,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.extension_package_manager.resolve_agent_group_leader_identity",
-        fail_identity,
-    )
-
-    init_session_metadata(
-        session_id="sess-agent-group-identity-fallback",
-        channel_id="web",
-        mode="team",
-    )
-    request = AgentRequest(
-        request_id="req-agent-group-identity-fallback",
-        channel_id="web",
-        session_id="sess-agent-group-identity-fallback",
-        req_method=ReqMethod.CHAT_SEND,
-        params={
-            "mode": "team",
-            "query": "使用暂时不可解析身份的专家团",
-            "agent_group_name": "review-group",
-        },
-    )
-
-    binding = await AgentWebSocketServerHarness().ensure_auto_team_binding_for_chat_for_test(request)
-
-    assert binding.team_name == "identity_fallback_team"
-    persisted = get_session_metadata("sess-agent-group-identity-fallback", cache_bust=True)
-    assert persisted["agent_group_name"] == "review-group"
-    assert "team_leader_identity" not in persisted
-
-
-@pytest.mark.asyncio
 async def test_first_team_chat_reuses_legacy_session_team_without_tiny_agent(monkeypatch, tmp_path):
     from jiuwenswarm.agents.harness import team as team_module
-    from jiuwenswarm.server.runtime.session.session_metadata import init_session_metadata
+    from jiuwenswarm.server.runtime.session.session_metadata import (
+        init_session_metadata,
+    )
 
     sessions_root = tmp_path / "sessions"
     patch_session_roots(monkeypatch, sessions_root)
@@ -2682,6 +2702,10 @@ async def test_handle_team_bindings_list_selects_entity_when_template_deleted(mo
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -2738,6 +2762,10 @@ async def test_handle_team_session_bind_allows_existing_session_dir_without_meta
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     patch_session_roots(monkeypatch, sessions_root)
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.team_binding_store.get_team_binding_store",
@@ -2788,6 +2816,10 @@ async def test_handle_team_session_bind_rejects_missing_session(monkeypatch, tmp
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     patch_session_roots(monkeypatch, sessions_root)
@@ -2880,6 +2912,14 @@ async def test_handle_session_switch_delegates_product_lifecycle(
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     monkeypatch.setattr(server, "_execution_runtime", lambda: runtime)
 
     request = AgentRequest(
@@ -2910,6 +2950,7 @@ async def test_handle_session_switch_delegates_product_lifecycle(
         "payload": {
             "session_id": "sess_002",
             "mode": resolved_mode,
+            "moa_enabled": False,
             "switched": True,
         },
         "ok": True,
@@ -2973,6 +3014,14 @@ async def test_handle_session_switch_records_foreground_before_ack(monkeypatch):
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
     monkeypatch.setattr(server, "_execution_runtime", lambda: runtime)
 
     request = AgentRequest(
@@ -3004,6 +3053,7 @@ async def test_handle_session_switch_records_foreground_before_ack(monkeypatch):
             "payload": {
                 "session_id": "sess_002",
                 "mode": "agent.plan",
+                "moa_enabled": False,
                 "switched": True,
             },
             "ok": True,
@@ -3012,13 +3062,15 @@ async def test_handle_session_switch_records_foreground_before_ack(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def legacy_handle_session_kvc_prepare_is_best_effort(monkeypatch):
+async def test_handle_session_input_intent_uses_transport_neutral_runtime_api(
+    monkeypatch,
+):
     server = AgentWebSocketServerHarness()
     fake_ws = FakeWebSocket()
     calls = []
 
-    def _prepare(**kwargs):
-        calls.append(kwargs)
+    async def _record_input_intent(request, *, view_id):
+        calls.append((request.session_id, request.params["intent_id"], view_id))
         return "scheduled"
 
     monkeypatch.setattr(
@@ -3027,33 +3079,42 @@ async def legacy_handle_session_kvc_prepare_is_best_effort(monkeypatch):
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.kv_cache.kv_cache_product_hooks."
-        "record_session_prepare",
-        _prepare,
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
     )
-
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        server,
+        "_execution_runtime",
+        lambda: types.SimpleNamespace(
+            record_session_input_intent=_record_input_intent,
+        ),
+    )
     request = AgentRequest(
-        request_id="req-kvc-prepare",
+        request_id="req-input-intent",
         channel_id="web",
-        req_method=ReqMethod.SESSION_KVC_PREPARE,
+        session_id="sess_002",
+        req_method=ReqMethod.SESSION_INPUT_INTENT,
         params={
             "session_id": "sess_002",
             "intent_id": "intent-1",
-            "mode": "code.normal",
+            "view_id": "view-1",
         },
     )
 
-    await server.handle_session_kvc_prepare_for_test(
+    await server.handle_session_input_intent_for_test(
         fake_ws,
         request,
         asyncio.Lock(),
     )
 
-    assert calls[0]["session_id"] == "sess_002"
-    assert calls[0]["intent_id"] == "intent-1"
+    assert calls == [("sess_002", "intent-1", "view-1")]
     assert fake_ws.sent == [
         {
-            "response_id": "req-kvc-prepare",
+            "response_id": "req-input-intent",
             "payload": {
                 "session_id": "sess_002",
                 "scheduled": True,
@@ -3121,6 +3182,14 @@ async def test_handle_session_switch_serializes_reentrant_requests(monkeypatch):
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(server, "_execution_runtime", lambda: runtime)
@@ -3229,6 +3298,10 @@ async def legacy_handle_team_delete_deletes_all_matching_team_sessions(monkeypat
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -3345,6 +3418,10 @@ async def legacy_handle_team_delete_warns_when_local_team_directory_cleanup_fail
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         "jiuwenswarm.agents.harness.team.stop_team_session_runtime_across_managers",
         lambda session_id, reason="": asyncio.sleep(0, result=True),
     )
@@ -3435,6 +3512,10 @@ async def legacy_handle_team_delete_stops_when_runner_reports_failure(monkeypatc
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         "jiuwenswarm.agents.harness.team.stop_team_session_runtime_across_managers",
         lambda session_id, reason="": asyncio.sleep(0, result=True),
     )
@@ -3513,6 +3594,10 @@ async def legacy_handle_team_delete_keeps_catalog_when_session_directory_delete_
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -3616,6 +3701,10 @@ async def legacy_handle_team_delete_without_sessions_skips_checkpointer_and_remo
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         interface_deep_module,
         "ensure_persistent_checkpointer",
         fail_ensure_persistent_checkpointer,
@@ -3677,6 +3766,10 @@ async def legacy_handle_team_delete_with_sessions_requires_persistent_checkpoint
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         interface_deep_module,
         "ensure_persistent_checkpointer",
         fake_ensure_persistent_checkpointer,
@@ -3719,6 +3812,10 @@ async def test_handle_team_delete_rejects_non_team_mode(monkeypatch):
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     request = AgentRequest(
         request_id="req-team-delete-agent",
@@ -3749,6 +3846,10 @@ async def test_handle_team_delete_requires_team_name(monkeypatch):
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
 
@@ -3815,6 +3916,10 @@ async def test_handle_session_delete_initializes_persistent_checkpointer(monkeyp
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         "jiuwenswarm.common.utils.get_agent_sessions_dir",
         lambda: sessions_root,
     )
@@ -3845,6 +3950,10 @@ async def test_handle_session_delete_initializes_persistent_checkpointer(monkeyp
 
     await server.handle_session_delete_for_test(fake_ws, request, asyncio.Lock())
 
+    await asyncio.wait_for(
+        asyncio.gather(*server._archive_service._finalizer_tasks),
+        timeout=5,
+    )
     assert ensure_calls == ["called"]
     assert release_calls == ["sess-agent-1"]
     assert cleared_metadata_cache == ["sess-agent-1"]
@@ -3856,7 +3965,13 @@ async def test_handle_session_delete_initializes_persistent_checkpointer(monkeyp
     assert fake_ws.sent == [
         {
             "response_id": "req-session-delete",
-            "payload": {"session_id": "sess-agent-1", "project_id": "default"},
+            "payload": {
+                "session_id": "sess-agent-1",
+                "project_id": "default",
+                "accepted": True,
+                "finalizing": True,
+                "stop_pending": True,
+            },
             "ok": True,
         }
     ]
@@ -3901,6 +4016,10 @@ async def legacy_handle_session_delete_drains_runtime_before_kvc_and_checkpoint_
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -3996,6 +4115,10 @@ async def legacy_handle_session_delete_keeps_state_when_cleanup_fails(
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         "jiuwenswarm.common.utils.get_agent_sessions_dir",
         lambda: sessions_root,
     )
@@ -4070,6 +4193,10 @@ async def legacy_handle_session_delete_unbinds_team_session(monkeypatch, tmp_pat
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
         "jiuwenswarm.common.utils.get_agent_sessions_dir",
         lambda: sessions_root,
     )
@@ -4127,7 +4254,7 @@ async def legacy_handle_session_delete_unbinds_team_session(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_handle_session_delete_rejects_when_checkpointer_unavailable(monkeypatch, tmp_path):
+async def test_handle_session_delete_defers_when_checkpointer_unavailable(monkeypatch, tmp_path):
     server = AgentWebSocketServerHarness()
     fake_ws = FakeWebSocket()
     sessions_root = tmp_path / "sessions"
@@ -4144,6 +4271,10 @@ async def test_handle_session_delete_rejects_when_checkpointer_unavailable(monke
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
     monkeypatch.setattr(
@@ -4169,16 +4300,28 @@ async def test_handle_session_delete_rejects_when_checkpointer_unavailable(monke
 
     await server.handle_session_delete_for_test(fake_ws, request, asyncio.Lock())
 
+    await asyncio.wait_for(
+        asyncio.gather(*server._archive_service._finalizer_tasks),
+        timeout=5,
+    )
     assert release_calls == []
     assert session_dir.exists()
+    operation = session_lifecycle.state("session", "sess-team-1")["operation"]
+    assert operation["status"] == "failed"
+    assert operation["retryable"] is True
+    assert operation["cleanup_attempts"] == 1
+    assert operation["errors"] == ["persistent checkpointer is unavailable"]
     assert fake_ws.sent == [
         {
             "response_id": "req-session-delete-checkpoint",
             "payload": {
-                "error": "persistent checkpointer is unavailable",
-                "code": "CHECKPOINT_UNAVAILABLE",
+                "session_id": "sess-team-1",
+                "project_id": "default",
+                "accepted": True,
+                "finalizing": True,
+                "stop_pending": True,
             },
-            "ok": False,
+            "ok": True,
         }
     ]
 
@@ -4232,6 +4375,10 @@ async def test_handle_acp_tool_response_completes_pending_future(monkeypatch):
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     request = AgentRequest(
         request_id="req-acp-tool-response",
@@ -4272,6 +4419,10 @@ async def test_handle_acp_tool_response_unknown_id_is_soft_ignored(monkeypatch):
     monkeypatch.setattr(
         agent_ws_server_module,
         "encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
 
@@ -4321,6 +4472,10 @@ async def test_handle_message_uses_ws_scoped_acp_client_capabilities(monkeypatch
         "encode_agent_response_for_wire",
         fake_encode_agent_response_for_wire,
     )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.transports.ws_sink.encode_agent_response_for_wire",
+        fake_encode_agent_response_for_wire,
+    )
 
     init_request_a = AgentRequest(
         request_id="req-init-a",
@@ -4339,10 +4494,15 @@ async def test_handle_message_uses_ws_scoped_acp_client_capabilities(monkeypatch
 
     captured = {}
 
-    async def fake_handle_session_create(ws, request, send_lock):
+    async def fake_handle_session_create(ws, request, _send_lock):
         captured[id(ws)] = dict(request.metadata or {})
 
     monkeypatch.setattr(server, "_handle_session_create", fake_handle_session_create)
+    monkeypatch.setattr(
+        server,
+        "_skips_session_lifecycle_guard",
+        lambda _request: True,
+    )
 
     env = e2a_from_agent_fields(
         request_id="req-session-create",

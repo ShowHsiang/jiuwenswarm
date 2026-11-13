@@ -1,18 +1,20 @@
 import json
+import os
 import time
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from websockets.exceptions import ConnectionClosedError
 
-from jiuwenswarm.gateway.app_gateway import (
+from agent_gateway.app_gateway import (
     GatewayServer,
     GatewayServerConfig,
     RouteConfig,
     _normalize_gateway_message,
 )
-from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
+from openjiuwen_protocol.message import EventType, Message, ReqMethod
 
 
 class DummyBus:
@@ -172,7 +174,7 @@ def test_normalize_gateway_message_preserves_user_id():
 
 @pytest.mark.asyncio
 async def test_schedule_gateway_restart_sets_event_without_execv(monkeypatch):
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     execv_calls = []
     monkeypatch.setattr(
@@ -189,15 +191,143 @@ async def test_schedule_gateway_restart_sets_event_without_execv(monkeypatch):
     assert execv_calls == []
 
 
+class _ProcessExited(Exception):
+    pass
+
+
+def _install_fake_os(monkeypatch, gateway_module, exit_codes, execv_calls, getppid=os.getppid):
+    """Swap the module's ``os`` for a local stub.
+
+    Patching attributes on ``gateway_module.os`` mutates the real, process-wide
+    ``os`` module: every thread's ``os._exit`` would raise for the duration of
+    the test (breaking even pytest-timeout's hard-kill path). Replacing the
+    module reference keeps the patch local, like the sibling test file's
+    ``_fake_os`` pattern.
+    """
+
+    def fake_exit(code):
+        exit_codes.append(code)
+        raise _ProcessExited
+
+    monkeypatch.setattr(
+        gateway_module,
+        "os",
+        SimpleNamespace(
+            environ=os.environ,
+            getpid=os.getpid,
+            getppid=getppid,
+            _exit=fake_exit,
+            execv=lambda executable, argv: execv_calls.append(argv),
+        ),
+    )
+
+
+def test_exec_gateway_restart_exits_to_supervisor(monkeypatch):
+    import agent_gateway.app_gateway as gateway_module
+
+    exit_codes = []
+    execv_calls = []
+    # The check needs a live process that is not younger than us, and the real
+    # parent is one. os.getppid() returns 0 when this process is PID 1, which
+    # it is inside a container that has no init shim, and PID 0 is not a
+    # process. PID 1 always exists and always starts first, so it stands in.
+    # Either way psutil stays real and the liveness and age checks both run.
+    supervisor_pid = os.getppid() or 1
+    _install_fake_os(
+        monkeypatch, gateway_module, exit_codes, execv_calls, getppid=lambda: supervisor_pid
+    )
+    monkeypatch.setenv(gateway_module.SUPERVISOR_PID_ENV, str(supervisor_pid))
+
+    with pytest.raises(_ProcessExited):
+        gateway_module._exec_gateway_restart()
+
+    assert exit_codes == [gateway_module.GATEWAY_RESTART_EXIT_CODE]
+    assert execv_calls == []
+
+
+@pytest.mark.parametrize("supervisor_pid", [None, "0"])
+def test_exec_gateway_restart_execs_without_its_supervisor(monkeypatch, supervisor_pid):
+    import agent_gateway.app_gateway as gateway_module
+
+    exit_codes = []
+    execv_calls = []
+    _install_fake_os(monkeypatch, gateway_module, exit_codes, execv_calls)
+    if supervisor_pid is None:
+        monkeypatch.delenv(gateway_module.SUPERVISOR_PID_ENV, raising=False)
+    else:
+        # A PID leaked through a saved environment must not be mistaken for our parent.
+        monkeypatch.setenv(gateway_module.SUPERVISOR_PID_ENV, supervisor_pid)
+
+    gateway_module._exec_gateway_restart()
+
+    assert len(execv_calls) == 1
+    assert exit_codes == []
+
+
+def test_exec_gateway_restart_execs_when_the_supervisor_pid_is_dead(monkeypatch):
+    # Windows: os.getppid() keeps reporting a hard-killed supervisor's PID
+    # (no reparenting), so the env match alone must not trigger the
+    # exit-and-be-respawned path with nobody left to respawn us.
+    import psutil
+
+    import agent_gateway.app_gateway as gateway_module
+
+    exit_codes = []
+    execv_calls = []
+    _install_fake_os(monkeypatch, gateway_module, exit_codes, execv_calls)
+    monkeypatch.setenv(gateway_module.SUPERVISOR_PID_ENV, str(os.getppid()))
+
+    def dead_process(pid=None):
+        raise psutil.NoSuchProcess(pid if pid is not None else 0)
+
+    monkeypatch.setattr(psutil, "Process", dead_process)
+
+    gateway_module._exec_gateway_restart()
+
+    assert len(execv_calls) == 1
+    assert exit_codes == []
+
+
+def test_exec_gateway_restart_execs_when_the_supervisor_pid_was_recycled(monkeypatch):
+    # A recycled PID belongs to a process younger than us: the real supervisor
+    # always starts before the gateway it spawned.
+    import psutil
+
+    import agent_gateway.app_gateway as gateway_module
+
+    exit_codes = []
+    execv_calls = []
+    _install_fake_os(monkeypatch, gateway_module, exit_codes, execv_calls)
+    monkeypatch.setenv(gateway_module.SUPERVISOR_PID_ENV, str(os.getppid()))
+
+    class _RecycledProcess:
+        def __init__(self, pid=None):
+            self._pid = pid
+
+        def create_time(self):
+            # pid=None is psutil.Process() (ourselves); anything else is the
+            # "parent", recreated after us.
+            return time.time() + (60.0 if self._pid is not None else 0.0)
+
+    monkeypatch.setattr(psutil, "Process", _RecycledProcess)
+
+    gateway_module._exec_gateway_restart()
+
+    assert len(execv_calls) == 1
+    assert exit_codes == []
+
+
 @pytest.mark.asyncio
 async def test_wait_for_gateway_tasks_returns_false_when_services_finish():
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     service_task = asyncio.create_task(asyncio.sleep(0))
     restart_request = gateway_module.GatewayRestartRequest()
 
     result = await asyncio.wait_for(
-        gateway_module._wait_for_gateway_tasks_or_restart([service_task], restart_request),
+        gateway_module._wait_for_gateway_tasks_or_restart(
+            [service_task], restart_request, asyncio.Event()
+        ),
         timeout=1.0,
     )
 
@@ -206,14 +336,16 @@ async def test_wait_for_gateway_tasks_returns_false_when_services_finish():
 
 @pytest.mark.asyncio
 async def test_wait_for_gateway_tasks_keeps_delayed_restart_when_services_finish():
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     service_task = asyncio.create_task(asyncio.sleep(0))
     restart_request = gateway_module.GatewayRestartRequest()
 
     gateway_module._schedule_gateway_restart(restart_request, delay=1.0)
     result = await asyncio.wait_for(
-        gateway_module._wait_for_gateway_tasks_or_restart([service_task], restart_request),
+        gateway_module._wait_for_gateway_tasks_or_restart(
+            [service_task], restart_request, asyncio.Event()
+        ),
         timeout=1.0,
     )
 
@@ -222,7 +354,7 @@ async def test_wait_for_gateway_tasks_keeps_delayed_restart_when_services_finish
 
 @pytest.mark.asyncio
 async def test_wait_for_gateway_tasks_keeps_delayed_restart_when_service_fails():
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     async def fail_service():
         raise RuntimeError("service failed before restart delay")
@@ -232,7 +364,9 @@ async def test_wait_for_gateway_tasks_keeps_delayed_restart_when_service_fails()
 
     gateway_module._schedule_gateway_restart(restart_request, delay=1.0)
     result = await asyncio.wait_for(
-        gateway_module._wait_for_gateway_tasks_or_restart([service_task], restart_request),
+        gateway_module._wait_for_gateway_tasks_or_restart(
+            [service_task], restart_request, asyncio.Event()
+        ),
         timeout=1.0,
     )
 
@@ -759,7 +893,7 @@ async def test_gateway_server_defers_end_turn_until_pending_client_rpc_resolves(
 async def test_gateway_server_expired_pending_rpc_does_not_block_end_turn(monkeypatch):
     server = build_server()
     ws = FakeWebSocket()
-    monkeypatch.setattr("jiuwenswarm.gateway.channel_manager.protocol.acp.acp_connect._ACP_PENDING_RPC_TIMEOUT_SECONDS",
+    monkeypatch.setattr("agent_gateway.channel_manager.protocol.acp.acp_connect._ACP_PENDING_RPC_TIMEOUT_SECONDS",
                         -1.0)
 
     async def on_message(msg):
@@ -1394,7 +1528,7 @@ async def test_gateway_server_prompt_result_echoes_user_message_id():
 
 @pytest.mark.asyncio
 async def test_gateway_server_does_not_end_turn_from_chat_final_before_late_tool_result(monkeypatch):
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     monkeypatch.setattr(gateway_module, "_PROMPT_IDLE_FINALIZE_SECONDS", 0.01)
     server = build_server()
@@ -1646,7 +1780,7 @@ async def test_gateway_server_emits_todo_update_then_waits_for_idle():
 
 @pytest.mark.asyncio
 async def test_gateway_server_delta_only_does_not_trigger_idle_finalize(monkeypatch):
-    import jiuwenswarm.gateway.app_gateway as gateway_module
+    import agent_gateway.app_gateway as gateway_module
 
     monkeypatch.setattr(gateway_module, "_PROMPT_IDLE_FINALIZE_SECONDS", 0.01)
     server = build_server()
@@ -2113,7 +2247,7 @@ async def test_gateway_injects_default_agent_type_on_forward():
 def _third_agent_registry():
     from openjiuwen.core.runner.callback.framework import AsyncCallbackFramework
 
-    from jiuwenswarm.extensions.registry import ExtensionRegistry
+    from agent_gateway.extensions.registry import ExtensionRegistry
 
     ExtensionRegistry.reset_instance()
     registry = ExtensionRegistry.create_instance(AsyncCallbackFramework(), {}, None)
@@ -2122,8 +2256,8 @@ def _third_agent_registry():
 
 
 def _resolve_third_agent_for_test():
-    from jiuwenswarm.extensions.registry import ExtensionRegistry
-    from jiuwenswarm.gateway.routing.third_agent import get_unsupported_third_agent
+    from agent_gateway.extensions.registry import ExtensionRegistry
+    from agent_gateway.routing.third_agent import get_unsupported_third_agent
 
     third = ExtensionRegistry.get_instance().get_third_agent()
     return third if third is not None else get_unsupported_third_agent()
@@ -2184,8 +2318,8 @@ async def test_gateway_agent_list_uses_local_handler_default_unsupported(
 async def test_gateway_agent_switch_local_handler_updates_connection(
     _third_agent_registry,
 ):
-    from jiuwenswarm.extensions.sdk.third_agent import ThirdAgentExtension
-    from jiuwenswarm.gateway.routing.third_agent import ThirdAgent
+    from agent_gateway.extensions.sdk.third_agent import ThirdAgentExtension
+    from agent_gateway.routing.third_agent import ThirdAgent
 
     class _FakeThirdAgent(ThirdAgent):
         def normalize_agent_type(self, raw):
@@ -2306,8 +2440,8 @@ async def test_gateway_agent_switch_local_handler_updates_connection(
 
 @pytest.mark.asyncio
 async def test_gateway_agent_switch_rejects_unsupported_type(_third_agent_registry):
-    from jiuwenswarm.extensions.sdk.third_agent import ThirdAgentExtension
-    from jiuwenswarm.gateway.routing.third_agent import ThirdAgent
+    from agent_gateway.extensions.sdk.third_agent import ThirdAgentExtension
+    from agent_gateway.routing.third_agent import ThirdAgent
 
     class _FakeThirdAgent(ThirdAgent):
         async def thirdagent_list(self, *, user_id, current_agent_type="", access_mode=""):
@@ -2385,7 +2519,7 @@ async def test_gateway_agent_switch_rejects_unsupported_type(_third_agent_regist
 
 
 def test_resolve_3rdagent_switch_session_id_requires_explicit_param():
-    from jiuwenswarm.gateway.channel_manager.tui.tui_connect import (
+    from agent_gateway.channel_manager.tui.tui_connect import (
         resolve_3rdagent_switch_session_id,
     )
 
@@ -2398,7 +2532,7 @@ def test_resolve_3rdagent_switch_session_id_requires_explicit_param():
 @pytest.mark.asyncio
 async def test_gateway_agent_switch_rejects_missing_session_id():
     server = _build_tui_server_with_agent_switch()
-    from jiuwenswarm.gateway.channel_manager.tui.tui_connect import (
+    from agent_gateway.channel_manager.tui.tui_connect import (
         resolve_3rdagent_switch_session_id,
     )
 

@@ -19,7 +19,6 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 QWEN_OMNI_PROXY_PATH = "/ws/video/qwen-omni"
-_DEFAULT_MODEL = "qwen3.5-omni-flash-realtime"
 
 
 @dataclass(frozen=True)
@@ -34,9 +33,8 @@ class QwenOmniRealtimeConfig:
         return cls(
             upstream_url=os.environ.get("QWEN_OMNI_REALTIME_URL", "").strip(),
             api_key=os.environ.get("QWEN_OMNI_API_KEY", "").strip(),
-            model=os.environ.get("QWEN_OMNI_MODEL_NAME", _DEFAULT_MODEL).strip()
-            or _DEFAULT_MODEL,
-            voice=os.environ.get("QWEN_OMNI_VOICE", "Ethan").strip() or "Ethan",
+            model=os.environ.get("QWEN_OMNI_MODEL_NAME", "").strip(),
+            voice=os.environ.get("QWEN_OMNI_VOICE", "").strip() or "Tina",
         )
 
     def validate(self) -> None:
@@ -79,6 +77,23 @@ def _safe_upstream_error(exc: BaseException, api_key: str) -> str:
     return message[:1_000]
 
 
+def qwen_upstream_error(event: object, api_key: str) -> tuple[str, str] | None:
+    """Read Realtime errors and untyped Model Studio authorization failures."""
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") == "error":
+        error = event.get("error")
+    elif not event.get("type") and event.get("code") and event.get("message"):
+        error = event
+    else:
+        return None
+    if not isinstance(error, dict):
+        return None
+    code = str(error.get("code") or error.get("type") or "qwen_upstream_error")
+    message = str(error.get("message") or "The provider rejected the session")
+    return code, _safe_upstream_error(RuntimeError(f"{code}: {message}"), api_key)
+
+
 async def _relay_browser_to_upstream(websocket: WebSocket, upstream: object) -> None:
     while True:
         message = await websocket.receive()
@@ -93,11 +108,21 @@ async def _relay_browser_to_upstream(websocket: WebSocket, upstream: object) -> 
             await upstream.send(data)  # type: ignore[attr-defined]
 
 
-async def _relay_upstream_to_browser(websocket: WebSocket, upstream: object) -> None:
+async def _relay_upstream_to_browser(websocket: WebSocket, upstream: object, api_key: str = "") -> None:
     async for message in upstream:  # type: ignore[attr-defined]
         if isinstance(message, bytes):
             await websocket.send_bytes(message)
         else:
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                event = None
+            error = qwen_upstream_error(event, api_key)
+            if error and not event.get("type"):
+                # Preserve the cause before the provider aborts its socket.
+                await _send_gateway_error(websocket, error[0], error[1])
+                logger.warning("Qwen-Omni upstream rejected session code=%s", error[0])
+                continue
             await websocket.send_text(message)
 
 
@@ -112,6 +137,7 @@ async def serve_qwen_omni_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="Qwen-Omni gateway is not configured")
         return
 
+    close_code, close_reason = 1000, ""
     try:
         async with websockets.connect(
             upstream_url,
@@ -123,10 +149,9 @@ async def serve_qwen_omni_websocket(websocket: WebSocket) -> None:
             max_size=8 * 1024 * 1024,
         ) as upstream:
             logger.info("Qwen-Omni Realtime relay connected model=%s", config.model)
-            tasks = {
-                asyncio.create_task(_relay_browser_to_upstream(websocket, upstream)),
-                asyncio.create_task(_relay_upstream_to_browser(websocket, upstream)),
-            }
+            browser_task = asyncio.create_task(_relay_browser_to_upstream(websocket, upstream))
+            upstream_task = asyncio.create_task(_relay_upstream_to_browser(websocket, upstream, config.api_key))
+            tasks = {browser_task, upstream_task}
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
@@ -135,20 +160,41 @@ async def serve_qwen_omni_websocket(websocket: WebSocket) -> None:
                     exception = task.exception()
                     if exception is not None:
                         raise exception
+                close_code = getattr(upstream, "close_code", None) or 1000
+                close_reason = getattr(upstream, "close_reason", "") or ""
+                if upstream_task in done and browser_task not in done:
+                    message = _safe_upstream_error(
+                        RuntimeError(f"Qwen Realtime 连接已关闭（{close_code}）：{close_reason or '服务端未提供具体原因'}"),
+                        config.api_key,
+                    )
+                    await _send_gateway_error(websocket, "qwen_gateway_upstream_closed", message)
             finally:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-    except (ConnectionClosed, WebSocketDisconnect):
-        pass
+    except ConnectionClosed as exc:
+        close_code = exc.rcvd.code if exc.rcvd else 1011
+        close_reason = exc.rcvd.reason if exc.rcvd else "Upstream disconnected without a close frame"
+        await _send_gateway_error(
+            websocket, "qwen_gateway_upstream_closed", _safe_upstream_error(exc, config.api_key)
+        )
+    except WebSocketDisconnect:
+        return
     except Exception as exc:  # noqa: BLE001 - isolate one upstream session
         message = _safe_upstream_error(exc, config.api_key)
         logger.warning("Qwen-Omni Realtime relay failed: %s", message)
         await _send_gateway_error(websocket, "qwen_gateway_upstream_error", message)
+        close_code, close_reason = 1011, "Qwen upstream connection failed"
     finally:
+        close_reason = _safe_upstream_error(Exception(close_reason), config.api_key) if close_reason else ""
+        logger.info("Qwen-Omni relay closed code=%s reason=%s", close_code, close_reason)
+        if close_code in {1004, 1005, 1006, 1015}:
+            close_reason = f"Upstream close {close_code}: {close_reason}"
+            close_code = 1011
+        close_reason = close_reason.encode("utf-8")[:123].decode("utf-8", errors="ignore")
         if websocket.client_state != WebSocketState.DISCONNECTED:
             try:
-                await websocket.close(code=1000)
+                await websocket.close(code=close_code, reason=close_reason)
             except (RuntimeError, WebSocketDisconnect):
                 pass

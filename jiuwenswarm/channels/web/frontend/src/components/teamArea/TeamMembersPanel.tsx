@@ -1,16 +1,24 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
+import type { TFunction } from 'i18next';
 import { useChatStore, useSessionStore, useTodoStore } from '../../stores';
 import type { Message, TeamMemberContextCompressionState } from '../../types';
 import type { TeamMemberExecutionEvent, TeamTask as SessionTeamTask } from '../../stores/sessionStore';
+import {
+  shouldPresentTeamMemberIdle,
+  type TeamConnectionPresentation,
+} from '../../features/teamConnectionPresentation';
 import { MarkdownMessageBody } from '../ChatPanel/MessageItem';
 import { parseTeamEventMessage, type ParsedTeamEvent } from '../ChatPanel/teamEventUtils';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import { isTeamLeaderMember, isUserMember } from '../../utils/teamMemberAvatar';
-import { contextCompressionRunningText } from '../../utils/contextCompression';
+import { contextCompressionElapsedText, contextCompressionRunningText } from '../../utils/contextCompression';
+import { useContextCompressionElapsed } from '../../hooks/useCompressionElapsed';
+import { getSkillAvatar } from '../../utils/skillAvatar';
 import teamIcon from '../../assets/team.svg';
-import PendingIcon from '../../assets/pending.svg?react';
+import FrameTimeIcon from '../../assets/work-mode/frame-time.svg?react';
+import { LoadingSpinner } from '../ui/LoadingSpinner/LoadingSpinner';
 
 import BackIcon from '../../assets/back.svg?react';
 import { MemberListItem } from './MemberListItem';
@@ -20,19 +28,47 @@ import { MemberTaskListBar, MemberTaskListPanel } from './MemberTaskList';
 import {
   buildProcessItems,
   buildTaskMap,
+  getMemberAvatarIdentity,
+  getMemberAvatarKey,
   getMemberDisplayName,
+  getMemberExpertHint,
   getMemberStatusKey,
   latestUserPrompt,
   mergeUniqueMessages,
   type TeamDetailTab,
   type TeamMember,
 } from './shared';
-import { AlertTriangle, CircleAlert, LoaderCircle, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleAlert,
+  ClipboardList,
+  Hand,
+  LoaderCircle,
+  RotateCcw,
+  Send,
+  Undo2,
+  X,
+  XCircle,
+  type LucideIcon,
+} from 'lucide-react';
+import {
+  buildGroupChatItems,
+  collectTimelineTitles,
+  inferLegacyHandoff,
+  type GroupChatItem,
+  type TeamHandoff,
+  type TeamTaskTimelineEntry,
+} from './groupChatTimeline';
+import { groupByWorkflowRun, type WorkflowRunGroup } from './runGrouping';
+import { isWorkflowRunEnded, type WorkflowStatus } from './workflowTypes';
+import { RunGroupHeader } from './RunGroupHeader';
 
 type TeamMembersPanelProps = {
   variant: 'compact' | 'expanded';
   members: TeamMember[];
   tasks?: SessionTeamTask[];
+  connectionPresentation?: TeamConnectionPresentation | null;
   selectedMemberId?: string;
   selectedMember?: TeamMember | null;
   activeDetailTab?: TeamDetailTab;
@@ -45,13 +81,14 @@ type TeamMembersPanelProps = {
 
 type GroupMessageItem = { message: Message; event: ParsedTeamEvent };
 
-const GROUP_LEADER_MEMBER_ID = 'team_leader';
+const EMPTY_TIMELINE: TeamTaskTimelineEntry[] = [];
 
 function getGroupMemberIds(members: TeamMember[]): string[] {
   return members.map((member) => member.member_id).filter((memberId) => !isTeamLeaderMember(memberId));
 }
 
 function isGroupMessageItem(item: { message: Message; event: ParsedTeamEvent | null }): item is GroupMessageItem {
+  // P2P-to-user stays visible here. Plain Leader output is shown in this Team's chat instead.
   return item.event !== null && !item.event.isLeaderToUser;
 }
 
@@ -108,6 +145,7 @@ export function TeamMembersPanel({
   variant,
   members,
   tasks = [],
+  connectionPresentation = null,
   selectedMemberId = '',
   selectedMember = null,
   activeDetailTab = 'members',
@@ -117,10 +155,37 @@ export function TeamMembersPanel({
   onDetailTabChange,
 }: TeamMembersPanelProps) {
   const { t } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const messages = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.messages ?? []);
   const teamLeaderMemberIds = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamLeaderMemberIds ?? []);
-  const groupMessages = useMemo(() => buildGroupMessageItems(historyMessages, messages), [historyMessages, messages]);
+  const teamTaskTimeline = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTaskTimeline ?? EMPTY_TIMELINE);
+  const taskTitles = useMemo(() => {
+    const titles = collectTimelineTitles(teamTaskTimeline);
+    tasks.forEach((task) => {
+      if (task.title) titles.set(task.task_id, task.title);
+    });
+    return titles;
+  }, [tasks, teamTaskTimeline]);
+  const groupItems = useMemo(
+    () =>
+      buildGroupChatItems(
+        buildGroupMessageItems(historyMessages, messages).map((item) => {
+          const timestamp = getGroupMessageTime(item);
+          const { event } = item;
+          // 老历史的模板交接没有 handoff 字段，按同成员 task.started 推断交接的是哪个任务。
+          const needsInference = !event.handoff && !event.content.trim() && event.isP2P;
+          const handoff = needsInference ? inferLegacyHandoff(event.toMember, timestamp, teamTaskTimeline) : undefined;
+          return { message: handoff ? { ...item, event: { ...event, handoff } } : item, timestamp };
+        }),
+        teamTaskTimeline,
+      ),
+    [historyMessages, messages, teamTaskTimeline],
+  );
+  const groupMemberNames = [t('team.leader'), ...getGroupMemberIds(members).map(getMemberDisplayName)].join(
+    t('team.memberSeparator'),
+  );
+  // 群聊头像：文字取本地化群聊名的首字符（getSkillAvatar 的配色也按同一名字哈希），随语言切换
+  const groupAvatar = getSkillAvatar(t('team.groupChat'));
   const visibleMembers = useMemo(
     () => members.filter((member) => !isLeaderMember(member, teamLeaderMemberIds)),
     [members, teamLeaderMemberIds],
@@ -139,6 +204,12 @@ export function TeamMembersPanel({
     });
     return progress;
   }, [tasks, visibleMembers]);
+  // 镜像的 swarmflow worker 按 run 分组展示；真实队友（无 workflow_run_id）平铺。
+  const workflowRuns = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.workflowRuns ?? []);
+  const memberRunGroups = useMemo(
+    () => groupByWorkflowRun(visibleMembers, workflowRuns),
+    [visibleMembers, workflowRuns],
+  );
 
   if (variant === 'compact') {
     return (
@@ -164,15 +235,20 @@ export function TeamMembersPanel({
               {t('team.noMemberData')}
             </div>
           ) : (
-            visibleMembers.map((member) => (
-              <MemberListItem
-                key={member.member_id}
-                member={member}
-                compact
-                taskProgress={memberTaskProgress[member.member_id]}
-                onClick={() => onMemberClick?.(member.member_id)}
-              />
-            ))
+            <MemberRunGroupedList
+              ungrouped={memberRunGroups.ungrouped}
+              groups={memberRunGroups.groups}
+              renderRow={(member) => (
+                <MemberListItem
+                  key={member.member_id}
+                  member={member}
+                  compact
+                  showIdleStatus={shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation)}
+                  taskProgress={memberTaskProgress[member.member_id]}
+                  onClick={() => onMemberClick?.(member.member_id)}
+                />
+              )}
+            />
           )}
         </div>
       </div>
@@ -185,41 +261,67 @@ export function TeamMembersPanel({
       data-testid="team-area-members-panel"
       data-variant="expanded"
     >
-      {activeDetailTab === 'members' && (
-        <aside
-          className="w-[240px] shrink-0 overflow-y-auto border-r border-border bg-card"
-          data-testid="team-area-members-sidebar"
-        >
-          <div className="px-[24px] pt-[24px]">
-            <DetailTabSwitch activeTab={activeDetailTab} onChange={onDetailTabChange} />
-          </div>
+      <aside
+        className="w-[240px] shrink-0 overflow-y-auto border-r border-border bg-card"
+        data-testid="team-area-members-sidebar"
+      >
+        <div className="px-[24px] pt-[24px]">
+          <DetailTabSwitch activeTab={activeDetailTab} onChange={onDetailTabChange} />
+        </div>
 
-          <div className="space-y-3 px-[24px] py-4" data-testid="team-area-members-sidebar-list">
-            {visibleMembers.length === 0 ? (
-              <div className="py-10 text-center text-sm text-text-muted" data-testid="team-area-members-sidebar-empty">
-                {t('team.noMemberData')}
+        <div className="space-y-3 px-[24px] py-4" data-testid="team-area-members-sidebar-list">
+          {activeDetailTab === 'group' ? (
+            <div
+              className="flex w-full items-center gap-3 rounded-md border border-transparent bg-[var(--color-tool-tab-active-bg)] px-[8px] py-[9px] text-left"
+              data-testid="team-area-member-item"
+              data-variant="group-chat"
+            >
+              <div className="relative shrink-0" data-testid="team-area-member-item-avatar">
+                <span
+                  className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-full text-sm font-semibold"
+                  style={groupAvatar.style}
+                >
+                  {groupAvatar.firstChar}
+                </span>
               </div>
-            ) : (
-              visibleMembers.map((member) => (
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-semibold text-text" data-testid="team-area-member-item-name">
+                    {t('team.groupChat')}
+                  </span>
+                </div>
+                <div
+                  className="mt-0.5 truncate text-xs text-[var(--color-team-member-item-id-text)]"
+                  data-testid="team-area-member-item-id"
+                >
+                  {groupMemberNames}
+                </div>
+              </div>
+            </div>
+          ) : visibleMembers.length === 0 ? (
+            <div className="py-10 text-center text-sm text-text-muted" data-testid="team-area-members-sidebar-empty">
+              {t('team.noMemberData')}
+            </div>
+          ) : (
+            <MemberRunGroupedList
+              ungrouped={memberRunGroups.ungrouped}
+              groups={memberRunGroups.groups}
+              renderRow={(member) => (
                 <MemberListItem
                   key={member.member_id}
                   member={member}
                   selected={visibleSelectedMember?.member_id === member.member_id}
+                  showIdleStatus={shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation)}
                   onClick={() => onSelectMember?.(member.member_id)}
                 />
-              ))
-            )}
-          </div>
-        </aside>
-      )}
+              )}
+            />
+          )}
+        </div>
+      </aside>
 
       {activeDetailTab === 'group' ? (
-        <GroupChatDetail
-          items={groupMessages}
-          members={members}
-          activeTab={activeDetailTab}
-          onTabChange={onDetailTabChange}
-        />
+        <GroupChatDetail items={groupItems} taskTitles={taskTitles} />
       ) : visibleSelectedMember ? (
         <MemberTaskDetail
           member={visibleSelectedMember}
@@ -231,6 +333,7 @@ export function TeamMembersPanel({
         <MemberOverviewPanel
           members={visibleMembers}
           tasks={tasks}
+          connectionPresentation={connectionPresentation}
           historyMessages={historyMessages}
           onMemberClick={(memberId) => onSelectMember?.(memberId)}
         />
@@ -273,36 +376,10 @@ function DetailTabSwitch({
   );
 }
 
-function GroupChatDetail({
-  items,
-  members,
-  activeTab,
-  onTabChange,
-}: {
-  items: GroupMessageItem[];
-  members: TeamMember[];
-  activeTab: TeamDetailTab;
-  onTabChange?: (tab: TeamDetailTab) => void;
-}) {
+function GroupChatDetail({ items, taskTitles }: { items: GroupChatItem<GroupMessageItem>[]; taskTitles: Map<string, string> }) {
   const { t } = useTranslation();
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
-  const groupMemberIds = getGroupMemberIds(members);
-  const memberNames = [t('team.leader'), ...groupMemberIds.map(getMemberDisplayName)].join(t('team.memberSeparator'));
-  const avatarMemberIds = [GROUP_LEADER_MEMBER_ID, ...groupMemberIds];
-  const memberNamesRef = useRef<HTMLDivElement>(null);
-  const [memberNamesTruncated, setMemberNamesTruncated] = useState(false);
-  const { tooltip: memberNamesTooltip, handlers: memberNamesTooltipHandlers } = useAdaptiveTooltip();
-
-  useLayoutEffect(() => {
-    const element = memberNamesRef.current;
-    if (!element) return;
-    const checkOverflow = () => setMemberNamesTruncated(element.scrollWidth > element.clientWidth);
-    checkOverflow();
-    const observer = new ResizeObserver(checkOverflow);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [memberNames]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -321,36 +398,6 @@ function GroupChatDetail({
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-card" data-testid="team-area-group-chat">
       <div
-        className="flex shrink-0 items-center justify-between gap-5 border-b border-border bg-card px-[24px] pt-[22px] pb-[24px]"
-        data-testid="team-area-group-chat-section"
-      >
-        <div className="w-[192px] shrink-0">
-          <DetailTabSwitch activeTab={activeTab} onChange={onTabChange} />
-        </div>
-        <div className="flex min-w-0 items-center justify-end gap-3">
-          <div className="min-w-0 text-right">
-            <div className="text-base font-semibold text-text" data-testid="team-area-group-chat-title">
-              {t('team.groupChat')}
-            </div>
-            <div
-              ref={memberNamesRef}
-              className="mt-1 truncate text-xs text-text-muted"
-              data-testid="team-area-group-chat-member-names"
-              data-tooltip={memberNamesTruncated ? memberNames : undefined}
-              tabIndex={memberNamesTruncated ? 0 : undefined}
-              {...memberNamesTooltipHandlers}
-            >
-              {memberNames}
-            </div>
-          </div>
-          <div className="flex -space-x-2" data-testid="team-area-group-chat-avatar-stack">
-            <GroupAvatarStack memberIds={avatarMemberIds} />
-          </div>
-        </div>
-      </div>
-
-      {memberNamesTooltip}
-      <div
         ref={scrollContainerRef}
         className="team-group-chat-message-list min-h-0 flex-1 overflow-y-auto px-7 py-6"
         onScroll={handleScroll}
@@ -365,9 +412,17 @@ function GroupChatDetail({
           </div>
         ) : (
           <div className="mx-auto max-w-[820px] space-y-5">
-            {items.map(({ message, event }, index) => (
-              <GroupChatMessage key={`${message.id}-${event.timestamp ?? index}`} event={event} />
-            ))}
+            {items.map((item, index) =>
+              item.kind === 'message' ? (
+                <GroupChatMessage
+                  key={`${item.message.message.id}-${item.message.event.timestamp ?? index}`}
+                  event={item.message.event}
+                  taskTitles={taskTitles}
+                />
+              ) : (
+                <GroupChatTaskEventRow key={item.entries[0].id} type={item.type} entries={item.entries} taskTitles={taskTitles} />
+              ),
+            )}
           </div>
         )}
       </div>
@@ -375,31 +430,16 @@ function GroupChatDetail({
   );
 }
 
-function GroupAvatarStack({ memberIds }: { memberIds: string[] }) {
-  const visibleMemberIds = memberIds.length > 3 ? memberIds.slice(0, 2) : memberIds;
-  const hiddenCount = memberIds.length - visibleMemberIds.length;
-
-  return (
-    <>
-      {visibleMemberIds.map((memberId) => (
-        <TeamMemberAvatar key={memberId} member={memberId} className="!h-7 !w-7 ring-2 ring-card" />
-      ))}
-      {hiddenCount > 0 && (
-        <span
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--color-team-overflow-surface)] text-xs font-medium text-accent ring-2 ring-card"
-          data-testid="team-area-group-chat-avatar-overflow"
-        >
-          +{hiddenCount}
-        </span>
-      )}
-    </>
-  );
-}
-
-function GroupChatMessage({ event }: { event: ParsedTeamEvent }) {
+function GroupChatMessage({ event, taskTitles }: { event: ParsedTeamEvent; taskTitles: Map<string, string> }) {
   const { t } = useTranslation();
   const displayName = getMemberDisplayName(event.fromMember);
   const isUser = isUserMember(event.fromMember);
+
+  // 模板交接消息正文为空；老历史里的这类消息没有 handoff 字段，退化为通用调度行，
+  // 也比一个只有 @ 的空白气泡强。
+  if (!event.content.trim() && (event.handoff || event.isP2P || event.isBroadcast)) {
+    return <GroupChatHandoffRow event={event} handoff={event.handoff ?? { kind: 'other' }} taskTitles={taskTitles} />;
+  }
 
   return (
     <div className={`flex items-start gap-3 ${isUser ? 'justify-end' : ''}`}>
@@ -441,14 +481,161 @@ function GroupChatMessage({ event }: { event: ParsedTeamEvent }) {
   );
 }
 
+function resolveTaskTitle(taskId: string | undefined, taskTitles: Map<string, string>, fallback?: string): string {
+  if (!taskId) return fallback || '';
+  return taskTitles.get(taskId) || fallback || '';
+}
+
+function GroupChatTaskRef({ taskId, title }: { taskId?: string; title?: string }) {
+  const { t } = useTranslation();
+  if (!taskId && !title) return null;
+  return (
+    <span className="min-w-0 truncate text-text" title={taskId} data-testid="team-area-group-chat-task-ref">
+      「{title || t('team.groupChatTimeline.taskFallback', { id: taskId })}」
+    </span>
+  );
+}
+
+/** 系统行外框：与消息正文列左对齐（头像 32px + 间距 12px），弱化为辅助信息。 */
+function GroupChatSystemRow({
+  icon: Icon,
+  testId,
+  variant,
+  children,
+}: {
+  icon: LucideIcon;
+  testId: string;
+  variant: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className="flex min-w-0 items-center gap-1.5 pl-11 text-xs leading-5 text-text-muted"
+      data-testid={testId}
+      data-variant={variant}
+    >
+      <Icon size={13} className="shrink-0" aria-hidden="true" />
+      {children}
+    </div>
+  );
+}
+
+function handoffLabel(t: TFunction, handoff: TeamHandoff): string {
+  if (handoff.kind === 'rework' && handoff.max_rounds) {
+    return t('team.groupChatTimeline.handoff.rework_with_limit', { max: handoff.max_rounds });
+  }
+  return t(`team.groupChatTimeline.handoff.${handoff.kind}`, {
+    defaultValue: t('team.groupChatTimeline.handoff.other'),
+  });
+}
+
+/**
+ * 调度器以 leader 身份投递的模板交接消息（content 为空，正文在收件人投递时才渲染），
+ * 在群聊里渲染成一行调度系统消息，而不是 leader 的空白聊天气泡。
+ */
+function GroupChatHandoffRow({
+  event,
+  handoff,
+  taskTitles,
+}: {
+  event: ParsedTeamEvent;
+  handoff: TeamHandoff;
+  taskTitles: Map<string, string>;
+}) {
+  const { t } = useTranslation();
+  const target = event.isBroadcast ? t('team.allMembers') : event.toMember ? getMemberDisplayName(event.toMember) : '';
+
+  return (
+    <GroupChatSystemRow icon={Send} testId="team-area-group-chat-handoff" variant={handoff.kind}>
+      <span className="shrink-0">{t('team.groupChatTimeline.scheduler')}</span>
+      {target && (
+        <span className="team-event-group-chip team-event-group-chip--p2p shrink-0 !mr-0">@{target}</span>
+      )}
+      <span className="shrink-0 font-medium text-text">{handoffLabel(t, handoff)}</span>
+      <GroupChatTaskRef
+        taskId={handoff.task_id}
+        title={resolveTaskTitle(handoff.task_id, taskTitles, handoff.task_title)}
+      />
+    </GroupChatSystemRow>
+  );
+}
+
+const TASK_EVENT_ICONS: Record<string, LucideIcon> = {
+  'team.task.created': ClipboardList,
+  'team.task.claimed': Hand,
+  'team.task.submitted_for_review': Send,
+  'team.task.verified': CheckCircle2,
+  'team.task.revision_requested': RotateCcw,
+  'team.task.completed': CheckCircle2,
+  'team.task.cancelled': XCircle,
+  'team.task.released': Undo2,
+  'team.task.revoked': Undo2,
+};
+
+/** 有执行者的事件：有成员时写「成员 + 动作」，没有时退回被动句。 */
+const ACTOR_TASK_EVENTS = new Set(['team.task.claimed', 'team.task.submitted_for_review', 'team.task.completed']);
+
+function GroupChatTaskEventRow({
+  type,
+  entries,
+  taskTitles,
+}: {
+  type: string;
+  entries: TeamTaskTimelineEntry[];
+  taskTitles: Map<string, string>;
+}) {
+  const { t } = useTranslation();
+  const action = type.replace(/^team\.task\./, '');
+  const icon = TASK_EVENT_ICONS[type] ?? ClipboardList;
+
+  if (type === 'team.task.created') {
+    const titles = entries.map((entry) => resolveTaskTitle(entry.task_id, taskTitles, entry.title) || entry.task_id);
+    return (
+      <GroupChatSystemRow icon={icon} testId="team-area-group-chat-task-event" variant={action}>
+        <span className="shrink-0">{t('team.leader')}</span>
+        <span className="shrink-0">
+          {entries.length > 1
+            ? t('team.groupChatTimeline.taskEvents.createdMany', { count: entries.length })
+            : t('team.groupChatTimeline.taskEvents.created')}
+        </span>
+        <span className="min-w-0 truncate text-text" title={titles.join('\n')}>
+          {titles.map((title) => `「${title}」`).join('')}
+        </span>
+      </GroupChatSystemRow>
+    );
+  }
+
+  const entry = entries[0];
+  const member = entry.member_id ? getMemberDisplayName(entry.member_id) : '';
+  const hasActor = ACTOR_TASK_EVENTS.has(type) && Boolean(member);
+  let text: string;
+  if (hasActor) {
+    text = t(`team.groupChatTimeline.taskEvents.${action}`);
+  } else if (ACTOR_TASK_EVENTS.has(type)) {
+    text = t(`team.groupChatTimeline.taskEvents.${action}Passive`);
+  } else {
+    text = t(`team.groupChatTimeline.taskEvents.${action}`);
+  }
+
+  return (
+    <GroupChatSystemRow icon={icon} testId="team-area-group-chat-task-event" variant={action}>
+      {hasActor && <span className="shrink-0">{member}</span>}
+      <span className="shrink-0">{text}</span>
+      <GroupChatTaskRef taskId={entry.task_id} title={resolveTaskTitle(entry.task_id, taskTitles, entry.title)} />
+    </GroupChatSystemRow>
+  );
+}
+
 function MemberOverviewPanel({
   members,
   tasks,
+  connectionPresentation,
   historyMessages,
   onMemberClick,
 }: {
   members: TeamMember[];
   tasks: SessionTeamTask[];
+  connectionPresentation: TeamConnectionPresentation | null;
   historyMessages?: Message[];
   onMemberClick: (memberId: string) => void;
 }) {
@@ -472,6 +659,7 @@ function MemberOverviewPanel({
                 member={member}
                 sequence={index + 1}
                 tasks={tasks}
+                connectionPresentation={connectionPresentation}
                 historyMessages={historyMessages}
                 onClick={() => onMemberClick(member.member_id)}
               />
@@ -487,17 +675,19 @@ const TeamMemberOverviewCard = memo(function TeamMemberOverviewCard({
   member,
   sequence,
   tasks,
+  connectionPresentation,
   historyMessages = [],
   onClick,
 }: {
   member: TeamMember;
   sequence: number;
   tasks?: SessionTeamTask[];
+  connectionPresentation: TeamConnectionPresentation | null;
   historyMessages?: Message[];
   onClick?: () => void;
 }) {
   const { t } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const todos = useTodoStore((s) => s.runtimes[activeSessionId ?? '']?.todos ?? []);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTaskEvents ?? []);
   const teamMemberExecutionEvents = useSessionStore(
@@ -523,25 +713,20 @@ const TeamMemberOverviewCard = memo(function TeamMemberOverviewCard({
   const displayName = getMemberDisplayName(member);
   const statusKey = getMemberStatusKey(member);
   const isRunning = statusKey === 'running';
-  const statusIcon = isRunning ? (
-    <svg className="w-4 h-4 text-info animate-spin shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 2v4" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m16.2 7.8 2.9-2.9" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 12h4" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m16.2 16.2 2.9 2.9" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 18v4" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m4.9 19.1 2.9-2.9" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2 12h4" />
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="m4.9 4.9 2.9 2.9" />
-    </svg>
+  const showIdleStatus = shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation);
+  const statusIcon = isRunning && !showIdleStatus ? (
+    <LoadingSpinner />
   ) : (
-    <PendingIcon className="w-4 h-4 shrink-0 text-text-muted" />
+    <FrameTimeIcon className="w-4 h-4 shrink-0 text-text-meta" />
   );
 
   return (
     <MemberOverviewCard
       memberId={member.member_id}
+      avatarKey={getMemberAvatarKey(member)}
+      avatarIdentity={getMemberAvatarIdentity(member)}
       displayName={displayName}
+      expertHint={getMemberExpertHint(member)}
       sequence={sequence}
       statusIcon={statusIcon}
       onClick={onClick}
@@ -576,7 +761,7 @@ function MemberTaskDetail({
       document.removeEventListener('mousedown', handlePointerDown);
     };
   }, [taskListExpanded]);
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const todos = useTodoStore((s) => s.runtimes[activeSessionId ?? '']?.todos ?? []);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTaskEvents ?? []);
   const teamMemberExecutionEvents = useSessionStore(
@@ -663,9 +848,7 @@ function MemberTaskDetail({
           }}
         />
         {memberTasks.length > 0 ? (
-          <div
-            data-testid="team-area-member-detail-footer"
-          >
+          <div data-testid="team-area-member-detail-footer">
             <MemberTaskListBar
               tasks={memberTasks}
               expanded={taskListExpanded}
@@ -689,6 +872,7 @@ function TeamMemberContextCompressionBar({
   const { t } = useTranslation();
   const runtime = state?.runtime;
   const summary = state?.summary;
+  const runningElapsedSeconds = useContextCompressionElapsed(runtime);
   const summaryItems = (summary?.summaries ?? []).filter(Boolean);
   const showSummaryDetails = summaryItems.length > 0;
 
@@ -699,11 +883,17 @@ function TeamMemberContextCompressionBar({
   const status = runtime?.status;
   const isRunning = status === 'running';
   const isFailed = status === 'failed';
+  // 用户暂停/取消：SDK 发 cancelled/paused，按中性终态呈现（可关闭、不红色、无转圈）。
+  const isInterrupted = status === 'cancelled' || status === 'paused';
   let statusTitle = t('team.contextCompression.completed', { count: summary?.count || 1 });
   if (isRunning) {
     statusTitle = t('team.contextCompression.running');
   } else if (isFailed) {
     statusTitle = t('team.contextCompression.failed');
+  } else if (isInterrupted) {
+    statusTitle = status === 'paused'
+      ? t('team.contextCompression.paused')
+      : t('team.contextCompression.cancelled');
   }
   const detailsTitle = showSummaryDetails
     ? summaryItems.map((item, index) => `${index + 1}. ${item}`).join('\n')
@@ -754,6 +944,14 @@ function TeamMemberContextCompressionBar({
             {isRunning ? contextCompressionRunningText(t, runtime?.processor, runtime.summary) : runtime.summary}
           </span>
         )}
+        {isRunning && runningElapsedSeconds !== undefined && (
+          <span
+            className="team-event-group-summary__activity context-compression-elapsed"
+            data-testid="team-area-context-compression-elapsed"
+          >
+            {contextCompressionElapsedText(t, runningElapsedSeconds)}
+          </span>
+        )}
         {!isRunning && (
           <button
             type="button"
@@ -778,11 +976,11 @@ function FinalSummaryList({ events }: { events: TeamMemberExecutionEvent[] }) {
 
   return (
     <div className="mt-5 border-t border-[var(--color-team-detail-divider)] pt-4" data-testid="team-area-final-summary">
-      <div className="mt-4 space-y-6">
+      <div className="mt-4">
         {events.map((event) => (
           <section
             key={event.id}
-            className="space-y-3"
+            className="my-4 space-y-3"
             data-testid="team-area-final-summary-item"
             data-variant={event.id}
           >
@@ -799,3 +997,44 @@ function FinalSummaryList({ events }: { events: TeamMemberExecutionEvent[] }) {
   );
 }
 
+/**
+ * 成员列表的运行分组渲染：无 run 的成员平铺，镜像 worker 按 run 分组，
+ * 每组前插共享 RunGroupHeader。行内容（MemberListItem 的具体 props）由调用方决定。
+ */
+function MemberRunGroupedList({
+  ungrouped,
+  groups,
+  renderRow,
+}: {
+  ungrouped: TeamMember[];
+  groups: WorkflowRunGroup<TeamMember>[];
+  renderRow: (member: TeamMember) => ReactNode;
+}) {
+  // 一个会话能攒好几个 run、每个 run 十几二十个 worker，全部平铺太长：
+  // 每个组头给一个展开/收起，默认展开还在跑的、收起已结束的。
+  const [collapsedRuns, setCollapsedRuns] = useState<Record<string, boolean>>({});
+  return (
+    <>
+      {ungrouped.map(renderRow)}
+      {groups.map((group) => {
+        const collapsed = collapsedRuns[group.runId] ?? isWorkflowRunEnded(group.status as WorkflowStatus);
+        return (
+          <div key={group.runId}>
+            <RunGroupHeader
+              name={group.name}
+              shortId={group.shortId}
+              status={group.status}
+              runId={group.runId}
+              executor={group.executor}
+              collapsed={collapsed}
+              onToggle={() =>
+                setCollapsedRuns((prev) => ({ ...prev, [group.runId]: !collapsed }))
+              }
+            />
+            {!collapsed && group.items.map(renderRow)}
+          </div>
+        );
+      })}
+    </>
+  );
+}

@@ -2445,6 +2445,59 @@ test('provisional inference projects running lifecycle without a fabricated end 
   assert.equal(request.completedAt, null);
 });
 
+function setDoubleAttribute(span, key, value) {
+  const current = span.attributes.find(attribute => attribute.key === key);
+  if (current === undefined) {
+    span.attributes.push({ key, value: { doubleValue: value } });
+    return;
+  }
+  current.value = { doubleValue: value };
+}
+
+function firstInferenceSpan(records) {
+  return spansOf(records).find(span => span.attributes.some(attribute => (
+    attribute.key === 'openjiuwen.trajectory.record.kind'
+      && attribute.value.stringValue === 'inference'
+  )));
+}
+
+test('assistant timing prefers time to first token over a framing-only first chunk', async () => {
+  const records = await fixtureRecords('standard-records.json');
+  const inferenceSpan = firstInferenceSpan(records);
+  assert.ok(inferenceSpan);
+  setDoubleAttribute(inferenceSpan, GEN_AI_ATTRIBUTES.GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, 0.28);
+  setDoubleAttribute(inferenceSpan, 'openjiuwen.gen_ai.response.time_to_first_token_ms', 4000);
+  setDoubleAttribute(inferenceSpan, 'openjiuwen.gen_ai.response.time_to_first_byte_ms', 150);
+  setIntAttribute(inferenceSpan, 'openjiuwen.request.retry_count', 1);
+  const identity = `${inferenceSpan.traceId}:${inferenceSpan.spanId}`;
+
+  const assistant = cellsOf(projectOtelTrajectory(records))
+    .find(cell => cell.recordId === `${identity}:assistant`);
+
+  assert.ok(assistant);
+  const metrics = assistant.assistantMetrics;
+  assert.equal(metrics.firstTokenTime - metrics.stepStartTime, 4000);
+  assert.equal(metrics.firstByteTime - metrics.stepStartTime, 150);
+  assert.equal(metrics.retryCount, 1);
+});
+
+test('assistant timing falls back to the first chunk when time to first token is absent', async () => {
+  const records = await fixtureRecords('standard-records.json');
+  const inferenceSpan = firstInferenceSpan(records);
+  assert.ok(inferenceSpan);
+  setDoubleAttribute(inferenceSpan, GEN_AI_ATTRIBUTES.GEN_AI_RESPONSE_TIME_TO_FIRST_CHUNK, 0.5);
+  const identity = `${inferenceSpan.traceId}:${inferenceSpan.spanId}`;
+
+  const assistant = cellsOf(projectOtelTrajectory(records))
+    .find(cell => cell.recordId === `${identity}:assistant`);
+
+  assert.ok(assistant);
+  const metrics = assistant.assistantMetrics;
+  assert.equal(metrics.firstTokenTime - metrics.stepStartTime, 500);
+  assert.equal(metrics.firstByteTime, null);
+  assert.equal(metrics.retryCount, null);
+});
+
 test('every inference keeps an independent request identity inside a shared step', async () => {
   const records = await fixtureRecords('agent-loop-records.json');
   for (const record of records) {
@@ -2680,6 +2733,125 @@ function turnSpanRecord({ attributes, name, spanId, startTimeUnixNano, traceId }
     }],
   };
 }
+
+test('schema-v2 events in one shared trace land on the turns they state', () => {
+  const traceId = '8'.repeat(32);
+  const first = v2Record({
+    eventId: 'event-shared-first',
+    sequence: 1,
+    traceId,
+    turn: 1,
+    turnId: 'member-turn-first',
+    payload: contextCommit('window-shared-first', null, [
+      contextMessage('message-shared-first', 'user', 'first task'),
+    ], []),
+  });
+  const second = v2Record({
+    eventId: 'event-shared-second',
+    sequence: 2,
+    traceId,
+    turn: 2,
+    turnId: 'member-turn-second',
+    payload: contextCommit('window-shared-second', 'window-shared-first', [
+      contextMessage('message-shared-first', 'user', 'first task'),
+      contextMessage('message-shared-second', 'user', 'second task'),
+    ], [
+      { op: 'insert', message_id: 'message-shared-second', index: 1, message: contextMessage('message-shared-second', 'user', 'second task') },
+    ]),
+  });
+
+  const snapshot = projectOtelTrajectory([first, second]);
+
+  assert.deepEqual(snapshot.turns.map(turn => turn.turn), [1, 2]);
+});
+
+test('a team lane splits one shared trace into the member turns its spans state', () => {
+  // A Team run keeps one trace for every member, and a member takes on several
+  // turns inside it. Each round's spans state their own turn, and a span that
+  // states none (a tool under the step) belongs to the turn of its ancestor.
+  const traceId = '7'.repeat(32);
+  const member = [
+    v2Attribute('gen_ai.conversation.id', 'team-session'),
+    v2Attribute('openjiuwen.execution.subject.id', 'team-member:team-session:alpha:researcher'),
+    v2Attribute('openjiuwen.execution.subject.kind', 'team_member'),
+  ];
+  const memberRound = (index, turnId, startTimeUnixNano) => {
+    const turn = [
+      v2Attribute('openjiuwen.turn.id', turnId),
+      v2Attribute('openjiuwen.turn.number', index, true),
+    ];
+    const roundSpanId = `a${index}`.padEnd(16, '0');
+    const stepSpanId = `b${index}`.padEnd(16, '0');
+    const round = turnSpanRecord({
+      name: `agent.researcher.task_iteration.${index}`,
+      spanId: roundSpanId,
+      startTimeUnixNano,
+      traceId,
+      attributes: [...member, ...turn, v2Attribute('openjiuwen.trajectory.record.kind', 'agent')],
+    });
+    round.resourceSpans[0].scopeSpans[0].spans[0].parentSpanId = 'f'.repeat(16);
+    const step = turnSpanRecord({
+      name: 'agent.researcher.react_iteration.1',
+      spanId: stepSpanId,
+      startTimeUnixNano: startTimeUnixNano + 10,
+      traceId,
+      attributes: [
+        ...member,
+        ...turn,
+        v2Attribute('openjiuwen.trajectory.record.kind', 'step'),
+        v2Attribute('openjiuwen.step.number', 1, true),
+      ],
+    });
+    step.resourceSpans[0].scopeSpans[0].spans[0].parentSpanId = roundSpanId;
+    const inference = turnSpanRecord({
+      name: 'llm.call',
+      spanId: `c${index}`.padEnd(16, '0'),
+      startTimeUnixNano: startTimeUnixNano + 20,
+      traceId,
+      attributes: [
+        ...member,
+        ...turn,
+        v2Attribute('openjiuwen.trajectory.record.kind', 'inference'),
+        v2Attribute('openjiuwen.step.number', 1, true),
+        v2Attribute('openjiuwen.inference.id', `inference-round-${index}`),
+        v2Attribute('gen_ai.output.messages', JSON.stringify([
+          structuredMessage('assistant', `round ${index} answer`),
+        ])),
+      ],
+    });
+    inference.resourceSpans[0].scopeSpans[0].spans[0].parentSpanId = stepSpanId;
+    // States no turn of its own: only its ancestry places it.
+    const tool = turnSpanRecord({
+      name: 'execute_tool search',
+      spanId: `d${index}`.padEnd(16, '0'),
+      startTimeUnixNano: startTimeUnixNano + 30,
+      traceId,
+      attributes: [
+        ...member,
+        v2Attribute('openjiuwen.trajectory.record.kind', 'tool'),
+        v2Attribute('gen_ai.operation.name', 'execute_tool'),
+        v2Attribute('gen_ai.tool.name', 'search'),
+        v2Attribute('gen_ai.tool.call.result', `round ${index} result`),
+        v2Attribute('openjiuwen.step.number', 1, true),
+      ],
+    });
+    tool.resourceSpans[0].scopeSpans[0].spans[0].parentSpanId = stepSpanId;
+    return [round, step, inference, tool];
+  };
+
+  const snapshot = projectOtelTrajectory([
+    ...memberRound(1, 'member-turn-first', 1_000_000),
+    ...memberRound(2, 'member-turn-second', 2_000_000),
+  ]);
+
+  assert.deepEqual(snapshot.turns.map(turn => turn.turn), [1, 2]);
+  const cellText = turn => JSON.stringify(turn.groups.flatMap(group => group.cells));
+  assert.match(cellText(snapshot.turns[0]), /round 1 answer/);
+  assert.match(cellText(snapshot.turns[0]), /round 1 result/);
+  assert.doesNotMatch(cellText(snapshot.turns[0]), /round 2/);
+  assert.match(cellText(snapshot.turns[1]), /round 2 answer/);
+  assert.match(cellText(snapshot.turns[1]), /round 2 result/);
+});
 
 test('a resumed tool rejoins the step the interrupt paused', () => {
   // The interrupt pauses step 4; the resume finishes that step's tool work in
@@ -3168,6 +3340,28 @@ test('content the store no longer holds is told apart from a silent model', () =
   );
 });
 
+test('an inference rebuilt without its request is told apart from a silent model', () => {
+  const record = legacyInferenceRecord({
+    output: 'never rebuilt',
+    requestNumber: 1,
+    spanId: 'e'.repeat(16),
+    startTimeUnixNano: 1_000_000,
+    stepId: 'step-1',
+    stepNumber: 1,
+  });
+  // A harness whose request logs never arrived reports the reply alone; here
+  // it had not yet seen any of the reply's content.
+  const attributes = record.resourceSpans[0].scopeSpans[0].spans[0].attributes;
+  const output = attributes.find(entry => entry.key === 'gen_ai.output.messages');
+  output.value = { stringValue: JSON.stringify([{ role: 'assistant', parts: [] }]) };
+  attributes.push({ key: 'openjiuwen.inference.input_observed', value: { boolValue: false } });
+
+  const assistant = cellsOf(projectOtelTrajectory([record])).find(cell => cell.kind === 'message');
+
+  assert.equal(assistant.text, 'Output not observed (request logs did not arrive)');
+  assert.equal(assistant.assistantMetrics.inputObserved, false);
+});
+
 test('a resumed run does not present the messages it resumed with as newly said', () => {
   // A restart commits a baseline: the whole window, not the change. Every
   // message the run resumed with is in it, so without comparing against the
@@ -3236,4 +3430,209 @@ test('tool payload stays as recorded when the wrapper is not an invocation signa
   const cell = cellsOf(projectOtelTrajectory(records)).find(candidate => candidate.kind === 'tool');
   assert.ok(cell);
   assert.deepEqual(JSON.parse(cell.inputDetail), [[{ command: 'pwd' }], { user: 'u1' }]);
+});
+
+test('a turn that failed before its first model call is still drawn, with its reason', () => {
+  // An external CLI member throttled at the gateway never reaches a model
+  // call, so the turn records nothing but the span it ran on. Dropping it
+  // left the turn numbers around it skipping, with no sign a turn had run.
+  const traceId = '5'.repeat(32);
+  const member = [
+    v2Attribute('gen_ai.conversation.id', 'team-session'),
+    v2Attribute('openjiuwen.execution.subject.id', 'team-member:team-session:alpha:codex-coder'),
+    v2Attribute('openjiuwen.execution.subject.kind', 'team_member'),
+  ];
+  const failed = turnSpanRecord({
+    name: 'invoke_agent Codex',
+    spanId: 'a1'.padEnd(16, '0'),
+    startTimeUnixNano: 1_000_000_000,
+    traceId,
+    attributes: [
+      ...member,
+      v2Attribute('openjiuwen.turn.id', 'turn-failed'),
+      v2Attribute('openjiuwen.turn.number', 1, true),
+      v2Attribute('openjiuwen.trajectory.record.kind', 'turn'),
+      v2Attribute('openjiuwen.trace.root', 'true'),
+      v2Attribute('gen_ai.operation.name', 'invoke_agent'),
+      v2Attribute('openjiuwen.span.input', '<team-inbound from="team-leader">start</team-inbound>'),
+    ],
+  });
+  failed.resourceSpans[0].scopeSpans[0].spans[0].status = {
+    code: 2,
+    message: 'exceeded retry limit, last status: 429 Too Many Requests',
+  };
+  const answered = turnSpanRecord({
+    name: 'llm.call',
+    spanId: 'b2'.padEnd(16, '0'),
+    startTimeUnixNano: 2_000_000_000,
+    traceId,
+    attributes: [
+      ...member,
+      v2Attribute('openjiuwen.turn.id', 'turn-answered'),
+      v2Attribute('openjiuwen.turn.number', 2, true),
+      v2Attribute('openjiuwen.trajectory.record.kind', 'inference'),
+      v2Attribute('openjiuwen.step.number', 1, true),
+      v2Attribute('openjiuwen.inference.id', 'inference-answered'),
+      v2Attribute('gen_ai.output.messages', JSON.stringify([structuredMessage('assistant', 'done')])),
+    ],
+  });
+
+  const snapshot = projectOtelTrajectory([failed, answered]);
+
+  assert.deepEqual(snapshot.turns.map(turn => turn.turn), [1, 2]);
+  const cells = snapshot.turns[0].groups.flatMap(group => group.cells);
+  assert.deepEqual(cells.map(cell => cell.kind), ['user', 'message']);
+  assert.equal(cells[0].text, '<team-inbound from="team-leader">start</team-inbound>');
+  assert.equal(cells[1].status, 'error');
+  assert.equal(cells[1].text, 'exceeded retry limit, last status: 429 Too Many Requests');
+});
+
+test('a turn that answered and then failed shows the failure after what it did', () => {
+  // The call the gateway throttled produced no response body, so nothing was
+  // reported for it and no row of this turn carries the failure. A native run
+  // states it on the record that hit it; an external CLI states it only on the
+  // span the turn ran on, which opened with the turn — so the row belongs at
+  // the end, not ahead of everything the turn went on to do.
+  const traceId = '6'.repeat(32);
+  const member = [
+    v2Attribute('gen_ai.conversation.id', 'team-session'),
+    v2Attribute('openjiuwen.execution.subject.id', 'team-member:team-session:alpha:codex-coder'),
+    v2Attribute('openjiuwen.execution.subject.kind', 'team_member'),
+    v2Attribute('openjiuwen.turn.id', 'turn-throttled'),
+    v2Attribute('openjiuwen.turn.number', 1, true),
+  ];
+  const answered = turnSpanRecord({
+    name: 'llm.call',
+    spanId: 'c1'.padEnd(16, '0'),
+    startTimeUnixNano: 1_000_000_000,
+    traceId,
+    attributes: [
+      ...member,
+      v2Attribute('openjiuwen.trajectory.record.kind', 'inference'),
+      v2Attribute('openjiuwen.step.number', 1, true),
+      v2Attribute('openjiuwen.inference.id', 'inference-throttled'),
+      v2Attribute('gen_ai.output.messages', JSON.stringify([structuredMessage('assistant', 'on it')])),
+    ],
+  });
+  const round = turnSpanRecord({
+    name: 'invoke_agent Codex',
+    spanId: 'c2'.padEnd(16, '0'),
+    startTimeUnixNano: 900_000_000,
+    traceId,
+    attributes: [
+      ...member,
+      v2Attribute('openjiuwen.trajectory.record.kind', 'turn'),
+      v2Attribute('openjiuwen.trace.root', 'true'),
+      v2Attribute('gen_ai.operation.name', 'invoke_agent'),
+      v2Attribute('openjiuwen.span.input', '<team-inbound from="team-leader">start</team-inbound>'),
+    ],
+  });
+  const roundSpan = round.resourceSpans[0].scopeSpans[0].spans[0];
+  roundSpan.endTimeUnixNano = String(3_000_000_000);
+  roundSpan.status = { code: 2, message: 'exceeded retry limit, last status: 429 Too Many Requests' };
+
+  const cells = cellsOf(projectOtelTrajectory([round, answered]));
+
+  const failure = cells[cells.length - 1];
+  assert.equal(failure.status, 'error');
+  assert.equal(failure.text, 'exceeded retry limit, last status: 429 Too Many Requests');
+  // The turn already shows what it was handed, on the call that read it.
+  assert.equal(cells.filter(cell => cell.text.startsWith('<team-inbound')).length, 0);
+});
+
+function recordingJsonParse(run) {
+  const parsed = [];
+  const original = JSON.parse;
+  JSON.parse = function recordedParse(text, reviver) {
+    parsed.push(text);
+    return original.call(this, text, reviver);
+  };
+  try {
+    run();
+  } finally {
+    JSON.parse = original;
+  }
+  return parsed;
+}
+
+test('a span that no model call reads never parses the request it restates', () => {
+  const history = JSON.stringify([structuredMessage('user', 'restated history only')]);
+  const tools = JSON.stringify([{ name: 'restated_tool_only', parameters: {} }]);
+  const instructions = JSON.stringify([{ type: 'text', content: 'restated instructions only' }]);
+  const record = {
+    resourceSpans: [{
+      scopeSpans: [{
+        spans: [{
+          traceId: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+          spanId: '0000000000000001',
+          name: 'execute_tool bash',
+          startTimeUnixNano: '1000',
+          endTimeUnixNano: '2000',
+          attributes: [
+            v2Attribute('gen_ai.conversation.id', 'lazy-session'),
+            v2Attribute('gen_ai.tool.name', 'bash'),
+            v2Attribute('gen_ai.input.messages', history),
+            v2Attribute('gen_ai.tool.definitions', tools),
+            v2Attribute('gen_ai.system_instructions', instructions),
+          ],
+        }],
+      }],
+    }],
+  };
+
+  const parsed = recordingJsonParse(() => projectOtelTrajectory([record]));
+
+  assert.equal(parsed.includes(history), false);
+  assert.equal(parsed.includes(tools), false);
+  assert.equal(parsed.includes(instructions), false);
+});
+
+test('model calls restating the same tool list parse it once', () => {
+  const tools = JSON.stringify([{
+    name: 'shared_tool_list_probe',
+    description: 'stated by every call',
+    parameters: { type: 'object' },
+  }]);
+  const records = [1, 2].map(requestNumber => {
+    const record = legacyInferenceRecord({
+      output: `answer ${requestNumber}`,
+      requestNumber,
+      spanId: `000000000000000${requestNumber}`,
+      startTimeUnixNano: requestNumber * 10_000,
+      stepId: `step-${requestNumber}`,
+      stepNumber: requestNumber,
+    });
+    setStringAttribute(spansOf([record])[0], 'gen_ai.tool.definitions', tools);
+    return record;
+  });
+
+  const parsed = recordingJsonParse(() => projectOtelTrajectory(records));
+
+  assert.equal(parsed.filter(text => text === tools).length, 1);
+});
+
+test('projecting a schema-v2 record never reads an attribute it does not use', () => {
+  // A value stated by reference assembles its whole history on each read;
+  // looking up the event kind or subject must not read every other value.
+  let reads = 0;
+  const restated = {};
+  Object.defineProperty(restated, 'stringValue', {
+    enumerable: true,
+    get: () => {
+      reads += 1;
+      return '[]';
+    },
+  });
+  const record = v2Record({
+    eventId: 'event-restated',
+    sequence: 1,
+    payload: contextCommit('window-restated', null, [
+      contextMessage('m1', 'user', 'hello', 'external_user'),
+    ], []),
+  });
+  spansOf([record])[0].attributes.push({ key: 'openjiuwen.test.restated', value: restated });
+
+  projectOtelTrajectory([record], { v2Reducer: createTrajectoryV2Reducer() });
+
+  assert.equal(reads, 0);
 });

@@ -36,12 +36,14 @@ def build_mock_rsi_adapters(
             MockArtifactProvider(root, "program"),
             model_resolver=model_resolver,
             requires_model=False,
+            tasks_root=root,
         ),
         "ARTIFACT:PAPER": ArtifactEngineAdapter(
             "PAPER",
             MockArtifactProvider(root, "paper"),
             model_resolver=model_resolver,
             requires_model=False,
+            tasks_root=root,
         ),
     }
 
@@ -71,14 +73,15 @@ def build_rsi_adapters(
         if "ARTIFACT:PROGRAM" not in adapters:
             # The public ``program_opt.provider`` module is the Protocol;
             # agent-core's concrete implementation is the PUCT provider.
-            from openjiuwen.rsi.artifact_rsi.program_opt import (
-                PuctProgramArtifactProvider,
+            from jiuwenswarm.agents.harness.common.rsi.program_threshold_provider import (
+                ThresholdStoppingProgramProvider,
             )
 
             adapters["ARTIFACT:PROGRAM"] = ArtifactEngineAdapter(
                 "PROGRAM",
-                PuctProgramArtifactProvider(),
+                ThresholdStoppingProgramProvider(),
                 model_resolver=model_resolver,
+                tasks_root=tasks_root,
             )
         if paper_provider is None and "ARTIFACT:PAPER" not in adapters:
             # The implementation is intentionally owned by agent-core.  The
@@ -94,6 +97,7 @@ def build_rsi_adapters(
                 "PAPER",
                 paper_provider,
                 model_resolver=model_resolver,
+                tasks_root=tasks_root,
             )
     if harness_provider is not None:
         adapters["HARNESS"] = HarnessEngineAdapter(harness_provider)

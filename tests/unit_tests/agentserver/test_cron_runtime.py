@@ -1,25 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
+import time
 
 import pytest
+from openjiuwen.harness.tools.cron import CronToolContext
+from agent_gateway.cron.scheduler import CronSchedulerService
+from agent_gateway.cron.store import CronJob, CronJobStore
 
 from jiuwenswarm.agents.harness.common.tools.cron.cron_runtime import (
     _CronToolsCronBackend,
     CronRuntimeBridge,
     _extract_legacy_params,
 )
-from openjiuwen.harness.tools.cron import CronToolContext
 from jiuwenswarm.agents.harness.common.tools.cron import cron_tools as cron_tools_module
 from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import CronToolRoute, CronTools
-from jiuwenswarm.gateway.cron.scheduler import CronSchedulerService
-from jiuwenswarm.gateway.cron.store import CronJob, CronJobStore
-
-import time
 
 
 class _TestableScheduler(CronSchedulerService):
@@ -85,7 +85,8 @@ class _FakeCronTools:
 
     async def run_now(self, job_id: str):
         _ = job_id
-        return {"run_id": "r-1"}
+        # 与 CronTools.run_now 的真实 ack 形状一致，不要用扁平形状掩盖适配层的取值错误。
+        return {"action": "run_now", "status": "ok", "data": {"run_id": "run-1"}}
 
 
 class _FakeGatewayPush:
@@ -608,6 +609,35 @@ async def test_cron_backend_create_job_pushes_and_resets_route() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cron_backend_create_job_inherits_team_session_mode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
+        lambda session_id, cache_bust=False: {
+            "mode": "team.work.normal" if session_id == "team-session" else "",
+        },
+    )
+    cron_tools = _FakeCronTools()
+    backend = _CronToolsCronBackend(cron_tools=cron_tools, message_handler=None)
+    context = SimpleNamespace(
+        channel_id="web",
+        session_id="team-session",
+        mode="agent.work.normal",  # The leader's tool context can be agent mode.
+        metadata={},
+    )
+
+    await backend.create_job(
+        {
+            "schedule": {"kind": "cron", "expr": "0 0 2 * * ? *"},
+            "payload": {"kind": "agentTurn", "message": "提醒上班"},
+            "delivery": {"channel": "web"},
+        },
+        context=context,
+    )
+
+    assert cron_tools.create_payloads[0]["mode"] == "team.work.normal"
+
+
+@pytest.mark.asyncio
 async def test_cron_backend_uses_bound_context_for_operations_without_context() -> None:
     """list/get/delete/toggle/preview/run_now 无显式 context 时回退 build_tools() 绑定的稳定上下文。"""
     cron_tools = _FakeCronTools()
@@ -635,6 +665,43 @@ async def test_cron_backend_uses_bound_context_for_operations_without_context() 
         assert route.session_id == "sess-bound"
         assert route.user_id == "user-42"
     assert len(cron_tools.reset_tokens) == 6
+
+
+@pytest.mark.asyncio
+async def test_cron_backend_run_now_reads_nested_gateway_run_id() -> None:
+    """Gateway ack 的 run_id 在 data 里，适配层不能读顶层导致永远回空串。"""
+    cron_tools = _FakeCronTools()
+    backend = _CronToolsCronBackend(cron_tools=cron_tools, message_handler=None)
+
+    assert await backend.run_now("job-1") == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_cron_backend_run_now_stays_empty_without_ack_payload() -> None:
+    """未等到 ack（status=submitted、data=None）时保持空串，不算失败。"""
+    cron_tools = _FakeCronTools()
+    backend = _CronToolsCronBackend(cron_tools=cron_tools, message_handler=None)
+
+    async def _submitted(job_id: str):
+        _ = job_id
+        return {"action": "run_now", "status": "submitted", "data": None}
+
+    cron_tools.run_now = _submitted
+    assert await backend.run_now("job-1") == ""
+
+
+@pytest.mark.asyncio
+async def test_cron_backend_run_now_keeps_legacy_flat_shape_compatible() -> None:
+    """顶层 run_id 的旧形状仍要能取到，兼容其他 CronTools 实现。"""
+    cron_tools = _FakeCronTools()
+    backend = _CronToolsCronBackend(cron_tools=cron_tools, message_handler=None)
+
+    async def _flat(job_id: str):
+        _ = job_id
+        return {"run_id": "legacy-1"}
+
+    cron_tools.run_now = _flat
+    assert await backend.run_now("job-1") == "legacy-1"
 
 
 @pytest.mark.asyncio
@@ -714,7 +781,7 @@ async def test_cron_tools_create_job_uses_route_project_id_and_work_mode(
     # 本测试断言 route 上下文 model_name 透传，不依赖外部模型配置：patch 掉
     # 严格校验，与 test_cron_tools_update_job_validates_model 保持一致。
     monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.cron.cron_tools.validate_cron_model",
+        "jiuwenswarm.runtime.cron.models.validate_cron_model",
         lambda raw: str(raw).strip() or None,
     )
 
@@ -876,7 +943,7 @@ async def test_cron_tools_update_job_validates_model(tmp_path, monkeypatch) -> N
         targets="web",
     )
     monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.cron.cron_tools.validate_cron_model",
+        "jiuwenswarm.runtime.cron.models.validate_cron_model",
         lambda raw: "checked-model" if raw == "valid-model" else None,
     )
 
@@ -910,7 +977,7 @@ async def test_cron_tools_create_job_tool_preserves_explicit_empty_project_dir(
     finally:
         tools.reset_cron_route(token)
 
-    assert job["project_id"] == ""
+    assert job["project_id"] == "default"
     synced = push.payloads[-1]["body"]["data"]
     assert synced["project_dir"] == ""
 
@@ -1018,16 +1085,15 @@ async def test_cron_tools_update_job_rejects_invalid_patch(tmp_path, monkeypatch
     [
         pytest.param("default", "default", id="session_default_work"),
         pytest.param("default_code", "default_code", id="session_default_code"),
-        pytest.param("", "", id="session_empty_like_manual"),
+        pytest.param("", "default", id="session_empty_like_manual"),
     ],
 )
 async def test_cron_tools_create_job_inherits_session_default_project_id(
     tmp_path, monkeypatch, session_pid, expected_pid
 ):
-    """Issue #2653：对话创建未显式传 project_id 时注入会话 project_id。
+    """Issue #2653 / #5713：对话创建未显式传 project_id 时注入会话 project_id。
 
-    会话在默认项目下会落库 default/default_code（与手动未选的空串不同）；
-    列表展示层须把二者统一显示为「-」。
+    会话为空时按通道模式落默认项目（web → default），不再产生空 project_id。
     """
     _setup_project_store(tmp_path, monkeypatch)
     tools, push = _make_cron_tools(tmp_path, monkeypatch)
@@ -1194,7 +1260,6 @@ class TestComputeNextRunMissedTriggerWindow:
         assert push_dt == datetime(2026, 7, 24, 18, 25, 31, tzinfo=ZoneInfo("Asia/Shanghai"))
         assert wake_dt == push_dt
         assert run_id.startswith("one-shot:")
-
     def test_missed_trigger_beyond_window_raises(self) -> None:
         svc = _TestableScheduler.__new__(_TestableScheduler)
 
@@ -1237,18 +1302,32 @@ class _FakeDispatchBackend:
     async def create_job(self, params: dict, *, context=None) -> dict:
         return {"id": "spawned", **params}
 
+    async def update_job(self, job_id: str, patch: dict, *, context=None) -> dict:
+        return {"id": job_id, **patch}
+
 
 class TestBuildToolsAllowCreate:
-    """cron 执行会话的受限工具集：创建能力必须下掉，管理能力保留。"""
+    """cron 执行会话的受限工具集：创建/修改能力必须下掉，管理能力保留。"""
 
-    def _build(self, allow_create: bool) -> list:
+    def _build(
+        self,
+        allow_create: bool,
+        language: str = "cn",
+        allow_update: bool = True,
+    ) -> list:
         bridge = CronRuntimeBridge()
         bridge.set_backend(_FakeDispatchBackend())
         return bridge.build_tools(
             context=CronToolContext(channel_id="web", session_id="sess-1"),
             agent_id="agent-1",
+            language=language,
             allow_create=allow_create,
+            allow_update=allow_update,
         )
+
+    @staticmethod
+    def _unified(tools: list):
+        return next(tool for tool in tools if tool.card.name == "cron")
 
     def test_allow_create_false_drops_cron_create_job(self) -> None:
         tools = self._build(allow_create=False)
@@ -1284,3 +1363,159 @@ class TestBuildToolsAllowCreate:
         result = await unified._func(action="list")
 
         assert result == {"jobs": [{"id": "job-1"}]}
+
+    def test_allow_create_false_strips_add_from_unified_schema(self) -> None:
+        """统一 cron 工具的 schema 不再宣传 add：枚举摘除 + 描述声明不可用。"""
+        tools = self._build(allow_create=False)
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" not in action["enum"]
+        assert {"status", "list", "update", "remove", "run", "runs", "wake"} <= set(
+            action["enum"]
+        )
+        assert "add（创建新定时任务）" in unified.card.description
+        # 描述里的 action 列表不再宣传 add，job 字段也不再以 add 为卖点。
+        assert "status、list、add、update" not in unified.card.description
+        assert "用于 add 的任务对象" not in unified.card.input_params["properties"]["job"]["description"]
+        assert "本会话不支持 add" in action["description"]
+
+    def test_allow_create_false_strips_add_from_unified_schema_en(self) -> None:
+        tools = self._build(allow_create=False, language="en")
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" not in action["enum"]
+        assert "add (creating new cron jobs)" in unified.card.description
+        assert "status, list, add, update" not in unified.card.description
+        assert "Job object for add" not in unified.card.input_params["properties"]["job"]["description"]
+        assert "unavailable in this session: add" in action["description"]
+
+    def test_allow_create_true_keeps_add_in_unified_schema(self) -> None:
+        """普通会话的统一 cron 工具保持完整：add 仍在枚举与描述中。"""
+        tools = self._build(allow_create=True)
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" in action["enum"]
+        assert "以下动作不可用" not in unified.card.description
+        assert "status、list、add、update" in unified.card.description
+
+    def test_cron_session_toolset_drops_update_tools_and_schema(self) -> None:
+        """cron 会话同时下架 update：独立工具、枚举值与描述宣传一并清除。"""
+        tools = self._build(allow_create=False, allow_update=False)
+        names = {tool.card.name for tool in tools}
+
+        assert "cron_create_job" not in names
+        assert "cron_update_job" not in names
+        assert {
+            "cron",
+            "cron_list_jobs",
+            "cron_get_job",
+            "cron_delete_job",
+            "cron_toggle_job",
+            "cron_preview_job",
+        } <= names
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" not in action["enum"]
+        assert "update" not in action["enum"]
+        assert {"status", "list", "remove", "run", "runs", "wake"} <= set(action["enum"])
+        assert "add（创建新定时任务）" in unified.card.description
+        assert "update（修改定时任务）" in unified.card.description
+        assert "status、list、add、update" not in unified.card.description
+        props = unified.card.input_params["properties"]
+        assert "不支持 update" in props["patch"]["description"]
+        assert "不支持 add" in props["job"]["description"]
+
+    def test_cron_session_toolset_drops_update_schema_en(self) -> None:
+        tools = self._build(allow_create=False, language="en", allow_update=False)
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" not in action["enum"]
+        assert "update" not in action["enum"]
+        assert "update (modifying cron jobs)" in unified.card.description
+        assert "status, list, add, update" not in unified.card.description
+        props = unified.card.input_params["properties"]
+        assert "update is unavailable" in props["patch"]["description"]
+
+    def test_allow_update_false_only_strips_update(self) -> None:
+        """只关 update 时 add 保持完整（创建/修改两个开关彼此独立）。"""
+        tools = self._build(allow_create=True, allow_update=False)
+        names = {tool.card.name for tool in tools}
+
+        assert "cron_create_job" in names
+        assert "cron_update_job" not in names
+        unified = self._unified(tools)
+        action = unified.card.input_params["properties"]["action"]
+
+        assert "add" in action["enum"]
+        assert "update" not in action["enum"]
+        assert "update（修改定时任务）" in unified.card.description
+
+    @pytest.mark.asyncio
+    async def test_unified_cron_tool_update_blocked_when_update_disabled(self) -> None:
+        tools = self._build(allow_create=False, allow_update=False)
+        unified = next(tool for tool in tools if tool.card.name == "cron")
+
+        with pytest.raises(ValueError, match="not allowed"):
+            await unified._func(action="update", jobId="job-1", patch={"name": "x"})
+
+    @pytest.mark.asyncio
+    async def test_unified_cron_tool_list_still_works_when_update_disabled(self) -> None:
+        tools = self._build(allow_create=False, allow_update=False)
+        unified = next(tool for tool in tools if tool.card.name == "cron")
+
+        result = await unified._func(action="list")
+
+        assert result == {"jobs": [{"id": "job-1"}]}
+
+
+class TestEnsureSchedulerStartedBackgroundTask:
+    """issue #6286：后台启动 Task 须持强引用且内部异常须记日志。"""
+
+    def _make_bridge_with_backend(self, ensure_coro_factory):
+        bridge = CronRuntimeBridge()
+        backend = MagicMock(spec=_CronToolsCronBackend)
+        backend.ensure_scheduler_started = ensure_coro_factory
+        bridge.set_backend(backend)
+        return bridge
+
+    @pytest.mark.asyncio
+    async def test_holds_task_reference_and_releases_on_done(self) -> None:
+        started = asyncio.Event()
+
+        async def slow_start():
+            await started.wait()
+
+        bridge = self._make_bridge_with_backend(slow_start)
+        bridge.ensure_scheduler_started()
+
+        assert len(bridge._scheduler_start_tasks) == 1
+        task = next(iter(bridge._scheduler_start_tasks))
+        assert not task.done()
+
+        started.set()
+        await task
+        assert bridge._scheduler_start_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_background_exception_is_logged_not_silent(self, caplog) -> None:
+        async def boom():
+            raise RuntimeError("scheduler-start-exploded")
+
+        bridge = self._make_bridge_with_backend(boom)
+        bridge.ensure_scheduler_started()
+
+        with caplog.at_level(logging.WARNING, logger="jiuwenswarm.common.utils"):
+            await asyncio.wait_for(
+                asyncio.gather(*bridge._scheduler_start_tasks), timeout=5
+            )
+
+        assert any(
+            "Background scheduler start failed" in rec.message
+            for rec in caplog.records
+            if rec.levelno == logging.WARNING
+        )

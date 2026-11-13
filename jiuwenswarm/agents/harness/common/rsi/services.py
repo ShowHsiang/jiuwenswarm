@@ -439,17 +439,33 @@ class RsiTaskService:
 
     # -- I5 delete --
 
-    def delete(self, params: dict[str, Any]) -> dict[str, Any]:
+    def delete(self, params: dict[str, Any], *, worker: Any = None) -> dict[str, Any]:
         """``rsi.task.delete``（web §6.4，一致性规则 §8.2）。"""
         task_id = str(params.get("task_id") or "").strip()
         if not task_id:
             raise RsiBadRequest("task_id 必填")
+        task = self.store.get(task_id)
         if self.harness_activation_store is not None:
             for version in self.harness_activation_store.list_versions():
                 if str(version.get("task_id") or "").strip() == task_id:
                     raise RsiTaskStateConflict(
                         f"任务 {task_id} 持有保留的 Harness 版本，不可删除"
                     )
+        if task.status in {TaskStatus.QUEUED.value, TaskStatus.PAUSED.value}:
+            config = task.config or {}
+            if config.get("harness_refs_path") and not bool(
+                config.get("active_ref_released", False)
+            ):
+                raise RsiTaskStateConflict(f"任务 {task_id} 产物仍在生效，不可删除")
+            if task.status == TaskStatus.QUEUED.value and worker is not None:
+                worker.cancel(task_id, "terminate")
+            else:
+                self.store.update_status(
+                    task_id,
+                    [task.status],
+                    TaskStatus.TERMINATED.value,
+                    cause="delete",
+                )
         self.store.delete(task_id, forbid_running=True, forbid_active_artifact=True)
         return {"ok": True}
 
@@ -602,6 +618,8 @@ class RsiTreeService:
         # view before asking the Provider for optional recovery/backfill data.
         self.projector.load_from_disk(task_id)
         self.projector.register_root(task_id)
+        if _is_completed_program_artifact(task):
+            self.projector.reconcile_program_threshold_stops(task_id)
         if adapter is not None:
             tree = _read_provider_snapshot(adapter, "get_tree", task_id)
             if tree is not None:
@@ -756,6 +774,14 @@ class RsiArtifactDownloadService:
         if not result["is_directory"]:
             result.update(_download_fields(result["path"], params))
         return result
+
+
+def _is_completed_program_artifact(task: Any) -> bool:
+    """Whether a stored task is a completed program-artifact optimization."""
+
+    if task is None or task.status != TaskStatus.COMPLETED.value:
+        return False
+    return task.scenario == Scenario.ARTIFACT.value and task.artifact_type == ArtifactType.PROGRAM.value
 
 
 def _download_fields(path: str, params: dict[str, Any]) -> dict[str, str]:

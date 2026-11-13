@@ -45,7 +45,11 @@ from jiuwenswarm.agents.harness.common.rails.skill_retrieval_prompt_rail import 
 from jiuwenswarm.agents.harness.common.rails.symphony import (
     SymphonyOrchestrationRail,
 )
+from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (
+    SessionMessagingRouteRail,
+)
 from jiuwenswarm.agents.harness.code.rails.heartbeat_rail import HeartbeatRail
+from jiuwenswarm.agents.harness.common.tools.heartbeat_policy import is_heartbeat_supported
 from jiuwenswarm.agents.harness.team.rails.team_skill_storage_policy_rail import (
     TeamSkillStoragePolicyRail,
 )
@@ -58,6 +62,7 @@ from jiuwenswarm.agents.harness.team.rails.team_workspace_report_path_rail impor
 from jiuwenswarm.agents.harness.team.team_runtime_inheritance import (
     _build_context_processor_rail,
 )
+from jiuwenswarm.common.cron_session import is_cron_execution_context
 
 from jiuwenswarm.agents.swarm.context import SwarmBuildContext
 
@@ -72,12 +77,87 @@ TEAM_SKILL_STORAGE_POLICY = "swarm.team_skill_storage_policy"
 # spec carries the old element name.
 TEAM_SKILL_LIBRARY_RELOAD = "swarm.team_skill_library_reload"
 TEAM_WORKSPACE_REPORT_PATH = "swarm.team_workspace_report_path"
+ORGANIZATION_AVAILABILITY = "swarm.organization_availability"
+ORGANIZATION_MODEL = "swarm.organization_model"
+ORGANIZATION_OWNER_INBOX = "swarm.organization_owner_inbox"
+
+
+@harness_element(kind=ElementKind.RAIL, name=ORGANIZATION_OWNER_INBOX,
+                 description="Inject ordered durable results on the Owner's next model call.")
+def _build_organization_owner_inbox_rail(params: dict[str, Any], context: SwarmBuildContext) -> Any:
+    from jiuwenswarm.agents.harness.team.rails.organization_owner_inbox_rail import OrganizationOwnerInboxRail
+
+    if str(context.role) != "leader":
+        return None
+    return OrganizationOwnerInboxRail(context.team_id, context.session_id)
+
+
+@harness_element(kind=ElementKind.RAIL, name=ORGANIZATION_MODEL,
+                 description="Apply the persistent model selection of an organization expert Team.")
+def _build_organization_model_rail(params: dict[str, Any], context: SwarmBuildContext) -> Any:
+    from jiuwenswarm.agents.harness.team.rails.organization_model_rail import OrganizationModelRail
+
+    return OrganizationModelRail(context.team_id, context.session_id, str(context.role))
+
+
+@harness_element(kind=ElementKind.RAIL, name=ORGANIZATION_AVAILABILITY,
+                 description="Expose current AgentGroup availability to organization leaders.")
+def _build_organization_availability_rail(params: dict[str, Any], context: SwarmBuildContext) -> Any:
+    from jiuwenswarm.agents.harness.team.rails.organization_availability_rail import OrganizationAvailabilityRail
+
+    return OrganizationAvailabilityRail(context.team_id, context.session_id)
+
 CONTEXT_PROCESSOR = "swarm.context_processor"
 MODEL_ANOMALY_DETECTION = "swarm.model_anomaly_detection"
 PLUGIN_RAILS = "swarm.plugin_rails"
 SKILL_RETRIEVAL_PROMPT = "swarm.skill_retrieval_prompt"
 SYMPHONY_ORCHESTRATION_PROMPT = "swarm.symphony_orchestration_prompt"
 HEARTBEAT = "swarm.heartbeat"
+SESSION_MESSAGING_ROUTE = "swarm.session_messaging_route"
+
+
+@harness_element(
+    kind=ElementKind.RAIL,
+    name=SESSION_MESSAGING_ROUTE,
+    description="Leader-only invocation-scoped Session messaging route rail.",
+)
+def _build_session_messaging_route_rail(
+    params: dict[str, Any],
+    context: SwarmBuildContext,
+) -> SessionMessagingRouteRail | None:
+    """Mount Session messaging routing only on the Team leader."""
+    _ = params
+    if str(getattr(context, "role", "") or "") != "leader":
+        return None
+    return SessionMessagingRouteRail()
+
+
+def _read_session_metadata(session_id: str) -> dict[str, Any] | None:
+    """Read the session metadata used by the cron gate.
+
+    ``common.cron_session`` must stay free of upper-layer imports (R1 layering
+    rule), so resolving the persisted ``cron_id`` happens here, in the agents
+    layer, and is passed to the shared predicate as a mapping.
+    """
+    try:
+        from jiuwenswarm.server.runtime.session.session_metadata import (
+            get_session_metadata,
+        )
+
+        metadata = get_session_metadata(
+            session_id, cache_bust=True, enable_writeback=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - gating must not break member build
+        # Fail-open keeps the member usable, but it also means the cron gate
+        # degrades to request signals; keep that visible in logs.
+        logger.warning(
+            "[swarm.heartbeat] session metadata lookup failed; cron gate falls "
+            "back to request signals session_id=%s: %s",
+            session_id,
+            exc,
+        )
+        return None
+    return metadata if isinstance(metadata, dict) else None
 
 
 @harness_element(
@@ -101,6 +181,33 @@ def _build_heartbeat_rail(
     if service is None or not session_id:
         return None
     metadata = dict(getattr(context, "request_metadata", None) or {})
+    # cron 执行会话不挂心跳工具：心跳任务绑定创建它的会话，从 cron 运行里再
+    # 派生心跳任务与"禁止 cron 派生 cron"同理，且随一次性 cron 会话回收无意义。
+    # 与 swarm.cron_tools 共用同一个判定，包含会话里持久化的 ``cron_id``，
+    # 这样 Web 定时任务执行会话（普通 ``web_*`` ID、web 渠道）在用户后续追问
+    # 或运行时重建时也保持隔离（issue #6188）。普通会话所有信号都不命中，
+    # 心跳能力不受影响。
+    if is_cron_execution_context(
+        session_id,
+        channel_id=getattr(context, "channel_id", None),
+        request_metadata=metadata,
+        session_metadata=_read_session_metadata(session_id),
+    ):
+        logger.info(
+            "[swarm.heartbeat] skip HeartbeatRail for cron execution session %s",
+            session_id,
+        )
+        return None
+    # 小艺等渠道没有可用的主动投递路径（见 heartbeat_policy），不挂心跳工具，
+    # 否则成员会回答"心跳已创建"而结果永远送不到手机。
+    if not is_heartbeat_supported(getattr(context, "channel_id", None)):
+        logger.info(
+            "[swarm.heartbeat] skip HeartbeatRail for channel without heartbeat "
+            "support channel=%s session=%s",
+            getattr(context, "channel_id", None),
+            session_id,
+        )
+        return None
     tool_context = SimpleNamespace(
         channel_id=str(getattr(context, "channel_id", None) or "web"),
         session_id=session_id,
@@ -610,6 +717,7 @@ __all__ = [
     "SKILL_RETRIEVAL_PROMPT",
     "SYMPHONY_ORCHESTRATION_PROMPT",
     "HEARTBEAT",
+    "SESSION_MESSAGING_ROUTE",
     "TEAM_PERMISSION",
     "TEAM_PERMISSION_POLICY",
 ]

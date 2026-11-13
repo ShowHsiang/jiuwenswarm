@@ -21,6 +21,10 @@ _UNNAMED_PHASE = "unnamed phase"
 _UNNAMED_HUMAN = "unnamed human"
 _UNNAMED_AGENT = "unnamed agent"
 
+# Per-node activity ring cap — keeps a long-running worker's tool history
+# bounded (oldest dropped) so a delta / snapshot never unboundedly grows.
+_ACTIVITY_RING_CAP = 200
+
 
 # ---------------------------------------------------------------------------
 # Input model — mirrors WorkflowProgressTeamEvent fields
@@ -60,7 +64,17 @@ class WorkflowProgress(BaseModel):
                            sole source of node kind — kind derives:
                            node_type in {human, human_session} -> human)
       agent_id       -> agent_id  (AGENT_*: deterministic resume-stable node id)
+      agent_type     -> agent_type  (AGENT_STARTED: external provider kind
+                           claude/codex; None for native workers)
+      agent_template -> agent_template  (AGENT_STARTED: AgentGroup member picked
+                           via options.agent_template; None for the generic worker)
+      display_name   -> display_name  (AGENT_STARTED: that expert's display name)
       answer         -> answer  (HUMAN_REPLIED: the person's raw reply text)
+      activity_type  -> activity_type  (AGENT_ACTIVITY: "tool_call" / "tool_result")
+      tool_call_id   -> tool_call_id  (AGENT_ACTIVITY: pairs a call with its result)
+      tool_name      -> tool_name  (AGENT_ACTIVITY: the invoked tool)
+      content        -> content  (AGENT_ACTIVITY: 512-char preview; result preview
+                           rides the call's row via tool_result_preview)
 
     """
 
@@ -81,7 +95,21 @@ class WorkflowProgress(BaseModel):
     correlation_id: Optional[str] = None
     node_type: Optional[str] = None
     agent_id: Optional[str] = None
+    # AGENT_STARTED: external provider kind (claude / codex); None for native workers.
+    agent_type: Optional[str] = None
+    # AGENT_STARTED: AgentGroup member picked via options.agent_template (None = generic worker)
+    agent_template: Optional[str] = None
+    # AGENT_STARTED: display name of that expert (None when no expert)
+    display_name: Optional[str] = None
     answer: Optional[str] = None
+    # AGENT_ACTIVITY: "tool_call" | "tool_result" (structured worker activity)
+    activity_type: Optional[str] = None
+    # AGENT_ACTIVITY: pairs a tool call with its result (result previews ride the
+    # call's row on WorkflowAgentActivity.tool_result_preview).
+    tool_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    # AGENT_ACTIVITY: preview text (engine-truncated to 512 chars)
+    content: Optional[str] = None
     tokens: Optional[int] = None
     budget: Optional[dict] = None
     workflow_budget: Optional[dict] = None
@@ -91,6 +119,34 @@ class WorkflowProgress(BaseModel):
     nested_phase: Optional[str] = None
     parent_phase: Optional[str] = None
     phase_iteration: Optional[int] = None
+    parent_session_id: Optional[str] = None
+    # the session's avatar member name (agent_started, session nodes); the
+    # join key a UI uses to resolve parent_session_id to a session card
+    member_name: Optional[str] = None
+    # verify round fields (verify_started / verify_settled)
+    verify_reviewers: Optional[int] = None
+    verify_verdict: Optional[str] = None
+    verify_threshold: Optional[float] = None
+    verify_votes: Optional[list[dict]] = None
+    # reviewer label roster in fan-out order (verify_started); unique across rounds
+    verify_reviewer_labels: Optional[list[str]] = None
+    # reviewer business role roster (verify_started), same fan-out order;
+    # display-only — judgement never reads it
+    verify_reviewer_roles: Optional[list[Optional[str]]] = None
+    # engine round identity (structural call position) — pairs started/settled
+    # of the SAME round among concurrent same-label verify() calls
+    verify_id: Optional[str] = None
+    # prompt-cache-hit tokens of the call (agent_completed); subset of tokens
+    cache_tokens: Optional[int] = None
+    # prompt / completion split of tokens (agent_completed); None when the
+    # provider reported no split
+    token_input: Optional[int] = None
+    token_output: Optional[int] = None
+    # Run attribution: the member currently hosting the run via swarmflow
+    # (the relaunch host on a resume; the leader itself for a leader-hosted
+    # run). Narration, completion injections and resume handoff all read it;
+    # None only when the event carries no team context.
+    executor: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +174,15 @@ class WorkflowAgentActivity(BaseModel):
     Agent lifecycle (started/completed/failed) is already captured by
     ``status`` / ``started_at`` / ``completed_at`` / ``outcome`` / ``error``
     / ``duration_ms`` on ``WorkflowAgentState`` itself, so no status-type
-    activity is written. Tool-call activity (type="tool_call" /
-    "tool_result") requires upstream structured data which is not yet
-    available. ``activity`` on ``WorkflowAgentState`` is always empty.
+    activity is written. Only tool activity is recorded here: the engine's
+    ``AGENT_ACTIVITY`` pair (``type="tool_call"`` / ``type="tool_result"``)
+    carries a 512-char preview in ``content``.
+
+    A ``tool_result`` pairs back onto its ``tool_call`` row (same
+    ``tool_call_id``): the result preview fills ``tool_result_preview`` on
+    that row and no second entry is appended. An orphan result (no matching
+    call — e.g. after the ring cap dropped it) appends as its own
+    ``type="tool_result"`` row, in order.
 
     Human nodes never produce activity (their question/answer live on
     ``human_prompt`` / ``human_reply``); only agent nodes' tool_call /
@@ -128,11 +190,12 @@ class WorkflowAgentActivity(BaseModel):
     """
 
     timestamp: str  # required — every entry must be timestamped
-    type: str  # "tool_call" | "tool_result" (pending upstream)
+    type: str  # "tool_call" | "tool_result"
     content: str = ""
-    # reserved — tool calls require upstream WorkflowProgressEvent extension
     tool_name: Optional[str] = None
     tool_call_id: Optional[str] = None
+    # Paired result preview, filled when a matching tool_result arrives;
+    # None on the call row until then.
     tool_result_preview: Optional[str] = None
 
 
@@ -151,12 +214,75 @@ class WorkflowAgentState(BaseModel):
     completed_at: Optional[str] = None
     # reserved — pending upstream token accounting
     token_count: Optional[int] = None
+    # prompt-cache-hit tokens (agent_completed); subset of token_count, None
+    # when the provider reported none (old runs / non-reporting providers)
+    cache_token_count: Optional[int] = None
+    # prompt / completion split of token_count; None when the provider
+    # reported no split (old runs keep only the total)
+    input_token_count: Optional[int] = None
+    output_token_count: Optional[int] = None
     duration_ms: Optional[int] = None
     kind: str = "agent"  # "agent" | "human" — derived: node_type in {"human","human_session"} -> "human"
     node_type: Optional[str] = None
+    agent_type: Optional[str] = None  # "claude" | "codex" | None (native)
+    agent_template: Optional[str] = None  # AgentGroup member name; None for the generic worker
+    display_name: Optional[str] = None  # expert display name shown instead of the label
     correlation_id: Optional[str] = None
+    # Fork child (node_type=agent_session_fork): the parent session's avatar
+    # member name (unique per session), carried on every AGENT_STARTED turn so
+    # a UI can draw the fork edge and resolve the exact parent even for
+    # chained / same-label forks.
+    parent_session_id: Optional[str] = None
+    # This session's avatar member name (constant across its turns); the
+    # join key for parent_session_id. None on one-shot agent()/human() nodes.
+    member_name: Optional[str] = None
     human_prompt: Optional[str] = None
     human_reply: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dict for event payload."""
+        return self.model_dump(exclude_none=True)
+
+
+class WorkflowVerifyGroupState(BaseModel):
+    """One ``verify()`` round folded under a phase.
+
+    Created on ``verify_started`` (reviewer count + threshold), settled on
+    ``verify_completed`` (``verify_settled`` compat alias — verdict + per-reviewer
+    votes + full ``outcome``). ``verdict=None`` after settling means undecided
+    (a reviewer did not vote) — never a silent pass. ``votes`` entries mirror
+    the engine's shape: ``{name, kind, role, decision, score, feedback, voted}``
+    where ``name`` matches the reviewer agent node's label in the same phase.
+
+    Concurrent same-label rounds: each round is one card entry carrying its
+    engine ``verify_id`` (the verify analog of an agent node's agent_id —
+    parallel rounds differ structurally even under a shared label). The
+    frontend folds same-label entries into one visual container ×N rounds,
+    exactly like same-name agents. Legacy events without ``verify_id`` fall
+    back to the label-matching folding below.
+    """
+
+    id: str
+    label: str
+    # engine round identity (structural call position); None on legacy events
+    verify_id: Optional[str] = None
+    status: str = "running"  # running / settled
+    threshold: Optional[float] = None
+    reviewers: Optional[int] = None
+    # reviewer label roster in fan-out order (verify_started); same default
+    # label repeats across same-label rounds — rounds are told apart by
+    # verify_id, not by label uniqueness
+    reviewer_labels: list[str] = []
+    # reviewer business role roster (verify_started), same fan-out order;
+    # display-only — judgement never reads it
+    reviewer_roles: list[Optional[str]] = []
+    verdict: Optional[str] = None  # "pass" / "fail" / None = undecided
+    votes: list[dict] = []
+    # complete round output as a JSON string (engine _preview(VerifyResult));
+    # None on legacy events — frontend falls back to votes aggregation
+    outcome: Optional[str] = None
+    started_at: Optional[str] = None
+    settled_at: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for event payload."""
@@ -173,6 +299,7 @@ class WorkflowPhaseState(BaseModel):
     agent_count: int = 0
     completed_agent_count: int = 0
     agents: list[WorkflowAgentState] = []
+    verify_groups: list[WorkflowVerifyGroupState] = []
     phase_type: Optional[str] = None
     parent_phase: Optional[str] = None
     iteration: Optional[int] = None
@@ -216,6 +343,11 @@ class WorkflowRunState(BaseModel):
     # Absolute path of the script driving this run, set from the workflow_started
     # event for advisory cold-start context; distinct from ``script`` above.
     script_path: Optional[str] = None
+    # Member name currently hosting the run (relaunch host on a resume; the
+    # leader's own name for a leader-hosted run). Latched from every progress
+    # event in apply(), so badge and resume handoff always follow the latest
+    # host; None only when no event ever carried team context.
+    executor: Optional[str] = None
     # Disk-restored after a cold start with no live controller handle; the
     # frontend greys this run's control buttons until a launch-plane relaunch
     # (leader advisory) brings it back.
@@ -240,9 +372,10 @@ class WorkflowRunState(BaseModel):
     # Private mutable state for ID generation sequencing (not serialized)
     _phase_counter: int = 0  # Global phase counter (1-based)
     _agent_slug_counter: dict[str, int] = {}  # Per-slug agent counter
-    # Last phase entered via agent events (not serialized). Drives phase sealing:
-    # when the next agent event carries a different phase name, the previous
-    # phase is finalized. See ``_switch_to_phase``.
+    # Last phase card entered via agent events (not serialized). Drives phase
+    # sealing: when the next agent event lands on another card — a different
+    # name, or the next iteration of the same name — the previous card is
+    # finalized. See ``_switch_to_phase``.
     _last_phase: Optional[WorkflowPhaseState] = None
 
     model_config = {"arbitrary_types_allowed": True}
@@ -253,8 +386,12 @@ class WorkflowRunState(BaseModel):
         "agent_started": "_on_agent_started",
         "agent_completed": "_on_agent_completed",
         "agent_failed": "_on_agent_failed",
+        "agent_activity": "_on_agent_activity",
         "human_prompt": "_on_human_prompt",
         "human_replied": "_on_human_replied",
+        "verify_started": "_on_verify_started",
+        "verify_completed": "_on_verify_settled",
+        "verify_settled": "_on_verify_settled",
         "workflow_completed": "_on_workflow_completed",
         "workflow_failed": "_on_workflow_failed",
         "workflow_paused": "_on_workflow_paused",
@@ -266,6 +403,17 @@ class WorkflowRunState(BaseModel):
     @property
     def is_terminal(self) -> bool:
         return self._is_terminal_status(self.status)
+
+    def _phase_may_run(self) -> bool:
+        """True while the run itself is live, so phase cards may enter running.
+
+        A phase/agent event landing after the run was parked or finalized must
+        not resurrect its phase card to ``running`` — a paused run card
+        carrying a running phase is a mixed UI state. A resume re-emits
+        ``workflow_started`` first (which flips the run back to running), so
+        the normal pause→resume path is untouched.
+        """
+        return not self.is_terminal and self.status != "paused"
 
     @staticmethod
     def _is_terminal_status(status: str) -> bool:
@@ -347,12 +495,25 @@ class WorkflowRunState(BaseModel):
 
         Returns None if no push is needed (e.g. log, or unknown kind).
         """
+        # Run attribution: the publisher stamps executor on every progress
+        # event, so latch it here — an observer that missed the started event
+        # (recovered / re-attached mid-run) still learns the host, and the
+        # cold-restore snapshot reads it back. None clears nothing.
+        if progress.executor is not None:
+            self.executor = progress.executor
         kind = progress.kind
         handler = self._KIND_HANDLERS.get(kind)
         if handler is None:
             return None
         method = getattr(self, handler)
-        return method(progress)
+        delta = method(progress)
+        # Attach attribution to every emitted delta while known, so a consumer
+        # joining mid-run self-heals from the next frame. Never attach an
+        # explicit None: the frontend's incremental merge would overwrite a
+        # cold-restored name.
+        if delta is not None and self.executor is not None:
+            delta["executor"] = self.executor
+        return delta
 
     def finalize_if_running(self, terminal_status: str = "stopped") -> bool:
         """Force a non-terminal run to a terminal status. Returns True if changed.
@@ -369,19 +530,26 @@ class WorkflowRunState(BaseModel):
         return True
 
     def pause_if_running(self) -> bool:
-        """Mark a non-terminal run as paused (non-terminal, resumable). Returns True if changed.
+        """Park a non-terminal run as paused (non-terminal, resumable). Returns True if changed.
 
         Mirrors ``_on_workflow_paused`` but returns a bool instead of a delta —
         used by teardown to park a run without stamping completed_at/duration.
+        An already-paused run is re-scanned rather than skipped: a parked run
+        whose phases were left ``running`` (stale events after the park, or a
+        restore-time run-level flip) reads as a mixed paused-run / running-phase
+        state, and a re-park heals it.
         """
-        if self.is_terminal or self.status == "paused":
+        if self.is_terminal:
             return False
+        changed = self.status != "paused"
         self.status = "paused"
         for phase in self.phases:
             if phase.status == "running":
                 phase.status = "paused"
-            self._pause_running_agents(phase)
-        return True
+                changed = True
+            if self._pause_running_agents(phase):
+                changed = True
+        return changed
 
     def _stamp_workflow_terminal(self, status: str) -> None:
         """Set workflow to a terminal status with completion timestamp and duration."""
@@ -410,19 +578,22 @@ class WorkflowRunState(BaseModel):
                 self._stamp_agent_terminal(agent, terminal_status)
         self._refresh_phase_counts(phase)
 
-    def _pause_running_agents(self, phase: WorkflowPhaseState) -> None:
+    def _pause_running_agents(self, phase: WorkflowPhaseState) -> bool:
         """Pause still-running agents in ``phase`` to ``paused`` (non-terminal).
 
         Unlike :meth:`_finalize_running_agents`, this does NOT stamp
         ``completed_at`` / ``duration_ms`` — a paused agent is not finished, it
         will be reactivated on resume. ``waiting_for_human`` nodes are also
         paused (their pending reply is cancelled by the pause's abort), so the
-        frontend does not spin forever.
+        frontend does not spin forever. Returns True when any agent changed.
         """
+        changed = False
         for agent in phase.agents:
             if agent.status in ("running", "waiting_for_human"):
                 agent.status = "paused"
+                changed = True
         self._refresh_phase_counts(phase)
+        return changed
 
     def _finalize_running_phases(self, terminal_status: str) -> None:
         """Mark all running / paused phases and their agents as terminal.
@@ -513,10 +684,16 @@ class WorkflowRunState(BaseModel):
         iteration** (round 1/2/3 of ``phase("生成")`` → 3 distinct cards).
         Legacy events without ``iteration`` fall back to one-card-per-name.
 
+        Sealing is keyed on the **card**, not the name: entering another card
+        seals the previous one whether its name differs or it is the next
+        iteration of the same name. A card that still holds live agents is
+        left running and sealed by its own last terminal event.
+
         Returns ``(target_phase, sealed_phase_or_None)``.
         """
         iter_key = iteration or 1
         target = self._find_phase_by_name(phase_name, iter_key)
+        phase_may_run = self._phase_may_run()
         if target is None:
             # Fallback: try a planned card with iteration=None (treated as 1)
             # so the first real phase() call reuses the planned card.
@@ -527,16 +704,18 @@ class WorkflowRunState(BaseModel):
             if target is None:
                 phase_id = self._generate_phase_id(phase_name)
                 target = WorkflowPhaseState(
-                    id=phase_id, name=phase_name, status="running", iteration=iter_key,
+                    id=phase_id, name=phase_name,
+                    status="running" if phase_may_run else "paused",
+                    iteration=iter_key,
                 )
                 self.phases.append(target)
                 logger.warning(
                     "[WF_DBG WorkflowRunState] phase %s#%s not in plan, created on the fly",
                     phase_name, iter_key,
                 )
-            else:
+            elif phase_may_run:
                 target.status = "running"
-        else:
+        elif phase_may_run:
             target.status = "running"
 
         sealed: Optional[WorkflowPhaseState] = None
@@ -544,28 +723,75 @@ class WorkflowRunState(BaseModel):
         can_seal_prev = (
             prev is not None
             and prev is not target
-            and prev.name != phase_name
             and prev.status == "running"
         )
-        if can_seal_prev:
-            # Phase status mirrors its agents by priority:
-            #   any stopped → stopped (external termination wins)
-            #   all failed  → failed (every agent errored)
-            #   otherwise   → completed (at least one completed, partial OK)
-            statuses = [a.status for a in prev.agents] if prev.agents else []
-            if statuses and any(s == "stopped" for s in statuses):
-                prev.status = "stopped"
-            elif statuses and all(s == "failed" for s in statuses):
-                prev.status = "failed"
-            else:
-                prev.status = "completed"
+        if can_seal_prev and self._phase_quiescent(prev):
+            prev.status = self._phase_status_from_agents(prev)
             self._finalize_running_agents(prev, prev.status)
             sealed = prev
             logger.info("[WF_DBG WorkflowRunState] phase %s -> %s (sealed on switch to %s)",
                         prev.name, prev.status, phase_name)
+        elif can_seal_prev:
+            # Interleaved branches (pipe([impl, verify]) running in parallel per
+            # spec) legitimately start the next phase's agents while siblings of
+            # the previous phase are still running. Sealing here would stamp
+            # live agents completed; the phase stays running and the last
+            # terminal agent seals it (see _seal_child_and_propagate).
+            logger.info(
+                "[WF_DBG WorkflowRunState] phase %s still has live agents; "
+                "deferring seal on switch to %s",
+                prev.name, phase_name,
+            )
 
         self._last_phase = target
         return target, sealed
+
+    @staticmethod
+    def _phase_quiescent(phase: WorkflowPhaseState) -> bool:
+        """True when a phase holds no live agent (empty, or all terminal)."""
+        return not phase.agents or WorkflowRunState._all_agents_terminal(phase)
+
+    @staticmethod
+    def _verify_rounds_all_settled(phase: WorkflowPhaseState) -> bool:
+        """True for a verify phase (has rounds) whose every round has settled.
+
+        A settled round emits nothing more, so with every agent terminal the
+        phase can close even while it is still the active phase. A phase with
+        no verify rounds is not eligible: a plain phase's "next event" is
+        unknowable (another sequential agent may follow).
+        """
+        groups = phase.verify_groups
+        return bool(groups) and all(g.status == "settled" for g in groups)
+
+    def _author_phase_sealable(self, phase: WorkflowPhaseState, *, require_settled: bool) -> bool:
+        """True when a running author phase has gone quiet enough to seal.
+
+        Every agent must be terminal. Then either the phase is no longer the
+        active one (no further event can reach it), or it is a verify phase
+        whose rounds have all settled; ``require_settled`` demands the latter
+        regardless of the active slot (the settle event re-check).
+        """
+        if phase.phase_type == "child" or phase.status != "running":
+            return False
+        if not self._all_agents_terminal(phase):
+            return False
+        if require_settled or phase is self._last_phase:
+            return self._verify_rounds_all_settled(phase)
+        return True
+
+    @staticmethod
+    def _phase_status_from_agents(phase: WorkflowPhaseState) -> str:
+        """Phase status mirrored from its agents by priority.
+
+        any stopped → stopped (external termination wins); all failed → failed;
+        otherwise completed (at least one completed, partial OK).
+        """
+        statuses = [a.status for a in phase.agents] if phase.agents else []
+        if statuses and any(s == "stopped" for s in statuses):
+            return "stopped"
+        if statuses and all(s == "failed" for s in statuses):
+            return "failed"
+        return "completed"
 
     def _resolve_agent(
             self,
@@ -705,6 +931,8 @@ class WorkflowRunState(BaseModel):
             agent.outcome = outcome
         if error is not None:
             agent.error = error
+        if progress.model:
+            agent.model = progress.model  # the CLI-reported model beats the assembly-time guess
 
         self._bump_completion(phase, progress, agent)
         logger.info(
@@ -742,7 +970,8 @@ class WorkflowRunState(BaseModel):
             WorkflowRunState._is_terminal_status(a.status) for a in phase.agents
         )
 
-    def _refresh_phase_counts(self, phase: WorkflowPhaseState) -> None:
+    @staticmethod
+    def _refresh_phase_counts(phase: WorkflowPhaseState) -> None:
         """Recompute a phase card's counters from its agent list (derived).
 
         ``agent_count`` is the total number of agent instances on the card;
@@ -793,9 +1022,18 @@ class WorkflowRunState(BaseModel):
             if error is not None and not agent.error:
                 agent.error = error
                 updated = True
+            if progress.model and not agent.model:
+                agent.model = progress.model
+                updated = True
             if updated:
                 if progress.tokens is not None:
                     agent.token_count = progress.tokens
+                if progress.cache_tokens is not None:
+                    agent.cache_token_count = progress.cache_tokens
+                if progress.token_input is not None:
+                    agent.input_token_count = progress.token_input
+                if progress.token_output is not None:
+                    agent.output_token_count = progress.token_output
                 if progress.budget is not None:
                     self.budget = progress.budget
                 if progress.workflow_budget is not None:
@@ -811,6 +1049,27 @@ class WorkflowRunState(BaseModel):
                 self._refresh_phase_counts(phase)
                 self._refresh_run_agent_counts()
                 return self._build_phase_delta(phase)
+        # Mixed statuses: the node was stamped by a phase seal (an inference
+        # from the phase aggregate) while it was actually still running, and
+        # the engine's genuine verdict arrived after the seal. A real terminal
+        # event — one whose agent_id exactly matches the node — overrides the
+        # inference; a label-fallback event (no id match) never does, because
+        # it may have resolved to the wrong same-label node.
+        id_backed = bool(progress.agent_id and progress.agent_id == agent.id)
+        seal_status = agent.status
+        if id_backed and seal_status in ("completed", "stopped", "failed") and seal_status != status:
+            self._stamp_agent_terminal(agent, status)
+            if outcome is not None:
+                agent.outcome = outcome
+            if error is not None:
+                agent.error = error
+            self._refresh_phase_counts(phase)
+            self._refresh_run_agent_counts()
+            logger.info(
+                "[WF_DBG WorkflowRunState] late %s overrode seal stamp %s on %r",
+                status, seal_status, agent.name,
+            )
+            return self._build_phase_delta(phase)
         return None
 
     def _bump_completion(self, phase: WorkflowPhaseState, progress: WorkflowProgress,
@@ -818,6 +1077,12 @@ class WorkflowRunState(BaseModel):
         """Refresh phase counters, write tokens / budget, refresh run totals."""
         if progress.tokens is not None:
             agent.token_count = progress.tokens
+        if progress.cache_tokens is not None:
+            agent.cache_token_count = progress.cache_tokens
+        if progress.token_input is not None:
+            agent.input_token_count = progress.token_input
+        if progress.token_output is not None:
+            agent.output_token_count = progress.token_output
         if progress.budget is not None:
             self.budget = progress.budget
         if progress.workflow_budget is not None:
@@ -837,18 +1102,24 @@ class WorkflowRunState(BaseModel):
 
     def _seal_child_and_propagate(self, phase: WorkflowPhaseState) -> dict:
         """Seal child phase when all its agents are done, then try sealing parent."""
+        # Author phase whose last agent just went terminal seals here — but only
+        # when no more events can flip the card back: either another phase has
+        # taken the active slot, or (the active phase) it is a verify phase whose
+        # every round has settled. Sealing between same-phase events (sequential
+        # agents, a verify settle still pending) flips the card completed/running
+        # and makes the task mirror flap claimed/completed; a verify phase with
+        # all rounds settled gets nothing further by construction, and waiting
+        # for the next phase to displace it leaves a finished card spinning for
+        # as long as a sibling branch keeps retrying elsewhere.
+        if self._author_phase_sealable(phase, require_settled=False):
+            phase.status = self._phase_status_from_agents(phase)
+            logger.info(
+                "[WF_DBG WorkflowRunState] sealed author phase=%s (last agent terminal, status=%s)",
+                phase.name, phase.status,
+            )
+            return self._build_phase_delta(phase)
         if phase.phase_type == "child" and self._all_agents_terminal(phase):
-            # Phase status mirrors its agents by priority:
-            #   any stopped → stopped (external termination wins)
-            #   all failed  → failed (every agent errored)
-            #   otherwise   → completed (at least one completed, partial OK)
-            statuses = [a.status for a in phase.agents] if phase.agents else []
-            if statuses and any(s == "stopped" for s in statuses):
-                phase.status = "stopped"
-            elif statuses and all(s == "failed" for s in statuses):
-                phase.status = "failed"
-            else:
-                phase.status = "completed"
+            phase.status = self._phase_status_from_agents(phase)
             logger.info(
                 "[WF_DBG child] sealed child phase=%s (all agents done, status=%s)",
                 phase.name, phase.status,
@@ -894,6 +1165,10 @@ class WorkflowRunState(BaseModel):
         relaunch_kind = progress.relaunch_kind
         if relaunch_kind == "relaunch":
             self.phases = []
+            # The seal slot points at a card from the discarded tree; leaving it
+            # set would seal that stale card on the next phase switch and push
+            # it back to the frontend as if it belonged to the fresh attempt.
+            self._last_phase = None
             # Drop every terminal leftover from the prior run so the frontend does
             # not show a stale "budget exhausted" / failed badge over the fresh
             # attempt, and the run-level counts rebuild from zero.
@@ -1021,7 +1296,8 @@ class WorkflowRunState(BaseModel):
         if parent is None and parent_name:
             logger.warning("[WF_DBG child] parent_phase=%s NOT FOUND in phases=%s",
                            parent_name, [p.name for p in self.phases])
-        if parent is not None and parent.status == "planned":
+        phase_may_run = self._phase_may_run()
+        if parent is not None and parent.status == "planned" and phase_may_run:
             parent.status = "running"
         # Resume replays the script's ``workflow()`` calls, re-emitting the same
         # child PHASE events. Reuse the existing child card (by name, which
@@ -1030,7 +1306,7 @@ class WorkflowRunState(BaseModel):
         # phase list by one card per child.
         existing = self._find_child_phase_by_name(progress.phase)
         if existing is not None:
-            if not self._is_terminal_status(existing.status):
+            if phase_may_run and not self._is_terminal_status(existing.status):
                 existing.status = "running"
             logger.info("[WF_DBG child] run=%s reuse card=%s parent=%s (resume re-declared)",
                         self.id, existing.name, parent_name)
@@ -1042,7 +1318,7 @@ class WorkflowRunState(BaseModel):
             name=progress.phase,
             phase_type="child",
             parent_phase=parent_name,
-            status="running",
+            status="running" if phase_may_run else "paused",
         )
         self.phases.append(phase)
         logger.info("[WF_DBG child] run=%s card=%s parent=%s parent_status=%s",
@@ -1069,9 +1345,158 @@ class WorkflowRunState(BaseModel):
                          caller, progress.phase, progress.nested_phase)
             progress.phase = progress.nested_phase
 
+    # -- verify round folding (verify_started / verify_settled) --------------
+    @staticmethod
+    def _verify_group_shares_roster(
+        group: WorkflowVerifyGroupState, vote_names: "set[str]",
+    ) -> bool:
+        """True when the group's roster (labels or prior votes) overlaps the settled votes."""
+        if set(group.reviewer_labels) & vote_names:
+            return True
+        prior = {v.get("name") for v in group.votes if v.get("name")}
+        return bool(prior & vote_names)
+
+    def _resolve_verify_phase(
+        self, progress: WorkflowProgress,
+    ) -> tuple[WorkflowPhaseState, Optional[WorkflowPhaseState]]:
+        """Locate (or create) the phase a verify round belongs to.
+
+        Reuses the agent-flow resolution: child phases match by name, top-level
+        phases go through ``_switch_to_phase`` so the previous phase is sealed
+        at the moment the verify round begins (a true boundary in the run's
+        timeline — the reviewers follow in the same phase).
+        """
+        phase_name = progress.phase or _UNNAMED_PHASE
+        child = self._find_child_phase_by_name(phase_name)
+        if child is not None:
+            return child, None
+        return self._switch_to_phase(phase_name, iteration=progress.phase_iteration)
+
+    def _on_verify_started(self, progress: WorkflowProgress) -> dict[str, Any]:
+        """Open a verify round card under the round's phase (reviewers + threshold).
+
+        Round-keyed folding: one card per engine round (``verify_id`` = the
+        verify analog of an agent node's agent_id — concurrent same-label
+        rounds differ structurally). Legacy events without a verify_id keep the
+        label+running folding (a rework loop re-verifying under one label in
+        one phase still yields one card per round).
+        """
+        self._apply_nested_phase(progress, "verify_started")
+        label = progress.label or "verify"
+        phase, sealed = self._resolve_verify_phase(progress)
+        if progress.verify_id:
+            group = next(
+                (g for g in phase.verify_groups if g.verify_id == progress.verify_id),
+                None,
+            )
+            if group is None:
+                group = WorkflowVerifyGroupState(
+                    id=f"{phase.id}-verify-{len(phase.verify_groups) + 1}",
+                    label=label,
+                    verify_id=progress.verify_id,
+                    started_at=WorkflowRunState._now_iso(),
+                )
+                phase.verify_groups.append(group)
+        else:
+            group = next(
+                (g for g in reversed(phase.verify_groups)
+                 if g.label == label and g.status != "settled"),
+                None,
+            )
+            if group is None:
+                group = WorkflowVerifyGroupState(
+                    id=f"{phase.id}-verify-{len(phase.verify_groups) + 1}",
+                    label=label,
+                    started_at=WorkflowRunState._now_iso(),
+                )
+                phase.verify_groups.append(group)
+        group.status = "running"
+        group.reviewers = progress.verify_reviewers
+        group.threshold = progress.verify_threshold
+        if progress.verify_reviewer_labels is not None:
+            group.reviewer_labels = list(progress.verify_reviewer_labels)
+        if progress.verify_reviewer_roles is not None:
+            group.reviewer_roles = list(progress.verify_reviewer_roles)
+        if sealed is not None:
+            return self._build_phases_delta([sealed, phase])
+        return self._build_phase_delta(phase)
+
+    def _on_verify_settled(self, progress: WorkflowProgress) -> dict[str, Any]:
+        """Settle the round's verify group: verdict + per-reviewer votes.
+
+        Idempotent: re-settling the same round overwrites its card (journal
+        replay). verdict=None is undecided — kept explicit so the frontend can
+        render a "did not adjudicate, retry" hint.
+
+        Round-keyed match first (exact, engine-guaranteed); legacy events fall
+        back to label matching (roster/vote-name intersection, then the plain
+        latest same-label card).
+        """
+        self._apply_nested_phase(progress, "verify_settled")
+        label = progress.label or "verify"
+        phase, sealed = self._resolve_verify_phase(progress)
+        group = None
+        if progress.verify_id:
+            group = next(
+                (g for g in phase.verify_groups if g.verify_id == progress.verify_id),
+                None,
+            )
+        if group is None:
+            vote_names = {
+                v["name"] for v in (progress.verify_votes or [])
+                if isinstance(v.get("name"), str) and v["name"]
+            }
+            if vote_names:
+                group = next(
+                    (g for g in reversed(phase.verify_groups)
+                     if g.label == label and self._verify_group_shares_roster(g, vote_names)),
+                    None,
+                )
+        if group is None:
+            group = next(
+                (g for g in reversed(phase.verify_groups) if g.label == label),
+                None,
+        )
+        if group is None:
+            # Defensive: settled without a started card (partial replay) —
+            # materialize the card directly with the settled data.
+            group = WorkflowVerifyGroupState(
+                id=f"{phase.id}-verify-{len(phase.verify_groups) + 1}",
+                label=label,
+                verify_id=progress.verify_id,
+                started_at=WorkflowRunState._now_iso(),
+            )
+            phase.verify_groups.append(group)
+        group.status = "settled"
+        group.reviewers = progress.verify_reviewers
+        group.threshold = progress.verify_threshold
+        group.verdict = progress.verify_verdict
+        group.votes = list(progress.verify_votes or [])
+        if progress.outcome is not None:
+            group.outcome = progress.outcome
+        group.settled_at = WorkflowRunState._now_iso()
+        # The settle may land after the last reviewer's terminal event (the
+        # engine aggregates votes once every reviewer returned): re-run the
+        # author seal so a fully settled verify phase closes on this event.
+        if self._author_phase_sealable(phase, require_settled=True):
+            phase.status = self._phase_status_from_agents(phase)
+            logger.info(
+                "[WF_DBG WorkflowRunState] sealed verify phase=%s (all rounds settled, status=%s)",
+                phase.name, phase.status,
+            )
+        if sealed is not None:
+            return self._build_phases_delta([sealed, phase])
+        return self._build_phase_delta(phase)
+
     def _on_agent_started(self, progress: WorkflowProgress) -> dict[str, Any]:
         """Add a new agent, entering its phase and sealing the previous one."""
         self._apply_nested_phase(progress, "agent_started")
+        # Agent cards follow the run's liveness like phase cards do: an
+        # agent_started landing after the run was parked enters paused, so a
+        # paused run never shows a running agent. A resume re-emits
+        # workflow_started first (it flips the run back to running), so the
+        # relaunch path still enters running.
+        agent_status = "running" if self._phase_may_run() else "paused"
 
         def _label() -> str:
             if progress.label:
@@ -1091,12 +1516,17 @@ class WorkflowRunState(BaseModel):
 
         def _make_state(aid: str, label: str) -> WorkflowAgentState:
             return WorkflowAgentState(
-                id=aid, name=label, status="running",
+                id=aid, name=label, status=agent_status,
                 prompt=progress.prompt, model=progress.model,
                 started_at=WorkflowRunState._now_iso(),
                 kind="human" if progress.node_type in ("human", "human_session") else "agent",
                 node_type=progress.node_type,
                 correlation_id=progress.correlation_id,
+                parent_session_id=progress.parent_session_id,
+                member_name=progress.member_name,
+                agent_type=progress.agent_type,
+                agent_template=progress.agent_template,
+                display_name=progress.display_name,
             )
 
         def _reuse_existing(existing: WorkflowAgentState) -> None:
@@ -1109,9 +1539,14 @@ class WorkflowRunState(BaseModel):
             stamps are cleared so a running node does not carry stale terminal
             timestamps.
             """
-            existing.status = "running"
+            existing.status = agent_status
             existing.prompt = progress.prompt
             existing.model = progress.model
+            existing.agent_type = progress.agent_type
+            existing.agent_template = progress.agent_template
+            existing.display_name = progress.display_name
+            existing.parent_session_id = progress.parent_session_id
+            existing.member_name = progress.member_name
             existing.completed_at = None
             existing.duration_ms = None
 
@@ -1121,7 +1556,10 @@ class WorkflowRunState(BaseModel):
                 _reuse_existing(existing)
             else:
                 child_phase.agents.append(agent_state)
-            if self._is_terminal_status(child_phase.status) or child_phase.status == "paused":
+            phase_may_run = self._phase_may_run()
+            if phase_may_run and (
+                self._is_terminal_status(child_phase.status) or child_phase.status == "paused"
+            ):
                 child_phase.status = "running"
                 logger.info("[WF_DBG child] reactivated child phase=%s (new agent arrived)", child_phase.name)
             self._refresh_phase_counts(child_phase)
@@ -1129,7 +1567,9 @@ class WorkflowRunState(BaseModel):
             if child_phase.parent_phase:
                 parent = self._find_parent_author_phase(name=child_phase.parent_phase)
                 if parent is not None:
-                    if self._is_terminal_status(parent.status) or parent.status == "paused":
+                    if phase_may_run and (
+                        self._is_terminal_status(parent.status) or parent.status == "paused"
+                    ):
                         parent.status = "running"
                         logger.info("[WF_DBG parent] reactivated parent=%s (new agent on child=%s)",
                                     parent.name, child_phase.name)
@@ -1137,8 +1577,8 @@ class WorkflowRunState(BaseModel):
                     logger.debug("[WF_DBG parent] parent=%s agent_count=%s (refreshed after child=%s start)",
                                 parent.name, parent.agent_count, child_phase.name)
             self._refresh_run_agent_counts()
-            logger.debug("[WF_DBG WorkflowRunState] agent %s -> running, child_phase=%s",
-                         label, child_phase.name)
+            logger.debug("[WF_DBG WorkflowRunState] agent %s -> %s, child_phase=%s",
+                         label, agent_status, child_phase.name)
             if parent is not None:
                 return self._build_phases_delta([parent, child_phase])
             return self._build_phase_delta(child_phase)
@@ -1163,7 +1603,7 @@ class WorkflowRunState(BaseModel):
         if sealed_phase is not None:
             self._refresh_phase_counts(sealed_phase)
         self._refresh_run_agent_counts()
-        logger.info("[WF_DBG WorkflowRunState] agent %s -> running, phase=%s", label, target_phase.name)
+        logger.info("[WF_DBG WorkflowRunState] agent %s -> %s, phase=%s", label, agent_status, target_phase.name)
         if sealed_phase is not None:
             return self._build_phases_delta([sealed_phase, target_phase])
         return self._build_phase_delta(target_phase)
@@ -1184,6 +1624,59 @@ class WorkflowRunState(BaseModel):
             error=progress.text or progress.outcome or "agent failed",
         )
 
+    def _on_agent_activity(self, progress: WorkflowProgress) -> Optional[dict[str, Any]]:
+        """Append one tool-call / tool-result activity row to the target node.
+
+        Locates the node by ``agent_id`` (resume-stable, distinguishes
+        parallel same-label nodes); legacy events without it fall back to the
+        latest running same-label node in the phase. A ``tool_result`` with a
+        matching ``tool_call_id`` pairs back onto its call row (fills
+        ``tool_result_preview``, no second row); an orphan result appends as
+        its own ``tool_result`` row, in order. The per-node activity list is
+        capped at 200 rows (oldest dropped). The delta carries only the
+        touched phase — statuses are untouched by activity.
+        """
+        self._apply_nested_phase(progress, "agent_activity")
+        phase, agent = self._resolve_agent(
+            progress.phase or _UNNAMED_PHASE,
+            progress.label or "",
+            agent_id=progress.agent_id,
+            correlation_id=progress.correlation_id,
+            iteration=progress.phase_iteration,
+        )
+        if phase is None or agent is None:
+            logger.warning(
+                "[WF_DBG WorkflowRunState] agent_activity dropped: "
+                "phase=%r label=%r agent_id=%r",
+                progress.phase, progress.label, progress.agent_id,
+            )
+            return None
+
+        activity_type = progress.activity_type or "tool_call"
+        tool_call_id = progress.tool_call_id
+        if activity_type == "tool_result" and tool_call_id:
+            # Pair back: fill the matching call row's result preview, in order —
+            # never append a second row for a matched result.
+            for entry in reversed(agent.activity):
+                if entry.type == "tool_call" and entry.tool_call_id == tool_call_id:
+                    entry.tool_result_preview = progress.content or ""
+                    return self._build_phase_delta(phase)
+
+        agent.activity.append(
+            WorkflowAgentActivity(
+                timestamp=self._now_iso(),
+                type=activity_type,
+                content=progress.content or "",
+                tool_name=progress.tool_name,
+                tool_call_id=tool_call_id,
+                tool_result_preview=None,
+            )
+        )
+        if len(agent.activity) > _ACTIVITY_RING_CAP:
+            # Ring cap: drop the oldest rows so the node list stays bounded.
+            del agent.activity[: len(agent.activity) - _ACTIVITY_RING_CAP]
+        return self._build_phase_delta(phase)
+
     def _on_human_prompt(self, progress: WorkflowProgress) -> Optional[dict[str, Any]]:
         """A human turn is now waiting for the person's reply.
 
@@ -1197,12 +1690,14 @@ class WorkflowRunState(BaseModel):
         )
         if phase is None or agent is None:
             return None
-        agent.status = "waiting_for_human"
+        # A human turn landing while the run is parked must not flip the card
+        # to waiting_for_human — same liveness gate as _on_human_replied.
+        agent.status = "waiting_for_human" if self._phase_may_run() else "paused"
         agent.correlation_id = progress.correlation_id
         agent.human_prompt = progress.prompt
         logger.info(
-            "[WF_DBG WorkflowRunState] agent %s -> waiting_for_human, phase=%s",
-            agent.name, phase.name,
+            "[WF_DBG WorkflowRunState] agent %s -> %s, phase=%s",
+            agent.name, agent.status, phase.name,
         )
         return self._build_phase_delta(phase)
 
@@ -1214,7 +1709,9 @@ class WorkflowRunState(BaseModel):
         )
         if phase is None or agent is None:
             return None
-        agent.status = "running"
+        # A reply landing while the run is parked must not flip the card back
+        # to running — same liveness gate as _on_agent_started.
+        agent.status = "running" if self._phase_may_run() else "paused"
         agent.human_reply = progress.answer
         logger.info(
             "[WF_DBG WorkflowRunState] agent %s -> replied, phase=%s",
@@ -1418,6 +1915,9 @@ class WorkflowRunState(BaseModel):
         result["estimated_token_count"] = self.estimated_token_count
         result["budget"] = self.budget
         result["workflow_budget"] = self.workflow_budget
+        # Run attribution: the member currently hosting the run (None = legacy
+        # event without team context — the frontend renders no badge).
+        result["executor"] = self.executor
         if self.budget_exhausted_scope is not None:
             result["budget_exhausted_scope"] = self.budget_exhausted_scope
         # A disk-restored run with no live controller ticket: the frontend

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import re
 from typing import Literal
 
-PublishAssetKind = Literal["skill", "agent_template", "plugin", "mcp"]
+PublishAssetKind = Literal["skill", "skillpack", "agent_template", "agent_group", "plugin", "mcp"]
 
 
 class PublishProtocolError(ValueError):
@@ -23,7 +23,9 @@ class PublishIdentity:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or self.kind not in {
             "skill",
+            "skillpack",
             "agent_template",
+            "agent_group",
             "plugin",
             "mcp",
         }:

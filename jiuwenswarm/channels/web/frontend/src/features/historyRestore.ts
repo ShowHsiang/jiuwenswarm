@@ -1,7 +1,10 @@
 import { runtimeMonitorNoticeId } from './runtimeMonitorNotices';
-import { Message, MessageRole, UsageSummary, FileDownloadItem, MediaItem, WsEvent, ToolExecution } from '../types';
+import { readOutputOrder, isSuppressedOutput } from './sessionOutput';
+import type { OutputOrder } from '../types/message';
+import { Message, MessageRole, UsageSummary, FileDownloadItem, MediaItem, WsEvent, ToolExecution, AskUserQuestionPayload, Question, UserAnswer, SessionTokenUsageSnapshot, parseSessionTokenUsageSnapshot } from '../types';
 import { webClient } from '../services/webClient';
 import { normalizeFinalContent } from '../utils/finalContent';
+import { describeChatError } from './free-models/chatError';
 import { mergeFileDownloadItems } from '../utils/fileDownloadDedup';
 import { parseTimestampToMs, timestampMsToIso } from '../utils/timestamp';
 import { extractAutomation } from '../utils/heartbeatAutomation';
@@ -11,12 +14,17 @@ import {
   extractCrossSessionMessage,
 } from '../utils/crossSessionMessage';
 import { isA2UIClientEventContent } from './a2ui/a2uiContent';
+import { buildQaSummaryContent } from '../components/InteractionSlot/qaSummary';
+import i18n from '../i18n';
 import { normalizeToolCallPayload, normalizeToolResultPayload } from './tool-events/toolEventNormalizer';
 import {
   buildGoalCompletedContent,
   isGoalCompletedContent,
 } from '../components/GoalBar/goalCompletedMessage';
 import { HistoryRecordReassembler } from './historyRecordReassembler';
+import { stripMentionAppendix } from './designer/designerMentions';
+import { expertTeamId } from './teamOrganization/conversation';
+import { isTeamOrganizationUiEnabled } from './teamOrganization/featureConfig';
 import { readAgentTemplateName } from './agentIdentity';
 import {
   isSingleAgentContextUsageSnapshot,
@@ -48,6 +56,9 @@ const ALLOWED_ASSISTANT_EVENT_TYPES = new Set([
   'chat.usage_summary',
   'chat.file',
   'chat.subtask_update',
+  'chat.ask_user_question',
+  'chat.ask_user_answer',
+  'chat.error',
   'team.message',
   'team.member',
   'team.task',
@@ -214,9 +225,9 @@ function normalizeRecoveredSubagentStatus(status: string): {
 
 /**
  * Recover subagent roster/result hints from the parent history's structured tool records.
- * The parent history endpoint currently filters chat.subtask_update, so this is only a
- * discovery bridge to the independent subagent history; it never treats tool-result text
- * as a transcript/result body except the explicit subagent_wait.results mapping.
+ * Complements disk discovery via history.done ``subagent_ids`` when parent roster frames
+ * are missing; never treats tool-result text as a transcript/result body except the
+ * explicit subagent_wait.results mapping.
  */
 export function recoverSubagentToolHistory(
   items: HistoryToolReplayItem[],
@@ -416,6 +427,7 @@ export function recoverSubagentToolHistory(
 
 /** 历史中随 chat.final / chat.tool_call 落盘的模型思考（reasoning_content），用于刷新后重建思考块。 */
 export interface HistoryReasoningReplayItem {
+  outputOrder?: OutputOrder;
   at: string;
   text: string;
   /** Web 单 Agent reasoning 所属的专家；Team/旧 history 缺失时为空。 */
@@ -457,11 +469,23 @@ export interface HistoryContextUsageReplayItem {
   payload: Record<string, unknown>;
 }
 
+/** 历史恢复出的问题澄清对话框（chat.ask_user_question），重组为 AskUserQuestionPayload 重新入队弹框。 */
+export interface HistoryPendingQuestionReplayItem {
+  at: string;
+  payload: AskUserQuestionPayload;
+}
+
+/** 历史恢复出的问题澄清答案（chat.ask_user_answer），按 request_id 与 pending_question 配对。 */
+export interface HistoryAnsweredQuestionReplayItem {
+  at: string;
+  payload: { request_id: string; answers: UserAnswer[] };
+}
+
 type HistoryTimelineEntry =
   | { kind: 'message'; message: Message }
   | { kind: 'tool_call'; at: string; payload: Record<string, unknown> }
   | { kind: 'tool_result'; at: string; payload: Record<string, unknown> }
-  | { kind: 'usage_summary'; at: string; usage: UsageSummary }
+  | { kind: 'usage_summary'; at: string; usage: UsageSummary; tokenUsageSnapshot: SessionTokenUsageSnapshot | null }
   | { kind: 'context_usage'; at: string; payload: Record<string, unknown> }
   | { kind: 'file_items'; at: string; files: FileDownloadItem[] }
   | { kind: 'team_member'; at: string; payload: { event: Record<string, unknown> } }
@@ -469,10 +493,12 @@ type HistoryTimelineEntry =
   | { kind: 'harness_message'; at: string; content: string; stage?: string }
   | { kind: 'harness_stage_result'; at: string; stage: string; status: string; error: string; messages: string[]; metrics: Record<string, unknown> }
   | { kind: 'compaction'; at: string; summary: string }
-  | { kind: 'reasoning'; at: string; text: string; agentTemplateName?: string; updatedAt?: number }
+  | { kind: 'reasoning'; outputOrder?: OutputOrder; at: string; text: string; agentTemplateName?: string; updatedAt?: number }
   | { kind: 'subagent_update'; at: string; payload: Record<string, unknown> }
   | { kind: 'subagent_message'; at: string; payload: Record<string, unknown> }
-  | { kind: 'subagent_activity'; at: string; payload: Record<string, unknown> };
+  | { kind: 'subagent_activity'; at: string; payload: Record<string, unknown> }
+  | { kind: 'pending_question'; at: string; payload: AskUserQuestionPayload }
+  | { kind: 'answered_question'; at: string; payload: { request_id: string; answers: UserAnswer[] } };
 
 /** 历史回放出的压缩汇总：boundary 记录计数，metadata 拼 tooltip 明细行 */
 export interface HistoryCompactionReplay {
@@ -483,6 +509,8 @@ export interface HistoryCompactionReplay {
 interface BeginHistoryRestoreOptions {
   sessionId: string;
   subagentId?: string;
+  /** Continue initial restore past batches with no restorable content. */
+  requestNextBatch: (cursor: string) => Promise<unknown>;
   onReady: (messages: Message[], cursor: HistoryCursorMeta) => void;
   /** 与消息同一时间线顺序，用于恢复 ToolGroupDisplay */
   onToolReplay?: (items: HistoryToolReplayItem[]) => void;
@@ -492,13 +520,21 @@ interface BeginHistoryRestoreOptions {
   onTeamReplay?: (items: HistoryTeamReplayItem[]) => void;
   /** 恢复独立 subagent history 中的 roster/status 与 transcript */
   onSubagentReplay?: (items: HistorySubagentReplayItem[]) => void;
+  /** Parent history.done may list on-disk subagent bucket ids (GitCode #4887). */
+  onDiscoveredSubagentIds?: (ids: string[]) => void;
   /** 与消息同一时间线顺序，用于恢复模型思考块（chat.reasoning） */
   onReasoningReplay?: (items: HistoryReasoningReplayItem[]) => void;
   /** 恢复上下文压缩汇总（context.compact_boundary），用于回显「本轮完成上下文压缩 N 次」 */
   onCompactionReplay?: (info: HistoryCompactionReplay) => void;
   /** 恢复最新的完整 context.usage 快照，供刷新/续接后恢复上下文用量指示器 */
   onContextUsage?: (payload: Record<string, unknown>) => void;
-  /** 无消息且无工具回放时调用；游标元数据仍决定是否存在更早记录。 */
+  /** 恢复最新的累计输入/输出快照，供刷新/续接后恢复累计 Token 栏目 */
+  onSessionTokenUsage?: (payload: SessionTokenUsageSnapshot) => void;
+  /** 恢复问题澄清对话框（chat.ask_user_question），重新入 pendingQuestion 队列弹交互框 */
+  onPendingQuestionReplay?: (items: HistoryPendingQuestionReplayItem[]) => void;
+  /** 恢复已答的问题澄清（chat.ask_user_answer），用于丢弃快照重新派发的过期问题 */
+  onAnsweredQuestionReplay?: (items: HistoryAnsweredQuestionReplayItem[]) => void;
+  /** Called only when the exhausted snapshot has no restorable content. */
   onEmpty?: (cursor: HistoryCursorMeta) => void;
   onFailure?: (failure: HistoryRestoreFailure) => void;
   onError?: (message: string) => void;
@@ -565,7 +601,7 @@ function isProactiveRecommendationRecord(record: Record<string, unknown>): boole
  * 重建后会污染上一条用户消息的思考状态（"已完成" → "已完成 N 次思考"），故跳过。
  */
 function extractHistoryReasoningText(record: Record<string, unknown>): string {
-  if (isProactiveRecommendationRecord(record)) return '';
+  if (isProactiveRecommendationRecord(record) || isSuppressedOutput(record) || isSuppressedOutput(buildEventPayloadForRecord(record))) return '';
   const direct = record.reasoning_content;
   if (typeof direct === 'string' && direct.trim()) {
     return direct.trim();
@@ -859,6 +895,14 @@ function normalizeHistoryMediaItem(value: unknown): MediaItem | null {
     return null;
   }
 
+  // The composer draft's own id (session.assets.register's idempotency key),
+  // persisted by the backend (_history_media_record, interface.py) specifically so
+  // resolveAssetDisplayNames can match a restored message's attachment back to the
+  // ONE asset it actually created -- a path can now legitimately back more than
+  // one asset (a deliberate re-attach), so matching by path alone after a reload
+  // would resolve to whichever asset happens to be newest.
+  const clientId = pickFirstString(value, ['client_id', 'clientId']);
+
   return {
     type,
     filename,
@@ -866,6 +910,7 @@ function normalizeHistoryMediaItem(value: unknown): MediaItem | null {
     mime_type: mimeType,
     mimeType,
     ...(typeof size === 'number' ? { size_bytes: size, sizeBytes: size } : {}),
+    ...(clientId ? { clientId } : {}),
   };
 }
 
@@ -900,7 +945,7 @@ function appendHistoryMediaItems(
   }
 }
 
-function extractHistoryMediaItems(record: Record<string, unknown>): MediaItem[] {
+export function extractHistoryMediaItems(record: Record<string, unknown>): MediaItem[] {
   const mediaItems: MediaItem[] = [];
   const seenKeys = new Set<string>();
 
@@ -924,6 +969,42 @@ function extractHistoryMediaItems(record: Record<string, unknown>): MediaItem[] 
 
 function isTruthyHistoryFlag(value: unknown): boolean {
   return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function extractHistorySupplementalInput(
+  record: Record<string, unknown>
+): Message['supplementalInput'] | undefined {
+  const payload = buildEventPayloadForRecord(record);
+  const raw = isRecord(record.supplemental_input)
+    ? record.supplemental_input
+    : isRecord(payload.supplemental_input)
+      ? payload.supplemental_input
+      : null;
+  const marked =
+    isTruthyHistoryFlag(record.is_supplemental_input) ||
+    isTruthyHistoryFlag(payload.is_supplemental_input) ||
+    Boolean(raw);
+  if (!marked) return undefined;
+
+  const executionId = raw ? pickFirstString(raw, ['execution_id', 'executionId']) ?? '' : '';
+  const streamMessageId = raw
+    ? pickFirstString(raw, ['stream_message_id', 'streamMessageId'])
+    : undefined;
+  const rawOffset = raw?.stream_offset ?? raw?.streamOffset;
+  const numericOffset =
+    typeof rawOffset === 'number'
+      ? rawOffset
+      : typeof rawOffset === 'string' && rawOffset.trim()
+        ? Number(rawOffset)
+        : 0;
+  // Older records nested the input ID; new records use the ordinary request_id.
+  const requestId = raw?.request_id ?? record.request_id ?? payload.request_id;
+  return {
+    executionId,
+    ...(typeof requestId === 'string' ? { requestId } : {}),
+    ...(streamMessageId ? { streamMessageId } : {}),
+    streamOffset: Number.isFinite(numericOffset) && numericOffset >= 0 ? numericOffset : 0,
+  };
 }
 
 function compactTokenCount(value: number): string {
@@ -977,11 +1058,53 @@ function parseHistoryTimelineEntry(
   sessionId: string,
   subagentId?: string,
 ): HistoryTimelineEntry | null {
+  const payload = buildEventPayloadForRecord(record);
+  const teamId = expertTeamId({ ...payload, ...record }, sessionId);
+  if (teamId && !isTeamOrganizationUiEnabled()) return null;
+  const expertTeammate = Boolean(teamId && isTeamTeammateMessageRecord(record));
+  const entry = parseSessionHistoryTimelineEntry(
+    expertTeammate ? { ...record, role: 'assistant' } : record,
+    sessionId,
+    subagentId,
+  );
+  if (teamId && entry) {
+    // Expert history never replays tools or lifecycle into the owner's runtime.
+    if (entry.kind !== 'message') return null;
+    entry.message.teamId = teamId;
+    if (expertTeammate && record.event_type === 'chat.final') {
+      entry.message.id = `team-member-${String(payload.member_name ?? '')}@${entry.message.id}`;
+      entry.message.content = normalizeFinalContent(payload);
+    }
+  }
+  return entry;
+}
+
+function sessionTokenUsageSnapshotForHistory(
+  value: unknown,
+  sessionId: string,
+  subagentId?: string,
+): SessionTokenUsageSnapshot | null {
+  const snapshot = parseSessionTokenUsageSnapshot(value);
+  if (subagentId || snapshot?.session_id !== sessionId || snapshot.revision <= 0) {
+    return null;
+  }
+  return snapshot;
+}
+
+function parseSessionHistoryTimelineEntry(
+  record: Record<string, unknown>,
+  sessionId: string,
+  subagentId?: string,
+): HistoryTimelineEntry | null {
+  const eventPayload = buildEventPayloadForRecord(record);
+  if ((isSuppressedOutput(record) || isSuppressedOutput(eventPayload)) && record.event_type !== 'chat.tool_result') return null;
   const role = normalizeHistoryRole(record.role);
   const at = recordTimestampIso(record) ?? '';
   const forkedFromSessionId = readForkSourceSessionId(record);
 
   if (role === 'user') {
+    const userEventType = typeof record.event_type === 'string' ? record.event_type.trim() : '';
+    if (userEventType.startsWith('design.')) return null;
     const rawContent = record.content ?? record.text ?? record.body;
     if (isA2UIClientEventContent(rawContent)) {
       return null;
@@ -1007,6 +1130,7 @@ function parseHistoryTimelineEntry(
     const userCrossSession =
       extractCrossSessionMessage(record) ??
       extractCrossSessionMessage(buildEventPayloadForRecord(record));
+    const supplementalInput = extractHistorySupplementalInput(record);
     const id = userCrossSession
       ? crossSessionUserMessageId(userCrossSession.messageId)
       : restoredId;
@@ -1015,7 +1139,9 @@ function parseHistoryTimelineEntry(
       message: {
         id,
         role: 'user',
-        content,
+        outputOrder: readOutputOrder(record) ?? readOutputOrder(eventPayload),
+        // A design "@" mention carries a leader-only appendix; show the user's own text.
+        content: stripMentionAppendix(content),
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
         ...(mediaItems.length > 0 ? { mediaItems } : {}),
@@ -1023,6 +1149,7 @@ function parseHistoryTimelineEntry(
         ...(skills && skills.length > 0 ? { skills } : {}),
         ...(userAutomation ? { automation: userAutomation } : {}),
         ...(userCrossSession ? { crossSession: userCrossSession } : {}),
+        ...(supplementalInput ? { supplementalInput } : {}),
       },
     };
   }
@@ -1103,7 +1230,41 @@ function parseHistoryTimelineEntry(
     return { kind: 'subagent_update', at, payload };
   }
 
+  if (eventType === 'chat.error') {
+    // Use the same stable-code guidance as live delivery. Older records without
+    // a known code keep their original diagnostic text.
+    const errContent =
+      (typeof record.content === 'string' && record.content) ||
+      (typeof payload.content === 'string' && payload.content) ||
+      '';
+    if (!errContent.trim()) {
+      return null;
+    }
+    const restoredId =
+      pickFirstString(record, ['id', 'message_id', 'msg_id']) ?? `hist-error-${sessionId}-${at}`;
+    const errorMsg = describeChatError(
+      { code: record.code ?? payload.code, upstream: record.upstream ?? payload.upstream },
+      errContent,
+      (key) => i18n.t(key),
+    );
+    return {
+      kind: 'message',
+      message: {
+        id: restoredId,
+        role: 'system',
+        content: errorMsg,
+        timestamp: at,
+        ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
+      },
+    };
+  }
+
   if (eventType === 'chat.final') {
+    // A full-duplex task's raw Core answer (with its spoken-brief markers) is never shown
+    // live; the duplex runtime persists the clean result as its own tool_result reply.
+    if (record.channel_id === 'video_tool' || payload.channel_id === 'video_tool') {
+      return null;
+    }
     // Goal 完成卡片落盘的是 `goal.completed:` + JSON 信封，不是展示文本。
     // normalizeFinalContent 会把字面 `\n` 还原成真换行（GFM 表格要靠这个），信封里的
     // JSON 字符串于是带上非法控制符，parseGoalCompletedContent 解析失败 →
@@ -1149,34 +1310,29 @@ function parseHistoryTimelineEntry(
         },
       };
     }
-    // 主动推荐消息：从历史记录还原 source/proactive_type，使刷新后仍按
-    // ProactiveRecommendationCard 渲染（否则会退化为普通白色气泡）。
-    const histSource = typeof payload.source === 'string' ? payload.source : '';
-    const isProactiveRecommendation = histSource === 'proactive_recommendation';
-    const histProactiveType = typeof payload.proactive_type === 'string' ? payload.proactive_type : '';
-    const agentTemplateName = isProactiveRecommendation
-      ? undefined
-      : readAgentTemplateName(payload) ?? readAgentTemplateName(record);
-    // 刷新后历史里的 proactive 消息也需带 proactiveRecId，否则赞/踩按钮在历史消息上不出现。
-    const histProactiveRecId = typeof payload.proactive_rec_id === 'string' ? payload.proactive_rec_id : '';
+    // Scheduled proactive recommendation history is no longer restored into the chat UI.
+    if (isProactiveRecommendationRecord(record) || isProactiveRecommendationRecord(payload)) {
+      return null;
+    }
+    const agentTemplateName = readAgentTemplateName(payload) ?? readAgentTemplateName(record);
     const assistantCrossSession =
       extractCrossSessionMessage(payload) ?? extractCrossSessionMessage(record);
     const id = assistantCrossSession
       ? crossSessionAssistantMessageId(record.request_id, assistantCrossSession.messageId)
       : restoredId;
     // completed_at：收尾时刻（耗时）；timestamp 已是气泡出现/首包时刻（排序）
-    const completedAt =
-      (typeof record.completed_at === 'number' || typeof record.completed_at === 'string'
-        ? recordTimestampIso({ timestamp: record.completed_at })
-        : undefined) ||
-      (typeof payload.completed_at === 'number' || typeof payload.completed_at === 'string'
-        ? recordTimestampIso({ timestamp: payload.completed_at })
-        : undefined);
+    const recordCompletedAtMs = parseTimestampToMs(record.completed_at);
+    const completedAtMs = Number.isFinite(recordCompletedAtMs)
+      ? recordCompletedAtMs
+      : parseTimestampToMs(payload.completed_at);
+    const completedAt = timestampMsToIso(completedAtMs);
     return {
       kind: 'message',
       message: {
         id,
         role: 'assistant',
+        outputOrder: readOutputOrder(record) ?? readOutputOrder(payload),
+        outputPhaseId: typeof record.output_phase_id === 'string' ? record.output_phase_id : undefined,
         content,
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
@@ -1188,13 +1344,8 @@ function parseHistoryTimelineEntry(
         ...(record.channel_id === 'video_duplex' || payload.channel_id === 'video_duplex'
           ? { keepExpanded: true }
           : {}),
-        ...(completedAt ? { completedAt } : {}),
-        ...(isProactiveRecommendation ? { isProactiveRecommendation } : {}),
-        ...(isProactiveRecommendation && histProactiveType
-          ? { proactiveType: histProactiveType as 'skill_recommend' | 'task_reminder' | 'need_exploration' }
-          : {}),
+        ...(completedAt ? { completedAt, outputReplayUntil: completedAtMs } : {}),
         ...(agentTemplateName ? { agentTemplateName } : {}),
-        ...(isProactiveRecommendation && histProactiveRecId ? { proactiveRecId: histProactiveRecId } : {}),
         ...(assistantCrossSession ? { crossSession: assistantCrossSession } : {}),
         // §9：Heartbeat 自动轮的 assistant 消息同样带 metadata.automation 落盘，恢复时读回。
         // 优先读 payload（event_payload 已提升），再回退到 record 顶层。
@@ -1244,7 +1395,12 @@ function parseHistoryTimelineEntry(
       if (typeof rawUsage.input_cost === 'number') usage.input_cost = rawUsage.input_cost;
       if (typeof rawUsage.output_cost === 'number') usage.output_cost = rawUsage.output_cost;
       if (typeof rawUsage.total_cost === 'number') usage.total_cost = rawUsage.total_cost;
-      return { kind: 'usage_summary', at, usage };
+      return {
+        kind: 'usage_summary',
+        at,
+        usage,
+        tokenUsageSnapshot: sessionTokenUsageSnapshotForHistory(payload.session_usage, sessionId, subagentId),
+      };
     }
     return null;
   }
@@ -1282,6 +1438,116 @@ function parseHistoryTimelineEntry(
       kind: 'file_items',
       at,
       files,
+    };
+  }
+
+  // 问题澄清对话框（chat.ask_user_question）落盘的是问题列表（含完整 options）。
+  // 历史恢复时把 questions 重组为 AskUserQuestionPayload 作为 pending_question 条目。
+  // 在 materializeHistoryTimeline 里：若能按 request_id 配对到 chat.ask_user_answer，
+  // 渲染成带答案的 qa.summary 回显卡；否则渲染成 answers 为空的只读 qa.summary 卡片
+  // （不弹实时交互框——web 重连后后端不重发挂起中断，弹框 + resume 会报
+  // "session has no active execution"，见下方未配对分支）。
+  if (eventType === 'chat.ask_user_question') {
+    // Permission approvals share this event but are not clarification questions.
+    if (payload.source === 'permission_interrupt') {
+      return null;
+    }
+    const rawQuestions = payload.questions;
+    if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return null;
+    }
+    const questions: Question[] = [];
+    for (const q of rawQuestions) {
+      if (!isRecord(q)) continue;
+      const questionText = typeof q.question === 'string' ? q.question : '';
+      if (!questionText.trim()) continue;
+      const rawOptions = Array.isArray(q.options) ? q.options : [];
+      const options: Question['options'] = [];
+      for (const opt of rawOptions) {
+        if (!isRecord(opt)) continue;
+        const label = typeof opt.label === 'string' ? opt.label : '';
+        if (!label.trim()) continue;
+        const option: { label: string; description?: string; value?: string } = { label };
+        if (typeof opt.description === 'string' && opt.description.trim()) {
+          option.description = opt.description;
+        }
+        if (typeof opt.value === 'string' && opt.value.trim()) {
+          option.value = opt.value;
+        }
+        options.push(option);
+      }
+      const item: Question = {
+        question: questionText,
+        header: typeof q.header === 'string' && q.header.trim() ? q.header : 'Question',
+        options,
+        multi_select: !!q.multi_select,
+      };
+      if (typeof q.card_id === 'string' && q.card_id.trim()) {
+        item.card_id = q.card_id;
+      }
+      questions.push(item);
+    }
+    if (questions.length === 0) {
+      return null;
+    }
+    const requestId =
+      (typeof payload.request_id === 'string' ? payload.request_id : '') ||
+      (typeof record.request_id === 'string' ? record.request_id : '');
+    if (!requestId) {
+      return null;
+    }
+    const pendingPayload: AskUserQuestionPayload = {
+      request_id: requestId,
+      questions,
+      source: typeof payload.source === 'string' ? payload.source : undefined,
+    };
+    return {
+      kind: 'pending_question',
+      at,
+      payload: pendingPayload,
+    };
+  }
+
+  // 问题澄清答案（chat.ask_user_answer）落盘的是 answers 数组（含 question /
+  // selected_options / custom_input），request_id 与对应 chat.ask_user_question 一致。
+  // 历史恢复时在 materializeHistoryTimeline 里按 request_id 与 pending_question 配对：
+  // 配对成功的渲染成带答案的 qa.summary 回显卡，未配对的 pending_question 才弹框。
+  if (eventType === 'chat.ask_user_answer') {
+    const requestId =
+      (typeof payload.request_id === 'string' ? payload.request_id : '') ||
+      (typeof record.request_id === 'string' ? record.request_id : '');
+    if (!requestId) {
+      return null;
+    }
+    const rawAnswers = payload.answers;
+    if (!Array.isArray(rawAnswers) || rawAnswers.length === 0) {
+      return null;
+    }
+    const answers: UserAnswer[] = [];
+    for (const a of rawAnswers) {
+      if (!isRecord(a)) continue;
+      const selected = Array.isArray(a.selected_options)
+        ? a.selected_options.filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+        : [];
+      const answer: UserAnswer = {
+        question: typeof a.question === 'string' ? a.question : undefined,
+        selected_options: selected,
+      };
+      if (typeof a.custom_input === 'string' && a.custom_input.trim()) {
+        answer.custom_input = a.custom_input;
+      }
+      if (typeof a.card_id === 'string' && a.card_id.trim()) {
+        answer.card_id = a.card_id;
+      }
+      answers.push(answer);
+    }
+    if (answers.length === 0) {
+      return null;
+    }
+    return {
+      kind: 'answered_question',
+      at,
+      payload: { request_id: requestId, answers },
     };
   }
 
@@ -1357,6 +1623,9 @@ interface MaterializedHistoryTimeline {
   subagentReplay: HistorySubagentReplayItem[];
   reasoningReplay: HistoryReasoningReplayItem[];
   contextUsageReplay: HistoryContextUsageReplayItem[];
+  tokenUsageSnapshot: SessionTokenUsageSnapshot | null;
+  pendingQuestionReplay: HistoryPendingQuestionReplayItem[];
+  answeredQuestionReplay: HistoryAnsweredQuestionReplayItem[];
 }
 
 function entryTimestamp(entry: HistoryTimelineEntry): string {
@@ -1409,6 +1678,133 @@ function sinkGoalCompletionCardsToTurnEnd(
   );
 }
 
+/** 未答的澄清问题（pending_question）沉到本轮末尾。
+ *
+ * 实时侧未答问题框是 LLM 那轮产出全部完成后才弹出（吸附输入框底部），
+ * 但历史里 chat.ask_user_question 的落盘时刻略早于同轮收尾的 chat.final /
+ * chat.usage_summary（LLM 流式产出时 question chunk 先到、final 后到），
+ * 直接按时间戳排序会把未答 qa.summary 卡排到 chat.final 前面，与实时反过来。
+ * 已答的 pending_question 不在此处理——它们在主循环里被跳过，改由
+ * answered_question 条目处 push（位置已对）。
+ */
+function sinkUnansweredQuestionsToTurnEnd(
+  entries: HistoryTimelineEntry[]
+): HistoryTimelineEntry[] {
+  const answeredRequestIds = new Set<string>();
+  for (const e of entries) {
+    if (e.kind === 'answered_question') {
+      answeredRequestIds.add(e.payload.request_id);
+    }
+  }
+  const out = [...entries];
+  let changed = false;
+
+  for (let i = 0; i < out.length; i += 1) {
+    const entry = out[i];
+    if (entry.kind !== 'pending_question') {
+      continue;
+    }
+    if (answeredRequestIds.has(entry.payload.request_id)) {
+      // 已答：主循环会从 answered_question 处 push，这里不动。
+      continue;
+    }
+    const cardMs = safeTimestampMs(entryTimestamp(entry));
+    let turnEndMs = cardMs;
+    // 向后扫到下一个 user 消息（本轮边界），取本轮末尾时间。
+    for (let j = i + 1; j < out.length; j += 1) {
+      const next = out[j];
+      if (next.kind === 'message' && next.message.role === 'user') {
+        break;
+      }
+      turnEndMs = Math.max(turnEndMs, safeTimestampMs(entryTimestamp(next)));
+    }
+    if (turnEndMs <= cardMs) {
+      continue;
+    }
+    const iso = timestampMsToIso(turnEndMs + 1);
+    if (!iso) {
+      continue;
+    }
+    out[i] = { ...entry, at: iso };
+    changed = true;
+  }
+
+  if (!changed) {
+    return entries;
+  }
+  return out.sort(
+    (a, b) => safeTimestampMs(entryTimestamp(a)) - safeTimestampMs(entryTimestamp(b))
+  );
+}
+
+/** 已答问题合并成 qa.summary 回显卡消息（QaSummaryCard 渲染，带答案）。 */
+function buildAnsweredQaSummaryMessage(
+  at: string,
+  pending: AskUserQuestionPayload,
+  answers: UserAnswer[],
+): Message | null {
+  const answerByQuestion = new Map<string, UserAnswer>();
+  for (const a of answers) {
+    if (a.question) {
+      answerByQuestion.set(a.question, a);
+    }
+  }
+  const items = (pending.questions ?? []).map((q) => {
+    const ans = answerByQuestion.get(q.question);
+    const answerTexts: string[] = [];
+    const answerSources: Array<'option' | 'input'> = [];
+    if (ans) {
+      for (const opt of ans.selected_options ?? []) {
+        if (opt.trim()) {
+          answerTexts.push(opt);
+          answerSources.push('option');
+        }
+      }
+      if (ans.custom_input && ans.custom_input.trim()) {
+        answerTexts.push(ans.custom_input);
+        answerSources.push('input');
+      }
+    }
+    const header = q.header && q.header.trim() ? q.header : undefined;
+    return { header, question: q.question, answers: answerTexts, answerSources };
+  });
+  if (items.length === 0) {
+    return null;
+  }
+  return {
+    id: `qa-summary-hist-${pending.request_id || at}`,
+    role: 'assistant',
+    content: buildQaSummaryContent({ title: i18n.t('qaSummary.title'), items }),
+    timestamp: at,
+  };
+}
+
+/**
+ * 历史恢复出的「未答」问题澄清对话框——渲染成只读 qa.summary 卡片
+ * （QaSummaryCard 在 answers 为空时展示「—」），不弹实时交互框。
+ *
+ * 见 materializeHistoryTimeline 里 pending_question 未配对分支的说明：
+ * 后端 execution handle 在页面刷新后不可靠，弹框 + resume 会报
+ * "session has no active execution"，所以只读展示。
+ */
+function buildUnansweredQaSummaryMessage(
+  at: string,
+  pending: AskUserQuestionPayload,
+): Message | null {
+  const items = (pending.questions ?? []).map((q) => ({
+    header: q.header && q.header.trim() ? q.header : undefined,
+    question: q.question,
+    answers: [] as string[],
+  }));
+  if (items.length === 0) return null;
+  return {
+    id: `qa-summary-hist-${pending.request_id || at}`,
+    role: 'assistant',
+    content: buildQaSummaryContent({ title: i18n.t('qaSummary.title'), items }),
+    timestamp: at,
+  };
+}
+
 /** 将 history 条目折叠成消息/工具/思考，供 restore / page / 文件预览共用。入口统一升序。 */
 function materializeHistoryTimeline(
   rawEntries: HistoryTimelineEntry[]
@@ -1417,7 +1813,9 @@ function materializeHistoryTimeline(
   const sortedEntries = [...rawEntries].sort(
     (a, b) => safeTimestampMs(entryTimestamp(a)) - safeTimestampMs(entryTimestamp(b))
   );
-  const entries = sinkGoalCompletionCardsToTurnEnd(sortedEntries);
+  const entries = sinkUnansweredQuestionsToTurnEnd(
+    sinkGoalCompletionCardsToTurnEnd(sortedEntries),
+  );
   const messages: Message[] = [];
   const toolReplay: HistoryToolReplayItem[] = [];
   const harnessReplay: HistoryHarnessReplayItem[] = [];
@@ -1425,6 +1823,25 @@ function materializeHistoryTimeline(
   const subagentReplay: HistorySubagentReplayItem[] = [];
   const reasoningReplay: HistoryReasoningReplayItem[] = [];
   const contextUsageReplay: HistoryContextUsageReplayItem[] = [];
+  let tokenUsageSnapshot: SessionTokenUsageSnapshot | null = null;
+  const pendingQuestionReplay: HistoryPendingQuestionReplayItem[] = [];
+  const answeredQuestionReplay: HistoryAnsweredQuestionReplayItem[] = [];
+
+  // 先扫一遍收集已答问题，供 pending_question / answered_question 配对：
+  // 已答的渲染成带答案的 qa.summary 回显卡（进 messages）；
+  // 未答的也渲染成 qa.summary 卡片（answers 为空），不弹实时交互框（见下方分支）。
+  const answeredByRequestId = new Map<string, UserAnswer[]>();
+  // pending_question 的 payload（问题原文+选项），按 request_id 索引——
+  // 已答的 qa.summary 卡改在 answered_question 条目处 push（用答案时间定位），
+  // 但卡内容需要问题+答案合并，故需在此预扫一遍把问题 payload 存起来。
+  const pendingQuestionByRequestId = new Map<string, AskUserQuestionPayload>();
+  for (const e of entries) {
+    if (e.kind === 'answered_question') {
+      answeredByRequestId.set(e.payload.request_id, e.payload.answers);
+    } else if (e.kind === 'pending_question') {
+      pendingQuestionByRequestId.set(e.payload.request_id, e.payload);
+    }
+  }
 
   for (const e of entries) {
     if (e.kind === 'message') {
@@ -1438,7 +1855,47 @@ function materializeHistoryTimeline(
       messages.push(e.message);
       continue;
     }
+    if (e.kind === 'pending_question') {
+      const answers = answeredByRequestId.get(e.payload.request_id);
+      if (answers) {
+        // 已答：不在问题出现位置 push qa.summary 卡——改由下方 answered_question
+        // 条目处 push（用答案提交时间定位，与实时回显位置一致：实时回显的 qa.summary
+        // 卡在用户点确认那一刻追加到列表末尾，而非问题出现时刻）。这里直接跳过。
+      } else {
+        // 未答：不再弹实时交互框。
+        // web 通道重连后后端不会重新派发挂起的 chat.ask_user_question（_on_connect
+        // 只发 connection.ack，session.get_metadata 也不含 pending interaction），
+        // 原 execution handle 在刷新/重启后已不可靠——用户点确认会发 chat.send resume，
+        // 后端找不到 WAITING_FOR_CONTROL 的 parent 而抛 "session has no active execution"。
+        // 改成只读 qa.summary 回显卡（answers 为空，QaSummaryCard 渲染「—」），
+        // 让用户看到曾经被问过什么，但不提供无法兑现的确认按钮。
+        const unansweredMessage = buildUnansweredQaSummaryMessage(e.at, e.payload);
+        if (unansweredMessage) {
+          messages.push(unansweredMessage);
+        }
+      }
+      continue;
+    }
+    if (e.kind === 'answered_question') {
+      // 已答：在此处（答案提交时间位置）push qa.summary 回显卡，与实时回显位置一致。
+      // 用 answered_question 的 at（chat.ask_user_answer 落盘时间），而非问题的 at。
+      const pending = pendingQuestionByRequestId.get(e.payload.request_id);
+      if (pending) {
+        const qaMessage = buildAnsweredQaSummaryMessage(e.at, pending, e.payload.answers);
+        if (qaMessage) {
+          messages.push(qaMessage);
+        }
+      }
+      answeredQuestionReplay.push({ at: e.at, payload: e.payload });
+      continue;
+    }
     if (e.kind === 'usage_summary') {
+      if (
+        e.tokenUsageSnapshot
+        && (!tokenUsageSnapshot || e.tokenUsageSnapshot.revision > tokenUsageSnapshot.revision)
+      ) {
+        tokenUsageSnapshot = e.tokenUsageSnapshot;
+      }
       for (let i = messages.length - 1; i >= 0; i -= 1) {
         if (messages[i].role === 'assistant') {
           messages[i] = { ...messages[i], usageSummary: e.usage };
@@ -1506,6 +1963,7 @@ function materializeHistoryTimeline(
       reasoningReplay.push({
         at: e.at,
         text: e.text,
+        outputOrder: e.outputOrder,
         agentTemplateName: e.agentTemplateName,
         updatedAt: e.updatedAt,
       });
@@ -1526,6 +1984,9 @@ function materializeHistoryTimeline(
     subagentReplay,
     reasoningReplay,
     contextUsageReplay,
+    tokenUsageSnapshot,
+    pendingQuestionReplay,
+    answeredQuestionReplay,
   };
 }
 
@@ -1562,6 +2023,7 @@ export interface HistoryTimelinePreview {
   messages: Message[];
   executions: ToolExecution[];
   reasoningSegments: {
+    outputOrder?: OutputOrder;
     id: string;
     text: string;
     startedAt: number;
@@ -1572,6 +2034,9 @@ export interface HistoryTimelinePreview {
   }[];
   mode: 'team' | null;
   contextUsageSnapshot: Record<string, unknown> | null;
+  tokenUsageSnapshot: SessionTokenUsageSnapshot | null;
+  pendingQuestions: HistoryPendingQuestionReplayItem[];
+  answeredQuestions: HistoryAnsweredQuestionReplayItem[];
 }
 
 /**
@@ -1582,7 +2047,7 @@ export function parseHistoryJsonFileToTimelinePreview(
   sessionId: string
 ): HistoryTimelinePreview {
   if (!Array.isArray(parsed)) {
-    return { messages: [], executions: [], reasoningSegments: [], mode: null, contextUsageSnapshot: null };
+    return { messages: [], executions: [], reasoningSegments: [], mode: null, contextUsageSnapshot: null, tokenUsageSnapshot: null, pendingQuestions: [], answeredQuestions: [] };
   }
 
   const entries: HistoryTimelineEntry[] = [];
@@ -1603,6 +2068,7 @@ export function parseHistoryJsonFileToTimelinePreview(
     if (reasoningText) {
       entries.push({
         kind: 'reasoning',
+        outputOrder: readOutputOrder(item, 'reasoning_output_order'),
         at: recordTimestampIso(item) ?? '',
         text: reasoningText,
         agentTemplateName: readHistoryAgentTemplateName(item),
@@ -1618,7 +2084,7 @@ export function parseHistoryJsonFileToTimelinePreview(
     return safeTimestampMs(aAt) - safeTimestampMs(bAt);
   });
 
-  const { messages, toolReplay, reasoningReplay, contextUsageReplay } = materializeHistoryTimeline(entries);
+  const { messages, toolReplay, reasoningReplay, contextUsageReplay, tokenUsageSnapshot, pendingQuestionReplay, answeredQuestionReplay } = materializeHistoryTimeline(entries);
   const executions = buildToolExecutionsFromReplay(toolReplay);
   const reasoningSegments = buildReasoningSegmentsFromReplay(sessionId, reasoningReplay);
 
@@ -1628,6 +2094,9 @@ export function parseHistoryJsonFileToTimelinePreview(
     reasoningSegments,
     mode: isTeam ? 'team' : null,
     contextUsageSnapshot: selectLatestContextUsagePayload(contextUsageReplay),
+    tokenUsageSnapshot,
+    pendingQuestions: pendingQuestionReplay,
+    answeredQuestions: answeredQuestionReplay,
   };
 }
 
@@ -1639,10 +2108,11 @@ function buildReasoningSegmentsFromReplay(
   const seen = new Set<string>();
   items.forEach((item, index) => {
     const text = item.text?.trim();
-    if (!text || seen.has(text)) {
+    const identity = item.outputOrder ? `${item.outputOrder.requestId}:${item.outputOrder.sequence}` : text;
+    if (!text || seen.has(identity)) {
       return;
     }
-    seen.add(text);
+    seen.add(identity);
     const parsed = parseTimestampToMs(item.at);
     // 解析失败时跳过该段，勿用 index 当 epoch（会让 startMs≈0，耗时爆炸）
     if (!Number.isFinite(parsed)) {
@@ -1659,6 +2129,7 @@ function buildReasoningSegmentsFromReplay(
     segments.push({
       id: `hist-preview-rsn-${sessionId}-${index}`,
       text,
+      outputOrder: item.outputOrder,
       startedAt,
       closed: true,
       ...(item.agentTemplateName ? { agentTemplateName: item.agentTemplateName } : {}),
@@ -1692,12 +2163,14 @@ function buildToolExecutionsFromReplay(toolReplay: HistoryToolReplayItem[]): Too
       const agentTemplateName = readAgentTemplateName(item.payload);
       byId.set(n.id, {
         toolCallId: n.id,
+        outputOrder: n.outputOrder,
         toolCall: {
           id: n.id,
           name: n.name,
           arguments: n.arguments,
           description: n.description,
           formatted_args: n.formatted_args,
+          call_goal: n.call_goal,
           display_name: n.display_name,
           memberName: n.memberName,
           reviewer: n.reviewer,
@@ -1727,6 +2200,7 @@ function buildToolExecutionsFromReplay(toolReplay: HistoryToolReplayItem[]): Too
       summary: n.summary,
       skillTree: n.skillTree,
       ...(n.mermaid ? { mermaid: n.mermaid } : {}),
+      ...(n.mcpApp ? { mcpApp: n.mcpApp } : {}),
       ...(n.timedOut ? { timedOut: true as const } : {}),
       ...(n.beamSearch ? { beamSearch: n.beamSearch } : {}),
       reviewer: n.reviewer,
@@ -1881,7 +2355,11 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
   restoreGeneration = generation;
 
   const entries: HistoryTimelineEntry[] = [];
+  let requestCursor: string | null = null;
   let cursorMeta: HistoryCursorMeta | null = null;
+  let completionTokenUsage: SessionTokenUsageSnapshot | null = null;
+  let snapshotMeta: HistoryCursorMeta | null = null;
+  let discoveredSubagentIds: string[] = [];
   let disposed = false;
   let finalized = false;
   let restoreTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1899,14 +2377,26 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
       undefined,
       false,
       options.subagentId,
-      null,
+      requestCursor,
     )) {
       return;
     }
 
-    const nextMeta = readHistoryCursorMeta(payload, null);
+    const nextMeta = readHistoryCursorMeta(payload, requestCursor);
     if (nextMeta) {
+      if (snapshotMeta && (
+        nextMeta.snapshotId !== snapshotMeta.snapshotId
+        || nextMeta.snapshotEnd !== snapshotMeta.snapshotEnd
+      )) {
+        fail({ code: 'HISTORY_SNAPSHOT_CHANGED', message: 'history snapshot changed during restore' });
+        return;
+      }
+      snapshotMeta = nextMeta;
       cursorMeta = nextMeta;
+    }
+    const nextDiscovered = readDiscoveredSubagentIds(payload);
+    if (nextDiscovered.length > 0) {
+      discoveredSubagentIds = nextDiscovered;
     }
 
     if (payload.status === 'error') {
@@ -1918,6 +2408,14 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
     }
 
     if (isHistoryRestoreDonePayload(payload)) {
+      const usage = sessionTokenUsageSnapshotForHistory(
+        payload.session_usage,
+        options.sessionId,
+        options.subagentId,
+      );
+      if (usage) {
+        completionTokenUsage = usage;
+      }
       finalize();
       return;
     }
@@ -1937,6 +2435,7 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
       if (reasoningText) {
         entries.unshift({
           kind: 'reasoning',
+          outputOrder: readOutputOrder(full, 'reasoning_output_order'),
           at: recordTimestampIso(full) ?? '',
           text: reasoningText,
           agentTemplateName: readHistoryAgentTemplateName(full),
@@ -1981,10 +2480,10 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
 
   function finalize(): void {
     if (disposed || finalized) return;
-    finalized = true;
     reassembler.flush();
 
     if (!cursorMeta) {
+      finalized = true;
       stopListening();
       try {
         options.onFailure?.({
@@ -2005,20 +2504,61 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
       subagentReplay,
       reasoningReplay,
       contextUsageReplay,
+      tokenUsageSnapshot: historyTokenUsage,
+      pendingQuestionReplay,
+      answeredQuestionReplay,
     } = materializeHistoryTimeline(entries);
+    const tokenUsageSnapshot = completionTokenUsage ?? historyTokenUsage;
     const latestContextUsage = selectLatestContextUsagePayload(contextUsageReplay);
 
+    const isEmpty = (
+      messages.length === 0
+      && toolReplay.length === 0
+      && harnessReplay.length === 0
+      && teamReplay.length === 0
+      && subagentReplay.length === 0
+      && pendingQuestionReplay.length === 0
+      && answeredQuestionReplay.length === 0
+      && !latestContextUsage
+    );
+    const nextCursor = cursorMeta.nextCursor;
+    if (isEmpty && cursorMeta.hasMore && nextCursor) {
+      // A filtered batch does not establish that the whole snapshot is empty.
+      requestCursor = nextCursor;
+      cursorMeta = null;
+      resetRestoreTimer();
+      void Promise.resolve().then(() => {
+        if (!disposed && !finalized) return options.requestNextBatch(nextCursor);
+      }).catch((error: unknown) => {
+        fail({
+          code: 'HISTORY_RESTORE_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+
+    finalized = true;
     stopListening();
 
     try {
+      if (tokenUsageSnapshot) {
+        options.onSessionTokenUsage?.(tokenUsageSnapshot);
+      }
       const isEmpty = (
         messages.length === 0
         && toolReplay.length === 0
         && harnessReplay.length === 0
         && teamReplay.length === 0
         && subagentReplay.length === 0
+        && pendingQuestionReplay.length === 0
+        && answeredQuestionReplay.length === 0
         && !latestContextUsage
+        && (!tokenUsageSnapshot || tokenUsageSnapshot.revision === 0)
       );
+      if (discoveredSubagentIds.length > 0) {
+        options.onDiscoveredSubagentIds?.(discoveredSubagentIds);
+      }
       if (isEmpty) {
         options.onEmpty?.(cursorMeta);
         return;
@@ -2042,6 +2582,12 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
       if (reasoningReplay.length > 0) {
         options.onReasoningReplay?.(reasoningReplay);
       }
+      if (pendingQuestionReplay.length > 0) {
+        options.onPendingQuestionReplay?.(pendingQuestionReplay);
+      }
+      if (answeredQuestionReplay.length > 0) {
+        options.onAnsweredQuestionReplay?.(answeredQuestionReplay);
+      }
       const compactionCount = entries.reduce((n, e) => (e.kind === 'compaction' ? n + 1 : n), 0);
       if (compactionCount > 0) {
         const compactionSummaries = entries.flatMap((e) =>
@@ -2056,11 +2602,14 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
 
   const handle: HistoryRestoreHandle = { generation, dispose };
   activeHistoryRequests.set(requestKey, handle);
-  // 超时是一次明确失败，不能把不完整批次当作成功历史发布。
-  restoreTimer = setTimeout(() => {
-    if (disposed || finalized) return;
-    fail({ code: 'HISTORY_RESTORE_TIMEOUT', message: 'history restore timed out' });
-  }, HISTORY_RESTORE_TIMEOUT_MS);
+  function resetRestoreTimer(): void {
+    if (restoreTimer) clearTimeout(restoreTimer);
+    restoreTimer = setTimeout(() => {
+      if (disposed || finalized) return;
+      fail({ code: 'HISTORY_RESTORE_TIMEOUT', message: 'history restore timed out' });
+    }, HISTORY_RESTORE_TIMEOUT_MS);
+  }
+  resetRestoreTimer();
   return handle;
 }
 
@@ -2072,7 +2621,26 @@ export interface FetchHistoryCursorBatchResult {
   subagentReplay: HistorySubagentReplayItem[];
   reasoningReplay: HistoryReasoningReplayItem[];
   contextUsageSnapshot: Record<string, unknown> | null;
+  tokenUsageSnapshot: SessionTokenUsageSnapshot | null;
+  /** Parent history.done may list on-disk subagent bucket ids (GitCode #4887). */
+  discoveredSubagentIds: string[];
   cursor: HistoryCursorMeta;
+}
+
+/** Read ``subagent_ids`` advertised on a parent ``history.message`` done frame. */
+export function readDiscoveredSubagentIds(payload: Record<string, unknown>): string[] {
+  const raw = payload.subagent_ids ?? payload.subagentIds;
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const id = item.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
 }
 
 export interface FetchHistoryCursorBatchOptions {
@@ -2096,6 +2664,8 @@ export function fetchHistoryCursorBatch(
 
   const entries: HistoryTimelineEntry[] = [];
   let cursorMeta: HistoryCursorMeta | null = null;
+  let completionTokenUsage: SessionTokenUsageSnapshot | null = null;
+  let discoveredSubagentIds: string[] = [];
   let disposed = false;
   let finalized = false;
   let restoreTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2117,6 +2687,10 @@ export function fetchHistoryCursorBatch(
 
     const nextMeta = readHistoryCursorMeta(payload, options.cursor);
     if (nextMeta) cursorMeta = nextMeta;
+    const nextDiscovered = readDiscoveredSubagentIds(payload);
+    if (nextDiscovered.length > 0) {
+      discoveredSubagentIds = nextDiscovered;
+    }
 
     if (payload.status === 'error') {
       fail({
@@ -2126,6 +2700,14 @@ export function fetchHistoryCursorBatch(
       return;
     }
     if (isHistoryRestoreDonePayload(payload)) {
+      const usage = sessionTokenUsageSnapshotForHistory(
+        payload.session_usage,
+        options.sessionId,
+        options.subagentId,
+      );
+      if (usage) {
+        completionTokenUsage = usage;
+      }
       finalize();
       return;
     }
@@ -2141,6 +2723,7 @@ export function fetchHistoryCursorBatch(
       if (reasoningText) {
         entries.unshift({
           kind: 'reasoning',
+          outputOrder: readOutputOrder(full, 'reasoning_output_order'),
           at: recordTimestampIso(full) ?? '',
           text: reasoningText,
           agentTemplateName: readHistoryAgentTemplateName(full),
@@ -2186,7 +2769,13 @@ export function fetchHistoryCursorBatch(
     const materialized = materializeHistoryTimeline(entries);
     const contextUsageSnapshot = selectLatestContextUsagePayload(materialized.contextUsageReplay);
     dispose();
-    options.onReady({ ...materialized, contextUsageSnapshot, cursor: cursorMeta });
+    options.onReady({
+      ...materialized,
+      tokenUsageSnapshot: completionTokenUsage ?? materialized.tokenUsageSnapshot,
+      contextUsageSnapshot,
+      discoveredSubagentIds,
+      cursor: cursorMeta,
+    });
   }
 
   const handle: HistoryRestoreHandle = { generation, dispose };

@@ -12,12 +12,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from jiuwenswarm.common.auth import account_kit
-from jiuwenswarm.common.auth import service as service_mod
-from jiuwenswarm.common.auth import session_store as store_mod
-from jiuwenswarm.common.auth.account_kit import AccountKitFlow, OAuthConfig
-from jiuwenswarm.common.auth.service import AuthService
-from jiuwenswarm.gateway.channel_manager.web import web_http_auth
+from agent_gateway.auth import account_kit
+from agent_gateway.auth import service as service_mod
+from agent_gateway.auth import session_store as store_mod
+from agent_gateway.auth.account_kit import AccountKitFlow, OAuthConfig
+from agent_gateway.auth.service import AuthService
+from agent_gateway.channel_manager.web import web_http_auth
 
 ID_TOKEN_MARKER = "IDTOKEN-LEAK"
 REFRESH_TOKEN = "REFRESH-LEAK"
@@ -52,7 +52,7 @@ def token_endpoint(monkeypatch) -> FakeTokenEndpoint:
 
 def _remote(monkeypatch, *, effective=True, apig_base="https://apig.example.com",
             whitelist=None, blocklist=None, login=None, **apig_paths):
-    from jiuwenswarm.common.auth import remote_config
+    from agent_gateway.auth import remote_config
 
     remote_config.set_config_for_test(remote_config.parse_config({
         "is_effective": effective,
@@ -78,6 +78,7 @@ def _make_client(tmp_path, monkeypatch, exchange_url: str = EXCHANGE_URL) -> Tes
         )
     )
     service = AuthService(flow=flow, store=store_mod.AuthSessionStore())
+    monkeypatch.setattr(service, "refresh_model_catalog", lambda session_id=None: 0)
     monkeypatch.setattr(service_mod, "_service", service)
     monkeypatch.setattr(web_http_auth, "get_auth_service", lambda: service)
 
@@ -187,6 +188,20 @@ def test_status_without_session_is_logged_out(client):
     assert fresh_client.get("/api/v1/auth/status").json()["islogin"] is False
 
 
+def test_status_reports_the_campaign_state(client):
+    body = client.get("/api/v1/auth/status").json()
+    assert body["enabled"] is True and body["state"] == "active"
+    assert body["accountCenterUrl"] == account_kit.DEFAULT_ACCOUNT_CENTER_URL
+
+
+def test_status_reports_a_finished_campaign(client):
+    from agent_gateway.auth import remote_config
+
+    remote_config.set_config_for_test(remote_config.parse_config({"is_effective": False}))
+    body = client.get("/api/v1/auth/status").json()
+    assert body["enabled"] is False and body["state"] == "ended"
+
+
 def test_wrong_claim_token_is_rejected_without_burning_the_login(client):
     started = _authorize(client)
     _callback(client, started["state"], code="c")
@@ -247,6 +262,7 @@ def test_replayed_callback_does_not_exchange_twice(client, token_endpoint):
     [
         ("post", "/api/v1/auth/authorize", None),
         ("post", "/api/v1/auth/claim", {"state": "s", "claimToken": "t"}),
+        ("post", "/api/v1/auth/cancel", {"state": "s", "claimToken": "t"}),
         ("post", "/api/v1/auth/logout", None),
     ],
 )
@@ -254,6 +270,29 @@ def test_state_changing_routes_require_the_auth_header(client, method, path, bod
     response = getattr(client, method)(path, json=body, headers={web_http_auth.AUTH_REQUEST_HEADER: ""})
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "auth_header_required"
+
+
+def test_cancelled_login_can_no_longer_be_claimed(client, token_endpoint):
+    started = _authorize(client)
+    response = client.post("/api/v1/auth/cancel", json={"state": started["state"], "claimToken": "wrong"})
+    assert response.status_code == 200, "对不上也不给探测信号"
+    assert _claim(client, started).status_code == 202, "对不上的取消不算数"
+
+    response = client.post(
+        "/api/v1/auth/cancel", json={"state": started["state"], "claimToken": started["claimToken"]}
+    )
+    assert response.status_code == 200
+    assert _callback(client, started["state"], code="c").status_code == 400
+    assert token_endpoint.requests == [], "取消之后到的回调不再换 token"
+    assert _claim(client, started).json()["error"]["code"] == "oauth_state_invalid"
+
+
+def test_non_ascii_claim_token_is_not_a_server_error(client):
+    started = _authorize(client)
+    body = {"state": started["state"], "claimToken": "令牌"}
+    assert client.post("/api/v1/auth/cancel", json=body).status_code == 200
+    assert client.post("/api/v1/auth/claim", json=body).status_code == 400
+    assert _claim(client, started).status_code == 202, "登录没被这两次请求弄丢"
 
 
 def test_session_cookie_is_secure_over_https(client):
@@ -287,7 +326,7 @@ def test_logout_clears_session_and_cookie(client):
 
 
 def test_logout_revokes_the_credential_held_by_agent_server(client, monkeypatch):
-    from jiuwenswarm.gateway.channel_manager.web import web_http_auth
+    from agent_gateway.channel_manager.web import web_http_auth
 
     revoked: list[str] = []
 

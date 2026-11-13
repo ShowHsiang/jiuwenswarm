@@ -3,11 +3,11 @@
  * 字段对齐契约 §6.1 task.create 入参。数据集走 rsi.dataset.validate，
  * 数据集路径复用 path.select_files（单文件），产物路径沿用 path.select_directory。
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import clsx from 'clsx';
 import { Check, Copy } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { Input, Select } from '../../../components/ui';
 import { rsiDatasetValidate, rsiTaskCreate, rsiTaskList, rsiTrainingStart } from '../rsiApi';
 import type { RsiArtifactType, RsiScenario, RsiTaskCreateParams, RsiTaskListItem, RsiTaskStatus } from '../types';
 import { selectProjectDirectory } from '../../../features/workspace/projectDirectoryPicker';
@@ -105,12 +105,31 @@ function defaultForm(): FormState {
 export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExperimentDialogProps) {
   const { t } = useTranslation();
   const [form, setForm] = useState<FormState>(defaultForm);
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [showErrors, setShowErrors] = useState(false);
+  const [submitError, setSubmitError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [datasetValid, setDatasetValid] = useState<null | { valid: boolean; count: number | null }>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
 
   const branch: Branch = form.scenario === 'HARNESS' ? 'HARNESS' : form.artifactType;
+
+  // Reactive validation: recomputes on every form field change.
+  const validationErrors = useMemo((): Record<string, string> => {
+    const e: Record<string, string> = {};
+    if (!form.name.trim()) e.name = t('rsi.createDialog.validation.nameRequired');
+    if (branch === 'HARNESS' && !form.datasetFile) e.dataset = t('rsi.createDialog.validation.datasetRequired');
+    if (!form.optimizer) e.optimizer = t('rsi.createDialog.validation.optimizerRequired');
+    if (branch === 'HARNESS' && !form.tester) e.tester = t('rsi.createDialog.validation.testerRequired');
+    if (branch === 'PAPER' && !form.optimizationInstruction.trim() && !form.artifactPath) {
+      e.paper = t('rsi.createDialog.validation.paperOrInstruction');
+    }
+    if (branch === 'PROGRAM' && !form.artifactPath) {
+      e.program = t('rsi.createDialog.validation.programRequired');
+    }
+    return e;
+  }, [form, branch, t]);
+
+  const hasValidationErrors = Object.keys(validationErrors).length > 0;
   const isArtifact = form.scenario === 'ARTIFACT';
 
   // 选择数据集路径后自动校验
@@ -144,10 +163,20 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
     if (!open && dialog.open) dialog.close();
   }, [open]);
 
+  // Reset form and error state when the dialog is closed.
+  useEffect(() => {
+    if (!open) {
+      setForm(defaultForm());
+      setDatasetValid(null);
+      setShowErrors(false);
+      setSubmitError('');
+    }
+  }, [open]);
+
   // 切换实验场景（Harness 优化 vs 产物优化）
   const switchScenario = useCallback((s: RsiScenario) => {
     setDatasetValid(null);
-    setErrors({});
+    setShowErrors(false);
     setForm((f) => {
       if (s === 'HARNESS')
         return {
@@ -165,7 +194,7 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
 
   // 切换产物子类型（论文 / 程序）
   const switchArtifactType = useCallback((at: RsiArtifactType) => {
-    setErrors({});
+    setShowErrors(false);
     setForm((f) => {
       if (at === 'PAPER') return { ...f, artifactType: 'PAPER', artifactPath: '' };
       return {
@@ -191,11 +220,6 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
         });
         if (!result.ok || !result.path) return;
         update('artifactPath', result.path);
-        setErrors((prev) => {
-          const next = { ...prev };
-          delete next.paper;
-          return next;
-        });
         return;
       }
       if (target === 'dataset') {
@@ -213,26 +237,11 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
     [branch, form.artifactPath, update],
   );
 
-  const validate = useCallback((): boolean => {
-    const e: Record<string, string> = {};
-    if (!form.name.trim()) e.name = t('rsi.createDialog.validation.nameRequired');
-    if (branch === 'HARNESS' && !form.datasetFile) e.dataset = t('rsi.createDialog.validation.datasetRequired');
-    if (!form.optimizer) e.optimizer = t('rsi.createDialog.validation.optimizerRequired');
-    if (branch === 'HARNESS' && !form.tester) e.tester = t('rsi.createDialog.validation.testerRequired');
-    if (branch === 'PAPER') {
-      if (!form.optimizationInstruction.trim() && !form.artifactPath) {
-        e.paper = t('rsi.createDialog.validation.paperOrInstruction');
-      }
-    }
-    if (branch === 'PROGRAM') {
-      if (!form.artifactPath) e.program = t('rsi.createDialog.validation.programRequired');
-    }
-    setErrors(e);
-    return Object.keys(e).length === 0;
-  }, [form, branch, t]);
 
   const handleSubmit = useCallback(async () => {
-    if (!validate()) return;
+    setShowErrors(true);
+    setSubmitError('');
+    if (hasValidationErrors) return;
     setSubmitting(true);
     try {
       const createParams: RsiTaskCreateParams =
@@ -297,13 +306,14 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
       onClose();
       setForm(defaultForm());
       setDatasetValid(null);
+      setShowErrors(false);
     } catch (e) {
       console.error('[rsi] create failed', e);
-      setErrors((prev) => ({ ...prev, submit: e instanceof Error ? e.message : String(e) }));
+      setSubmitError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(false);
     }
-  }, [form, branch, validate, onCreated, onClose]);
+  }, [form, branch, hasValidationErrors, onCreated, onClose]);
 
   // 程序优化无"最大迭代轮次"字段（样式概要明确）
   const showMaxIterations = branch !== 'PROGRAM';
@@ -344,13 +354,13 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
 
         {/* 基础字段 */}
         <Field label={t('rsi.createDialog.nameLabel')}>
-          <input
-            className="rsi-input"
+          <Input
             value={form.name}
-            onChange={(e) => update('name', e.target.value)}
+            onChange={(value) => update('name', value)}
             placeholder={t('rsi.createDialog.namePlaceholder')}
+            invalid={showErrors && Boolean(validationErrors.name)}
           />
-          {errors.name && <Err text={errors.name} />}
+          {showErrors && validationErrors.name && <Err text={validationErrors.name} />}
         </Field>
 
         <Field label={t('rsi.createDialog.typeLabel')}>
@@ -387,19 +397,19 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
 
         <Field label={t('rsi.createDialog.optimizerModelLabel')}>
           <ModelSelect value={form.optimizer} onChange={(v) => update('optimizer', v)} />
-          {errors.optimizer && <Err text={errors.optimizer} />}
+          {showErrors && validationErrors.optimizer && <Err text={validationErrors.optimizer} />}
         </Field>
 
         {branch === 'HARNESS' && (
           <Field label={t('rsi.createDialog.testerModelLabel')}>
             <ModelSelect value={form.tester} onChange={(v) => update('tester', v)} />
-            {errors.tester && <Err text={errors.tester} />}
+            {showErrors && validationErrors.tester && <Err text={validationErrors.tester} />}
           </Field>
         )}
 
         {branch === 'HARNESS' && (
           <Field label={t('rsi.createDialog.evaluationMethodLabel')}>
-            <RsiSelect
+            <Select
               value={form.evaluationMethod}
               onChange={(v) => update('evaluationMethod', v)}
               options={[
@@ -407,13 +417,14 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
                 {
                   value: 'script',
                   label: t('rsi.createDialog.evaluationMethodScript'),
+                  trailing: <span className="rsi-select__badge">{t('rsi.createDialog.evaluationMethodComingSoon')}</span>,
                   disabled: true,
-                  badge: t('rsi.createDialog.evaluationMethodComingSoon'),
+                  disabledReason: t('rsi.createDialog.evaluationMethodComingSoon'),
                 },
               ]}
-              placeholder={t('rsi.createDialog.evaluationMethodAgent')}
-              ariaLabel={t('rsi.createDialog.evaluationMethodLabel')}
+              aria-label={t('rsi.createDialog.evaluationMethodLabel')}
               disabled={submitting}
+              showSelectedCheck
             />
           </Field>
         )}
@@ -445,7 +456,7 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
                   : t('rsi.createDialog.invalid')}
               </div>
             )}
-            {errors.dataset && <Err text={errors.dataset} />}
+            {showErrors && validationErrors.dataset && <Err text={validationErrors.dataset} />}
           </Field>
         )}
 
@@ -466,15 +477,14 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
                 placeholder={t('rsi.createDialog.paperPlaceholder')}
                 onPick={() => pickPath('artifact')}
               />
-              {errors.paper && <Err text={errors.paper} />}
+              {showErrors && validationErrors.paper && <Err text={validationErrors.paper} />}
             </Field>
             <Field
               label={t('rsi.createDialog.webProxyLabel')}
             >
-              <input
-                className="rsi-input"
+              <Input
                 value={form.webProxy}
-                onChange={(e) => update('webProxy', e.target.value)}
+                onChange={(value) => update('webProxy', value)}
                 placeholder={t('rsi.createDialog.webProxyPlaceholder')}
                 inputMode="url"
                 autoComplete="off"
@@ -494,7 +504,7 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
                 placeholder={t('rsi.createDialog.programPlaceholder')}
                 onPick={() => pickPath('artifact')}
               />
-              {errors.program && <Err text={errors.program} />}
+              {showErrors && validationErrors.program && <Err text={validationErrors.program} />}
             </Field>
           </>
         )}
@@ -505,7 +515,7 @@ export function CreateExperimentDialog({ open, onClose, onCreated }: CreateExper
           </Field>
         )}
 
-        {errors.submit && <Err text={errors.submit} />}
+        {submitError && <Err text={submitError} />}
 
         <div className="rsi-create-dialog__actions">
           <button type="button" className="rsi-btn rsi-btn--ghost" onClick={onClose} disabled={submitting}>
@@ -691,7 +701,7 @@ function PathInput({
 }) {
   return (
     <div className="rsi-create-dialog__path-input">
-      <input className="rsi-input" value={value} readOnly placeholder={placeholder} />
+      <Input value={value} readOnly placeholder={placeholder} />
       <button type="button" className="rsi-create-dialog__path-btn" onClick={onPick} aria-label="browse">
         {icon === 'file' ? (
           <svg
@@ -735,222 +745,36 @@ function PathInput({
 function ModelSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const { t } = useTranslation();
   const availableModels = useSessionStore((s) => s.availableModels);
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener('pointerdown', handlePointerDown);
-    return () => document.removeEventListener('pointerdown', handlePointerDown);
-  }, [open]);
-
-  const selected = availableModels.find((m) => m.model_name === value) ?? null;
-
-  const handleSelect = (modelName: string) => {
-    setOpen(false);
-    onChange(modelName);
-  };
 
   const isFree = (m: ModelEntry) => m.is_free === true;
-  const freeModels = availableModels.filter(isFree);
+  // 免费模型由网关按会话注入凭据，RSI 实验配置无法持久化保存，这里不展示。
   const configuredModels = availableModels.filter((m) => !isFree(m));
 
-  const renderGroup = (label: string, models: ModelEntry[]) =>
-    models.length === 0 ? null : (
-      <>
-        <div className="model-select__section-header">{label}</div>
-        {models.map((m, idx) => {
-          const key = m.alias || m.model_name;
-          const active = m.model_name === value;
-          return (
-            <button
-              key={`${m.model_name}-${idx}`}
-              type="button"
-              onClick={() => handleSelect(m.model_name)}
-              className={clsx('chat-mode-select__option', active && 'chat-mode-select__option--active')}
-              role="menuitemradio"
-              aria-checked={active}
-            >
-              <span className="chat-mode-select__option-main">
-                <span className="chat-mode-select__icon" aria-hidden="true">
-                  <ModelProviderIcon model={m} />
-                </span>
-                <span className="chat-mode-select__label">{key}</span>
-              </span>
-              {active && (
-                <svg
-                  className="chat-mode-select__check"
-                  viewBox="0 0 20 20"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                  aria-hidden="true"
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 10.5l3 3L15 6.5" />
-                </svg>
-              )}
-            </button>
-          );
-        })}
-      </>
-    );
+  const options = configuredModels.map((m) => ({
+    value: m.model_name,
+    label: (
+      <span className="rsi-model-select__value">
+        <ModelProviderIcon model={m} />
+        <span className="rsi-model-select__label">{m.alias || m.model_name}</span>
+      </span>
+    ),
+  }));
 
   return (
-    <div ref={rootRef} className="rsi-model-select">
-      <button
-        type="button"
-        className="rsi-model-select__trigger"
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-      >
-        {selected ? (
-          <span className="rsi-model-select__value">
-            <ModelProviderIcon model={selected} />
-            <span className="rsi-model-select__label">{selected.alias || selected.model_name}</span>
-          </span>
-        ) : (
-          <span className="rsi-model-select__label rsi-model-select__placeholder">
-            {t('rsi.createDialog.modelPlaceholder')}
-          </span>
-        )}
-        <svg
-          className="rsi-model-select__chevron"
-          viewBox="0 0 20 20"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.5}
-          aria-hidden="true"
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M6 8l4 4 4-4" />
-        </svg>
-      </button>
-
-      {open && (
-        <div className="chat-mode-select__menu model-select__menu rsi-model-select__menu" role="listbox">
-          {availableModels.length === 0 ? (
-            <div className="model-select__section-header">{t('rsi.createDialog.modelPlaceholder')}</div>
-          ) : (
-            <>
-              {renderGroup(t('chat.modelSelector.configured'), configuredModels)}
-              {renderGroup(t('chat.modelSelector.free'), freeModels)}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-interface RsiSelectOption {
-  value: string;
-  label: string;
-  disabled?: boolean;
-  badge?: string;
-}
-
-function RsiSelect({
-  value,
-  onChange,
-  options,
-  placeholder,
-  ariaLabel,
-  disabled,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  options: RsiSelectOption[];
-  placeholder?: string;
-  ariaLabel?: string;
-  disabled?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (e: PointerEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('pointerdown', handlePointerDown);
-    return () => document.removeEventListener('pointerdown', handlePointerDown);
-  }, [open]);
-
-  const selected = options.find((option) => option.value === value) ?? null;
-
-  return (
-    <div ref={rootRef} className="rsi-select">
-      <button
-        type="button"
-        className="rsi-model-select__trigger rsi-create-dialog__select--rounded"
-        onClick={() => setOpen((v) => !v)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label={ariaLabel}
-        disabled={disabled}
-      >
-        {selected ? (
-          <span className="rsi-model-select__label">{selected.label}</span>
-        ) : (
-          <span className="rsi-model-select__label rsi-model-select__placeholder">{placeholder}</span>
-        )}
-        <svg
-          className="rsi-model-select__chevron"
-          viewBox="0 0 20 20"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth={1.5}
-          aria-hidden="true"
-        >
-          <path strokeLinecap="round" strokeLinejoin="round" d="M6 8l4 4 4-4" />
-        </svg>
-      </button>
-
-      {open && (
-        <div className="chat-mode-select__menu model-select__menu rsi-model-select__menu" role="listbox">
-          {options.map((option) => {
-            const active = option.value === value;
-            return (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => {
-                  setOpen(false);
-                  onChange(option.value);
-                }}
-                className={clsx('chat-mode-select__option', active && 'chat-mode-select__option--active')}
-                role="menuitemradio"
-                aria-checked={active}
-                disabled={option.disabled}
-              >
-                <span className="chat-mode-select__option-main">
-                  <span className="chat-mode-select__label">{option.label}</span>
-                </span>
-                {option.badge ? (
-                  <span className="rsi-select__badge">{option.badge}</span>
-                ) : active ? (
-                  <svg
-                    className="chat-mode-select__check"
-                    viewBox="0 0 20 20"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                    aria-hidden="true"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 10.5l3 3L15 6.5" />
-                  </svg>
-                ) : null}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
+    <Select
+      value={value}
+      onChange={onChange}
+      options={options}
+      placeholder={t('rsi.createDialog.modelPlaceholder')}
+      panelHeader={
+        // 与旧版一致：有模型显示"已配置模型"分组头；无模型时占位文案兼作分组头
+        <span className="rsi-create-dialog__group-header">
+          {configuredModels.length > 0 ? t('chat.modelSelector.configured') : t('rsi.createDialog.modelPlaceholder')}
+        </span>
+      }
+      showSelectedCheck
+      aria-label={t('rsi.createDialog.modelPlaceholder')}
+    />
   );
 }
 

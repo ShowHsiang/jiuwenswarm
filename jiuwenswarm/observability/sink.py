@@ -85,6 +85,7 @@ class TrajectoryRecordSink:
         self._store = store or TrajectoryStore(
             settings.database_path,
             retention_days=settings.retention_days,
+            discard_final_span_frames=settings.discard_final_span_frames,
         )
         self._queue: queue.Queue[OtlpSpanRecordLike] = queue.Queue(
             maxsize=settings.queue_size,
@@ -765,6 +766,7 @@ class TrajectorySessionSinkRouter:
 
         Runs on the router thread, the only thread that creates writers, so a
         session cannot gain a writer between the check and the unlink.
+        A retention period of zero disables this sweep.
 
         Args:
             now: Wall-clock seconds to measure age against; defaults to now.
@@ -772,6 +774,8 @@ class TrajectorySessionSinkRouter:
         Returns:
             Number of session databases removed.
         """
+        if self.settings.retention_days == 0:
+            return 0
         root = Path(self.settings.database_path)
         if not root.is_dir():
             return 0

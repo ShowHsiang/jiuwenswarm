@@ -24,6 +24,11 @@ test('consumes the canonical v1 fields and all four returned categories', () => 
   assert.equal(result.session_kv_cache_hit_rate, 0.6);
 });
 
+test('accepts a manual compact snapshot without treating it as a provider call', () => {
+  const result = parseContextUsageSnapshot(snapshot({ phase: 'post_compact' }));
+  assert.equal(result.phase, 'post_compact');
+});
+
 test('uses only the top-level session KV rate without per-call or nested-session fallbacks', () => {
   const payload = snapshot({ session_kv_cache_hit_rate: 0.8829792874980116 });
   payload.kv_cache.request.hit_rate = 0.9976856905811974;
@@ -261,6 +266,45 @@ test('replaces overview, parts and KV together and accepts a new request after s
     store.removeRuntime(sessionId);
     store.ensureRuntime(sessionId);
     assert.equal(useSessionStore.getState().getRuntime(sessionId).contextUsageSnapshot, null);
+  } finally {
+    store.removeRuntime(sessionId);
+  }
+});
+
+test('session token totals are session-scoped and ignore older or malformed snapshots', () => {
+  const store = useSessionStore.getState();
+  const sessionId = fixture.product_session_id;
+  const usage = (revision, inputTokens) => ({
+    schema_version: 1,
+    revision,
+    session_id: sessionId,
+    main: {
+      input_tokens: inputTokens,
+      output_tokens: 20,
+      input_calls: 1,
+      output_calls: 1,
+      calls_total: 1,
+    },
+    others: {
+      input_tokens: 10,
+      output_tokens: 5,
+      input_calls: 1,
+      output_calls: 1,
+      calls_total: 1,
+    },
+  });
+
+  store.ensureRuntime(sessionId);
+  try {
+    store.receiveSessionTokenUsage(usage(2, 40));
+    store.receiveSessionTokenUsage(usage(1, 30));
+    store.receiveSessionTokenUsage({ ...usage(3, 20), main: { input_tokens: -1 } });
+    assert.equal(useSessionStore.getState().getRuntime(sessionId).tokenUsageSnapshot.main.input_tokens, 40);
+    assert.equal(useSessionStore.getState().getRuntime(sessionId).tokenUsageSnapshot.others.output_tokens, 5);
+    assert.equal(useSessionStore.getState().getRuntime('other-session')?.tokenUsageSnapshot, undefined);
+    store.removeRuntime(sessionId);
+    store.ensureRuntime(sessionId);
+    assert.equal(useSessionStore.getState().getRuntime(sessionId).tokenUsageSnapshot, null);
   } finally {
     store.removeRuntime(sessionId);
   }

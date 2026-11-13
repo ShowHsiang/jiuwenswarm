@@ -1,6 +1,23 @@
 import pytest
 
-from jiuwenswarm.symphony import config as symphony_config
+from jiuwenswarm.common import symphony_config
+
+
+@pytest.mark.parametrize("symphony_enabled", [None, False, True])
+def test_discovery_enables_required_infrastructure(symphony_enabled):
+    cfg = symphony_config.symphony_config_from_dict({
+        "enabled": symphony_enabled, "evolution": {"flow": {"enabled": True}},
+    })
+    assert cfg.enabled is True
+    assert cfg.evolution.flow.enabled is True
+
+
+def test_disabled_discovery_preserves_independent_symphony():
+    cfg = symphony_config.symphony_config_from_dict({
+        "enabled": True, "evolution": {"enabled": True, "flow": {"enabled": False}},
+    })
+    assert cfg.enabled is True
+    assert cfg.evolution.flow.enabled is False
 
 
 def test_symphony_config_defaults_paths(monkeypatch, tmp_path):
@@ -26,7 +43,7 @@ def test_symphony_config_defaults_paths(monkeypatch, tmp_path):
     assert cfg.build.min_edge_confidence == 0.5
     assert cfg.orchestration.mode == "fast"
     assert cfg.orchestration.min_edge_confidence == 0.5
-    assert cfg.evolution.enabled is False
+    assert cfg.evolution.flow.enabled is False
     assert cfg.enabled is False
 
 
@@ -101,7 +118,7 @@ def test_symphony_config_normalizes_values(monkeypatch, tmp_path):
     assert cfg.orchestration.mode == "fast"
     assert cfg.orchestration.max_depth == 7
     assert cfg.orchestration.min_edge_confidence == 0.0
-    assert cfg.evolution.enabled is False
+    assert cfg.evolution.flow.enabled is False
     assert cfg.enabled is True
 
 

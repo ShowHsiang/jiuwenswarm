@@ -3,7 +3,7 @@
  *
  * 从 index.tsx 抽取，内容保持不变。
  */
-import { useCallback, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronRight } from 'lucide-react';
@@ -12,6 +12,7 @@ import ExpandIcon from '../../assets/work-mode/expand.svg?react';
 import { PageCard, type PageCardActionProps } from '../ui';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
 import type { MarketplacePluginItem } from './types';
+import { getSourceLabel } from './skillPanelUtils';
 
 /** 表单字段问号 tooltip（position: fixed，不受 overflow 裁剪） */
 export function FormFieldTooltip({ text }: { text: string }) {
@@ -91,34 +92,6 @@ export function TopAnchorTooltip({ pos, text }: { pos: { left: number; top: numb
   );
 }
 
-/** 弹窗右上角关闭按钮（24px，可传 size 覆盖） */
-export function ModalCloseButton({
-  onClick,
-  label,
-  testId,
-  size = 24,
-}: {
-  onClick: () => void;
-  label: string;
-  testId?: string;
-  size?: number;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={label}
-      data-testid={testId}
-      className="flex items-center justify-center rounded-md hover:bg-secondary text-text-meta hover:text-text"
-      style={{ width: size, height: size }}
-    >
-      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-      </svg>
-    </button>
-  );
-}
-
 /** 技能类型徽标（团队技能 / 多模态） */
 /** 我的技能卡片右上角的"去试试"按钮，内置 tooltip，复用 useAdaptiveTooltip 保持与其他按钮一致。 */
 export function MySkillGoTryButton({
@@ -165,7 +138,8 @@ export function HubSkillCard({
 }) {
   const { t } = useTranslation();
   const displayName = skill.display_name || skill.name;
-  const tags = skill.tags && skill.tags.length > 0 ? skill.tags : undefined;
+  const sourceTag = `${t('skills.sourceLabel')}: ${getSourceLabel(skill.source || 'teamskillshub', t)}`;
+  const tags = [sourceTag, ...(skill.tags && skill.tags.length > 0 ? skill.tags : [])];
 
   return (
     <PageCard
@@ -247,7 +221,6 @@ export function FilterDropdown<T extends string>({
   value,
   onChange,
   options,
-  style,
   testId,
 }: {
   open: boolean;
@@ -256,16 +229,15 @@ export function FilterDropdown<T extends string>({
   value: T;
   onChange: (value: T) => void;
   options: { value: T; label: string }[];
-  style?: CSSProperties;
   testId?: string;
 }) {
   const selected = options.find((o) => o.value === value);
   return (
-    <div className="relative" style={style}>
+    <div className="relative">
       <button
         type="button"
         onClick={() => onToggle(!open)}
-        className="flex items-center justify-between w-full h-[32px] text-xs text-text bg-transparent"
+        className="flex items-center gap-1 h-[32px] text-xs text-text bg-transparent"
         data-testid={testId}
       >
         <span className="truncate">{selected ? selected.label : ''}</span>

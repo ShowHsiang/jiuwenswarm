@@ -13,13 +13,13 @@ description: 从自然语言创建可被 JiuwenSwarm 加载和安装的专家团
 
 设计一位 `leader` 和完成任务所需的专家成员，避免职责重复。明确各成员接收什么输入、负责什么、向 Leader 返回什么，以及 Leader 如何处理分歧和验收成果。已有专家满足需求时可复用其模板；缺少角色时直接在本团包内编写成员模板，无须将每个成员另行注册为独立专家。
 
-本技能只创建新资产。遇到同名包时保留现有内容，选择新 ID；若用户要求替换已有专家团，先明确替换范围，不通过删除旧包绕过重名保护。
+本技能只创建新资产。遇到同名包 ID 时保留现有内容并选择新 ID。注册时若提示展示名称重复，根据用户原始需求选一个不重复且贴切的展示名称，更新包内对应内容后重试，并在交付时告知最终名称；不要覆盖已有专家团。若用户要求替换已有专家团，先明确替换范围，不通过删除旧包绕过重名保护。
 
 ## 2. 填充专家团包
 
-读取 [references/package-spec.md](references/package-spec.md)，在当前任务的可写目录创建 `<group-id>/`。ID 使用小写 kebab-case，目录名必须等于顶层 manifest 的 `name`。
+完整读取 [references/package-spec.md](references/package-spec.md) 的包结构和成员内容规范，在当前任务的可写目录创建 `<group-id>/`。ID 使用小写 kebab-case，目录名必须等于顶层 manifest 的 `name`。
 
-包内包括根 `manifest.json`、`README.md`，以及每个角色的 `manifest.json` 和 persona。Leader 另有 `AGENT.md`，普通成员不得有 `AGENT.md`。共享技能只在实际需要时添加。
+包内包括根 `manifest.json`、`README.md`，以及每个角色的 `manifest.json` 和 persona。Leader 另有 `AGENT.md`，普通成员不得有 `AGENT.md`。成员专用技能放在 `agents/<角色 ID>/skills/<skill-id>/SKILL.md`，并在该成员 manifest 的 `skills` 中以相对成员目录的 `skills/<skill-id>` 声明。只有团队共享技能放在与 `agents/` 同级的根 `skills/` 下；根目录技能会共享给所有角色，不要把成员专用技能集中放在那里。没有实际需要时不创建技能。
 
 不要直接写安装目录或 marketplace.json，不改内置资产。专家团与单专家路径不同：最终由运行时导入至 `<JiuwenSwarm 用户工作区>/.agent_teams/agent_groups/local/<group-id>/`。由运行环境确定用户工作区，不硬编码用户路径或借用 agent-creator 的注册脚本。
 
@@ -27,24 +27,36 @@ description: 从自然语言创建可被 JiuwenSwarm 加载和安装的专家团
 
 ## 3. 校验
 
-用安装了 JiuwenSwarm 的 Python 执行；`<skill_dir>` 为本技能所在目录，包路径使用绝对路径：
+使用当前 JiuwenSwarm 会话的运行时执行脚本，不判断源码、虚拟环境或 EXE 等启动形态，也不要凭 PATH 猜测 `python3`/`python`。宿主会提供可执行当前脚本的运行时（冻结应用通过 `JIUWENSWARM_EXECUTABLE` 提供；源码运行时使用当前会话已经使用的 Python）。如果运行时支持脚本参数，直接传入脚本路径；不要对冻结应用使用 `-c`。
+
+`<runtime>` 表示当前会话的 JiuwenSwarm 运行时，不是用户机器上随意搜索出来的 Python。`<skill_dir>` 为本技能所在目录，包路径使用绝对路径：
 
 ```bash
-python3 <skill_dir>/scripts/register_group.py /absolute/path/<group-id> --validate-only
+<runtime> <skill_dir>/scripts/register_group.py /absolute/path/<group-id> --validate-only
 ```
 
-脚本调用真实专家团加载器，验证每个成员模板、persona、Leader 规则和共享技能。出现 `RESULT: PASS` 后才进入注册。失败时修正具体报错；缺少运行依赖时说明阻塞，不跳过校验或宣称已创建成功。
+注册步骤使用完全相同的运行时，只移除 `--validate-only`：
+
+```text
+<runtime> <skill_dir>/scripts/register_group.py /absolute/path/<group-id>
+```
+
+脚本先拒绝 Markdown、Python、JSON 文件中的 `[TODO]` 占位符，并校验各技能 frontmatter 的名称、目录一致性及非空简介，再调用真实专家团加载器验证成员模板、persona、Leader 规则和技能路径。出现 `RESULT: PASS` 后才进入注册。失败时修正具体报错；缺少运行依赖时说明阻塞，不跳过校验或宣称已创建成功。
+
+按 [成员内容规范](references/package-spec.md#成员内容规范) 逐一完成所有成员的内容检查和组件自检；包加载通过不等于完整 harness 热加载或业务执行通过。
+
+注册前逐项核对：每个成员声明的技能目录都位于该成员的 `skills/` 下且有 `SKILL.md`；根 `skills/` 中每项都是确实需要共享给所有角色的团队技能；没有用 `../../skills/` 引用根目录来代替成员专用技能。加载通过不能判断一个技能是否应该共享。
 
 同时检查语义质量：成员职责是否互补、共享指令是否与 persona 一致、是否覆盖用户要求、是否清楚说明交付物及验收标准。加载成功不代表这些内容自动合格。
 
 ## 4. 注册
 
 ```bash
-python3 <skill_dir>/scripts/register_group.py /absolute/path/<group-id>
+<runtime> <skill_dir>/scripts/register_group.py /absolute/path/<group-id>
 ```
 
-注册会再次校验，复用产品导入流程复制包并登记为本地、未安装专家团；重名会报错，不覆盖现有资产。只有输出 `REGISTERED:` 才表示注册完成。勿用直接写 marketplace 或跳过错误的方式伪造成功。
+注册会再次校验，复用产品导入和安装流程复制包，并登记为可直接使用的本地专家团；重名会报错，不覆盖现有资产。只有同时输出 `REGISTERED:` 和 `INSTALLED:` 才表示注册完成。勿用直接写 marketplace 或跳过错误的方式伪造成功。
 
 ## 5. 交付
 
-简要告知专家团名称、Leader 与成员分工、已注册的 ID 和最终包位置，并给出 2–3 条推荐提问。提示用户到“专家 → 我的专家 → 专家团”找到新资产，安装后使用。不要把已注册说成已安装，也不要替用户执行专家团的业务任务。
+简要告知专家团名称、Leader 与成员分工、已注册并安装的 ID 和最终包位置，并给出 2–3 条推荐提问。提示用户到“专家 → 我的专家 → 专家团”找到新资产并直接使用，不要替用户执行专家团的业务任务。

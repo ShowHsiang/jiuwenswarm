@@ -12,7 +12,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -38,6 +40,22 @@ from jiuwenswarm.agents.harness.common.tools.command_runtime import (
 
 class CommandCancelled(Exception):
     """Raised when a blocking command is terminated by user interrupt."""
+
+
+# Blocking host commands: drain stdio in short slices so large output keeps
+# flowing while timeout / cancellation stay responsive.
+_DRAIN_POLL_SECONDS = 0.1
+# The child has exited but a grandchild may still hold the pipe FDs open.
+_DRAIN_GRACE_SECONDS = 1.0
+_DRAIN_READ_CHARS = 64 * 1024
+# Hard memory ceiling for the blocking drain: UTF-8 bytes kept per stream.
+# 32MiB per pipe bounds the drain's own footprint at about 100MB (measured),
+# whatever the command prints: the retained text, the joined copy and the JSON
+# payload built from it all derive from this limit.  Output past the ceiling is
+# read and dropped so the writer never blocks.
+_DRAIN_STREAM_LIMIT_BYTES = 32 * 1024 * 1024
+_DRAIN_JOIN_SECONDS = 2.0
+_DRAIN_TRUNCATED_SUFFIX = "\n...[output truncated: output limit reached]"
 
 
 # ── jiuwenswarm-tui 反复 spawn 护栏 ────────────────────────────────
@@ -167,6 +185,98 @@ _DANGEROUS_COMMAND_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
+# Every backend process (launcher, AgentServer, Gateway, Web) is a Python
+# interpreter, so killing Python by name takes the whole service down.
+# Matches python, python3.13, pythonw.exe, py.exe and python*.
+_PYTHON_IMAGE = r"(?:python|pythonw|py)[\d.]*(?:\.exe)?\*?"
+_PYTHON_KILL_BY_NAME = (
+    "blocked pattern: killing python processes by name also kills the JiuwenSwarm backend; "
+    "kill the specific PIDs your command started instead"
+)
+_PYTHON_NAME_KILL_PATTERNS = (
+    re.compile(
+        rf"\btaskkill\b[^\n\r;|&]*?/im\s+['\"]?\*?{_PYTHON_IMAGE}['\"]?(?=\s|$|[;&|])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\btaskkill\b[^\n\r;|&]*?/fi\s+['\"]\s*imagename\s+eq\s+\*?{_PYTHON_IMAGE}(?=['\"\s]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:stop-process|spps)\b[^\n\r;|&]*?-(?:name|processname)\s+['\"]?\*?{_PYTHON_IMAGE}['\"]?(?=\s|$|[;&|,)])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:get-process|gps)\s+(?:-name\s+)?['\"]?\*?{_PYTHON_IMAGE}"
+        rf"['\"]?(?=\s|\|)[^\n\r;]*?\|\s*(?:stop-process|spps|kill)\b",
+        re.IGNORECASE,
+    ),
+    # Sub-expression form: Stop-Process -Id (Get-Process python).Id — the
+    # pipe pattern above never sees the `)` and there is no literal PID.
+    re.compile(
+        rf"\b(?:stop-process|spps)\b[^\n\r;|&]*\(\s*(?:get-process|gps)\s+"
+        rf"(?:-name\s+)?['\"]?\*?{_PYTHON_IMAGE}(?=['\"\s).,;|]|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:wmic|win32_process)\b[^\n\r]*?\bname\s*(?:=|like|-eq|-like|-match)\s*['\"]?%?\*?python"
+        r"[^\n\r]*?\b(?:delete|terminate)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:pkill|killall)\b(?:\s+-\S+)*\s+"
+        r"(?:'python[\d.]*w?'|\"python[\d.]*w?\"|python[\d.]*w?(?=$|[\s;&|]))",
+        re.IGNORECASE,
+    ),
+)
+_DANGEROUS_COMMAND_PATTERNS.extend((p, _PYTHON_KILL_BY_NAME) for p in _PYTHON_NAME_KILL_PATTERNS)
+
+# Kill-by-PID forms whose targets are checked against the backend processes.
+_TASKKILL_SEGMENT_RE = re.compile(r"\btaskkill\b[^\n\r;|&]*", re.IGNORECASE)
+_TASKKILL_PID_RE = re.compile(r"/pid\s+(\d+)", re.IGNORECASE)
+_TASKKILL_FI_PID_RE = re.compile(r"\bpid\s+eq\s+(\d+)", re.IGNORECASE)
+_STOP_PROCESS_IDS_RE = re.compile(
+    r"\b(?:stop-process|spps)\b(?:[^\n\r;|&]*?\s-id[:\s]*|\s+)(\d+(?:\s*,\s*\d+)*)\b",
+    re.IGNORECASE,
+)
+_GET_PROCESS_ID_PIPE_RE = re.compile(
+    r"\b(?:get-process|gps)\s+-id\s+(\d+(?:\s*,\s*\d+)*)[^\n\r;|&]*"
+    r"\|\s*(?:stop-process|spps|kill)\b",
+    re.IGNORECASE,
+)
+_WMIC_TERMINATE_PID_RE = re.compile(
+    r"\bwmic\b[^\n\r]*?\bprocessid\s*=\s*(\d+)[^\n\r]*?\b(?:terminate|delete)\b",
+    re.IGNORECASE,
+)
+_CIM_PROCESSID_RE = re.compile(r"\bprocessid\s*=\s*'?(\d+)", re.IGNORECASE)
+# Shell words, keeping separators as standalone tokens so the POSIX kill
+# argument scan stops at `;`, `|` and `&`.
+_SHELL_TOKEN_RE = re.compile(r"[^\s;&|]+|[;&|]")
+_SIGSPEC_RE = re.compile(r"-(\d+)")
+# Largest signal number bash accepts as a `-N` sigspec; larger magnitudes are
+# negative-PID operands (`kill -9 -4242` targets a process group).
+_MAX_SIGNAL_NUMBER = 64
+
+_BACKEND_MODULES = (
+    "jiuwenswarm.app",
+    "jiuwenswarm.start_services",
+    "jiuwenswarm.server.app_agentserver",
+    "agent_gateway.app_gateway",
+    "jiuwenswarm.channels.web.app_web",
+)
+_BACKEND_SCRIPT_SUFFIXES = tuple(module.replace(".", "/") + ".py" for module in _BACKEND_MODULES)
+_BACKEND_ENTRY_POINTS = frozenset(
+    {
+        "jiuwenswarm-start",
+        "jiuwenswarm-app",
+        "jiuwenswarm-agentserver",
+        "jiuwenswarm-gateway",
+        "jiuwenswarm-web",
+        "jiuwenswarm-desktop",
+    }
+)
+_BACKEND_FLAGS = frozenset({"--desktop-run-agent", "--desktop-run-gateway"})
+
 _POWERSHELL_TOKENS = (
     "powershell ",
     "powershell.exe ",
@@ -272,7 +382,125 @@ def _check_command_safety(command: str) -> str | None:
     for pattern, message in _DANGEROUS_COMMAND_PATTERNS:
         if pattern.search(command):
             return message
-    return None
+    return _check_backend_pid_kill(command)
+
+
+def _posix_kill_pids(command: str) -> set[int]:
+    """PIDs a POSIX ``kill`` invocation would actually signal.
+
+    Mirrors bash's parsing: ``-0``/``-9``/``-TERM`` are sigspecs, ``-s SIG``
+    and ``-n NUM`` consume the next token, and the LAST sigspec wins — so
+    ``kill -0 -n 9 <pid>`` is a SIGKILL, not an existence probe. A negative
+    operand too large to be a signal number targets a process group.
+    Quoted forms (``bash -c 'kill -9 <pid>'``) are seen through because
+    tokens are stripped of surrounding quotes.
+    """
+    tokens = _SHELL_TOKEN_RE.findall(command)
+    pids: set[int] = set()
+    index = 0
+    while index < len(tokens):
+        word = tokens[index].strip("'\"")
+        if word != "kill" and not word.endswith(("/kill", "\\kill")):
+            index += 1
+            continue
+        index += 1
+        found: set[int] = set()
+        signal_is_zero = False
+        options_done = False
+        while index < len(tokens):
+            token = tokens[index].strip("'\"")
+            index += 1
+            if token in (";", "|", "&"):
+                break
+            if not options_done:
+                if token == "--":
+                    options_done = True
+                    continue
+                if token == "-l":  # `kill -l` lists signal names; no targets
+                    found.clear()
+                    break
+                if token in ("-s", "-n"):
+                    if index < len(tokens):
+                        signal_is_zero = tokens[index].strip("'\"") == "0"
+                        index += 1
+                    continue
+                sigspec = _SIGSPEC_RE.fullmatch(token)
+                if sigspec and int(sigspec.group(1)) <= _MAX_SIGNAL_NUMBER:
+                    signal_is_zero = sigspec.group(1) == "0"
+                    continue
+                if re.fullmatch(r"-[A-Za-z]+", token):  # -TERM / -SIGHUP
+                    signal_is_zero = False
+                    continue
+            operand = re.fullmatch(r"-?(\d+)", token)
+            if operand:
+                found.add(int(operand.group(1)))
+                continue
+            break  # job spec (%1) or any other word ends this invocation
+        if found and not signal_is_zero:
+            pids.update(found)
+    return pids
+
+
+def _kill_target_pids(command: str) -> set[int]:
+    pids: set[int] = _posix_kill_pids(command)
+    for segment in _TASKKILL_SEGMENT_RE.findall(command):
+        pids.update(int(pid) for pid in _TASKKILL_PID_RE.findall(segment))
+        pids.update(int(pid) for pid in _TASKKILL_FI_PID_RE.findall(segment))
+    for pattern in (_STOP_PROCESS_IDS_RE, _GET_PROCESS_ID_PIPE_RE):
+        for group in pattern.findall(command):
+            pids.update(int(pid) for pid in re.split(r"\s*,\s*", group))
+    pids.update(int(pid) for pid in _WMIC_TERMINATE_PID_RE.findall(command))
+    lowered = command.lower()
+    if "invoke-cimmethod" in lowered and "terminate" in lowered:
+        pids.update(int(pid) for pid in _CIM_PROCESSID_RE.findall(command))
+    return pids
+
+
+def _is_backend_cmdline(cmdline: Sequence[str]) -> bool:
+    for index, arg in enumerate(cmdline):
+        if arg in _BACKEND_FLAGS:
+            return True
+        if arg == "-m" and index + 1 < len(cmdline) and cmdline[index + 1] in _BACKEND_MODULES:
+            return True
+    # Script paths and entry-point names are only trusted in executable
+    # positions (the command word or the first two arguments). Scanning every
+    # argument made the agent's own shells unkillable whenever a command merely
+    # mentioned a backend file (`git diff -- jiuwenswarm/app.py`).
+    for index, arg in enumerate(cmdline[:3]):
+        if index and (arg.startswith("-") or any(ch.isspace() for ch in arg)):
+            continue
+        normalized = arg.replace("\\", "/")
+        if normalized.endswith(_BACKEND_SCRIPT_SUFFIXES):
+            return True
+        if normalized.rsplit("/", 1)[-1].lower().removesuffix(".exe") in _BACKEND_ENTRY_POINTS:
+            return True
+    return False
+
+
+def _backend_pids() -> set[int]:
+    """PIDs of this process, its ancestors and every JiuwenSwarm service process."""
+    import psutil
+
+    pids = {os.getpid()}
+    with contextlib.suppress(psutil.Error):
+        pids.update(parent.pid for parent in psutil.Process().parents())
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        if _is_backend_cmdline(proc.info.get("cmdline") or ()):
+            pids.add(proc.info["pid"])
+    return pids
+
+
+def _check_backend_pid_kill(command: str) -> str | None:
+    targets = _kill_target_pids(command)
+    if not targets:
+        return None
+    protected = sorted(targets & _backend_pids())
+    if not protected:
+        return None
+    return (
+        f"blocked: PID {', '.join(map(str, protected))} belongs to the JiuwenSwarm backend "
+        "or its launcher; kill only the processes your command started"
+    )
 
 
 # Options of `git worktree add` that consume the following token as a value.
@@ -645,17 +873,126 @@ def _resolve_execution_plan(command: str, shell_type: str) -> tuple[list[str] | 
     raise RuntimeError(f"Unsupported shell_type: {normalized}")
 
 
-def _resolve_encoding(resolved_shell: str) -> str:
-    """Choose subprocess text encoding based on the resolved shell type.
+def _decode_subprocess_output(output: bytes | None) -> str:
+    """Decode CLI output as UTF-8, falling back to the system encoding."""
+    if not output:
+        return ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        return output.decode(encoding, errors="replace")
 
-    - bash / sh on Windows (e.g. Git Bash / MSYS2) output UTF-8 by default.
-    - cmd uses the system code page (typically CP936/GBK on Chinese Windows).
-    - PowerShell also uses the system code page by default; safest to use
-      the system code page and rely on ``errors='replace'`` for edge cases.
+
+class _BoundedPipeDrain(threading.Thread):
+    """Read one binary pipe to EOF, keeping at most *limit_bytes* of raw bytes.
+
+    Output past the limit is still read (so the writer never blocks) but
+    dropped, which bounds process memory however much the command prints.
+    Chunks stay as ``bytes``: the single decode happens at EOF through
+    ``_decode_subprocess_output``, so UTF-8 is still preferred over the
+    system code page.
+
+    The thread owns its pipe: it closes the stream when it reaches EOF.  That
+    keeps the fd from outliving the reader even when the caller has already
+    given up waiting for it (no process group to kill, e.g. on Windows).
     """
-    if os.name == "nt" and resolved_shell in ("bash", "sh"):
-        return "utf-8"
-    return locale.getpreferredencoding(False) or "utf-8"
+
+    def __init__(self, stream: Any, limit_bytes: int) -> None:
+        super().__init__(name="command-output-drain", daemon=True)
+        self._stream = stream
+        self._limit_bytes = limit_bytes
+        self._chunks: list[bytes] = []
+        self._kept_bytes = 0
+        self.truncated = False
+        self.done = threading.Event()
+
+    def run(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(_DRAIN_READ_CHARS)
+                if not chunk:
+                    return
+                room = self._limit_bytes - self._kept_bytes
+                if room <= 0:
+                    self.truncated = True
+                    continue
+                if len(chunk) <= room:
+                    self._chunks.append(chunk)
+                    self._kept_bytes += len(chunk)
+                    continue
+                self._chunks.append(self._prefix_within(chunk, room))
+                self._kept_bytes = self._limit_bytes
+                self.truncated = True
+        except (OSError, ValueError):
+            # Stream closed from the coordinating thread (timeout / cancel).
+            pass
+        finally:
+            # Closing here, not only from the coordinating thread, is the only
+            # fallback when the caller could not kill the writer: the fd is
+            # released as soon as the pipe finally drains.
+            with contextlib.suppress(Exception):
+                self._stream.close()
+            self.done.set()
+
+    @staticmethod
+    def _prefix_within(chunk: bytes, room: int) -> bytes:
+        """Cut *chunk* at *room* bytes without splitting a UTF-8 sequence."""
+        cut = min(room, len(chunk))
+        while 0 < cut < len(chunk) and (chunk[cut] & 0xC0) == 0x80:
+            cut -= 1
+        return chunk[:cut]
+
+    @staticmethod
+    def _trim_partial_utf8_tail(data: bytes) -> bytes:
+        """Drop a trailing unfinished UTF-8 sequence so the prefix decodes.
+
+        A stream cut at the byte limit can end inside a multi-byte character;
+        the strict UTF-8 decode would then fail and fall back to the system
+        code page for the whole buffer.
+        """
+        end = len(data)
+        start = end - 1
+        while start >= 0 and end - start <= 4 and data[start] & 0xC0 == 0x80:
+            start -= 1
+        if start < 0:
+            return data
+        lead = data[start]
+        if lead < 0x80:
+            width = 1
+        elif lead & 0xE0 == 0xC0:
+            width = 2
+        elif lead & 0xF0 == 0xE0:
+            width = 3
+        elif lead & 0xF8 == 0xF0:
+            width = 4
+        else:
+            return data  # Invalid lead byte: leave it to the decode fallback.
+        return data[:start] if end - start < width else data
+
+    def data(self) -> bytes:
+        data = b"".join(self._chunks)
+        self._chunks.clear()
+        if self.truncated:
+            data = self._trim_partial_utf8_tail(data)
+        return data
+
+
+def _kill_drain_writers(proc: subprocess.Popen[Any], pgid: int | None) -> None:
+    """Kill the command and anything still holding its output pipes.
+
+    ``terminate_shell_process`` returns at once when the direct child already
+    exited, which would leave grandchildren writing into the pipes and the
+    drains blocked in ``read()`` forever.  Kill the session group we created
+    in that case too, so the drains reach EOF and the threads can finish.
+    """
+
+    if terminate_shell_process(proc):
+        return
+    if pgid is None:
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 def _run_command_sync(
@@ -666,7 +1003,6 @@ def _run_command_sync(
     session_id: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     plan, use_shell, resolved_shell = _resolve_execution_plan(command, shell_type)
-    encoding = _resolve_encoding(resolved_shell)
     popen_kw: dict[str, Any] = {}
     if os.name != "nt":
         _jw_start_new_session = os.getenv("JW_START_NEW_SESSION", "true").strip().lower()
@@ -678,62 +1014,92 @@ def _run_command_sync(
         cwd=str(workdir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding=encoding,
-        errors="replace",
         **popen_kw,
     )
     sid = (session_id or "").strip()
     if sid:
         register_shell_process(sid, proc)
-    stdout: str = ""
-    stderr: str = ""
+    # POSIX: start_new_session makes the child a process-group leader, so its
+    # pid is also the pgid shared by everything it spawns.
+    pgid = proc.pid if popen_kw.get("start_new_session") else None
+    stdout_drain = _BoundedPipeDrain(proc.stdout, _DRAIN_STREAM_LIMIT_BYTES)
+    stderr_drain = _BoundedPipeDrain(proc.stderr, _DRAIN_STREAM_LIMIT_BYTES)
+    drains = (stdout_drain, stderr_drain)
     deadline = time.monotonic() + timeout_seconds
     try:
-        while proc.poll() is None:
-            if time.monotonic() >= deadline:
-                terminate_shell_process(proc)
+        # Drain stdout/stderr while waiting instead of polling with a bare
+        # sleep: a child that fills the pipe buffer (~64KB) blocks in write()
+        # and never exits, so a poll-only wait reports a bogus timeout no
+        # matter how long the command really needs.  Reading the pipes here
+        # (instead of communicate()) also caps how much output is retained.
+        for drain in drains:
+            drain.start()
+        exit_deadline: float | None = None
+        while True:
+            now = time.monotonic()
+            if exit_deadline is None and proc.poll() is not None:
+                # Child exited, but grandchildren may still hold pipe FDs open.
+                # Same grace as before: exit + 1s, never earlier than deadline.
+                exit_deadline = max(deadline, now + _DRAIN_GRACE_SECONDS)
+            endtime = exit_deadline if exit_deadline is not None else deadline
+            if now >= endtime:
+                _kill_drain_writers(proc, pgid)
                 raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_seconds) from None
-            # Check cancel flag inside the poll loop for responsive cancellation.
-            # Without this, a long-running command could block for up to 600s
-            # after the user cancels, waiting for communicate() to drain pipes.
             if sid and consume_shell_session_cancelled(sid):
-                terminate_shell_process(proc)
+                _kill_drain_writers(proc, pgid)
                 raise CommandCancelled(command)
-            time.sleep(0.1)
-        # Child exited, but grandchildren may still hold pipe FDs open.
-        # Use the remaining deadline as communicate() timeout to avoid blocking
-        # forever when a grandchild inherits stdout/stderr (e.g. `cmd &` in shell).
-        remaining = max(deadline - time.monotonic(), 1.0)
-        try:
-            stdout, stderr = proc.communicate(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            terminate_shell_process(proc)
-            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_seconds) from None
-        # Final cancel check after communicate drains — covers the case where
-        # cancel arrived between the last poll iteration and communicate().
+            if exit_deadline is not None and all(d.done.is_set() for d in drains):
+                break
+            time.sleep(_DRAIN_POLL_SECONDS)
+        # Final cancel check after the pipes drain — covers the case where
+        # cancel arrived between the last poll iteration and the final read.
         if sid and consume_shell_session_cancelled(sid):
             raise CommandCancelled(command)
     except CommandCancelled:
         raise
     except Exception:
-        terminate_shell_process(proc)
+        _kill_drain_writers(proc, pgid)
         raise
     finally:
         if sid:
             unregister_shell_process(sid, proc)
-        # Close pipe FDs that communicate() would have closed on the
-        # normal path.  Without this, exception paths (cancel / timeout)
-        # leak FDs and trigger ResourceWarning.
-        for stream in (proc.stdout, proc.stdin, proc.stderr):
-            if stream is not None:
+        join_deadline = time.monotonic() + _DRAIN_JOIN_SECONDS
+        for drain in drains:
+            if not drain.is_alive():
+                continue
+            remaining_join = join_deadline - time.monotonic()
+            if remaining_join > 0:
+                drain.join(timeout=remaining_join)
+        # A drain still reading means someone survived the shell and holds the
+        # pipes open (a grandchild that outlived the SIGTERM above).  Whatever
+        # holds them is still in the group we created, so the pgid cannot have
+        # been recycled: kill it and let the threads finish instead of leaking
+        # them until the writer goes away.
+        if pgid is not None and any(drain.is_alive() for drain in drains):
+            with contextlib.suppress(OSError):
+                os.killpg(pgid, signal.SIGKILL)
+            for drain in drains:
+                if drain.is_alive():
+                    drain.join(timeout=_DRAIN_JOIN_SECONDS)
+        # Only close a pipe once its reader finished: closing a stream another
+        # thread is blocked reading on would block that close.  The drains close
+        # their own pipes too, so this is a no-op on the normal path and the
+        # safety net for a drain that never started.
+        for stream, drain in ((proc.stdout, stdout_drain), (proc.stderr, stderr_drain)):
+            if stream is not None and not drain.is_alive():
                 with contextlib.suppress(Exception):
                     stream.close()
+    stdout = _decode_subprocess_output(stdout_drain.data())
+    stderr = _decode_subprocess_output(stderr_drain.data())
+    if stdout_drain.truncated:
+        stdout += _DRAIN_TRUNCATED_SUFFIX
+    if stderr_drain.truncated:
+        stderr += _DRAIN_TRUNCATED_SUFFIX
     return subprocess.CompletedProcess(
         args=plan,
         returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout=stdout or "",
-        stderr=stderr or "",
+        stdout=stdout,
+        stderr=stderr,
     ), resolved_shell
 
 
@@ -760,6 +1126,8 @@ def _run_command_background(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         **popen_kw,
     )
     try:

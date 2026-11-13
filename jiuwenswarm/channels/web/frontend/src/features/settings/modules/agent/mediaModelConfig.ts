@@ -1,24 +1,16 @@
 import type { ModelPlan, VendorPresetMap } from '../../../../types';
-import {
-  CONTEXT_WINDOW_1M_FIELD,
-  normalizeContextWindowTokens,
-  ONE_MILLION_CONTEXT_WINDOW_TOKENS,
-  parseContextWindowTokens,
-  resolveDraftContextWindowTokens,
-} from '../models/contextWindow';
+import type { ModelValidationPayload } from '../../services/settingsContract';
+import { normalizeContextWindowTokens, resolveDraftContextWindowTokens } from '../models/contextWindow';
 import {
   CUSTOM_VENDOR_SELECTION,
   findVendorPreset,
   vendorSelectionKey,
   type ModelInputMode,
 } from '../models/modelAdapters';
-import {
-  mediaCapabilityContextWindowField,
-  mediaCapabilityEnabledField,
-  type MediaCapabilityModality,
-} from './mediaCapabilities';
+import type { MediaCapabilityModality } from './mediaCapabilities';
 
 const MODEL_PLANS: readonly ModelPlan[] = ['token_plan', 'coding_plan', 'custom_api'];
+export type ModelConfigurationSlot = MediaCapabilityModality | 'topic';
 
 export type MediaModelDraft = {
   vendor_selection: string;
@@ -32,20 +24,19 @@ export type MediaModelDraft = {
   vendor_key: string;
   plan: string;
   context_window_tokens: string;
-  [CONTEXT_WINDOW_1M_FIELD]: boolean;
 };
 
 function isModelPlan(value: string): value is ModelPlan {
   return (MODEL_PLANS as readonly string[]).includes(value);
 }
 
-function readConfig(config: Readonly<Record<string, unknown>>, modality: MediaCapabilityModality, suffix: string) {
+function readConfig(config: Readonly<Record<string, unknown>>, modality: ModelConfigurationSlot, suffix: string) {
   return String(config[`${modality}_${suffix}`] ?? '');
 }
 
 export function createMediaModelDraft(
   config: Readonly<Record<string, unknown>>,
-  modality: MediaCapabilityModality,
+  modality: ModelConfigurationSlot,
 ): MediaModelDraft {
   const apiBase = readConfig(config, modality, 'api_base');
   const apiKey = readConfig(config, modality, 'api_key');
@@ -75,15 +66,13 @@ export function createMediaModelDraft(
     vendor_key: vendorKey,
     plan,
     context_window_tokens: normalizedContextWindowTokens,
-    [CONTEXT_WINDOW_1M_FIELD]:
-      parseContextWindowTokens(normalizedContextWindowTokens) === ONE_MILLION_CONTEXT_WINDOW_TOKENS,
   };
 }
 
 export function buildMediaModelConfigUpdates(
   draft: MediaModelDraft,
   catalog: VendorPresetMap,
-  modality: MediaCapabilityModality,
+  modality: ModelConfigurationSlot,
   enableOnSave: boolean,
 ): Record<string, string> {
   const preset = findVendorPreset(catalog, draft.vendor_selection);
@@ -95,9 +84,53 @@ export function buildMediaModelConfigUpdates(
     [`${modality}_endpoint_profile`]: (preset ? (preset.endpoint_profile ?? '') : draft.endpoint_profile).trim(),
     [`${modality}_vendor_key`]: (preset?.vendor_key ?? '').trim(),
     [`${modality}_plan`]: (preset?.plan ?? '').trim(),
-    [mediaCapabilityContextWindowField(modality)]: String(
-      resolveDraftContextWindowTokens(draft.context_window_tokens, draft[CONTEXT_WINDOW_1M_FIELD]),
-    ),
-    ...(enableOnSave ? { [mediaCapabilityEnabledField(modality)]: 'true' } : {}),
+    [`${modality}_context_window_tokens`]: String(resolveDraftContextWindowTokens(draft.context_window_tokens)),
+    ...(enableOnSave ? { [`${modality}_enabled`]: 'true' } : {}),
   };
+}
+
+/** Same probe shape as chat model settings; topic reuses ``config.validate_model``. */
+export function buildMediaModelValidationPayload(
+  draft: MediaModelDraft,
+  catalog: VendorPresetMap,
+  options: { apiKeyFallback?: string } = {},
+): ModelValidationPayload {
+  const preset = findVendorPreset(catalog, draft.vendor_selection);
+  const endpointProfile = (
+    preset ? (preset.endpoint_profile ?? '') : draft.endpoint_profile
+  ).trim();
+  const vendorKey = (preset?.vendor_key ?? '').trim();
+  const payload: ModelValidationPayload = {
+    api_base: (preset?.api_base ?? draft.api_base).trim(),
+    api_key: draft.api_key.trim() || String(options.apiKeyFallback ?? '').trim(),
+    model: draft.model_name.trim(),
+    model_provider: ((preset?.client_provider ?? draft.provider.trim()) || 'OpenAI').trim(),
+    reasoning_level: '',
+  };
+  if (endpointProfile) payload.endpoint_profile = endpointProfile;
+  if (vendorKey) payload.vendor_key = vendorKey;
+  return payload;
+}
+
+/** Card-level probe for a saved topic connection (key already loaded). */
+export function buildSavedTopicModelValidationPayload(
+  config: Readonly<Record<string, unknown>>,
+): ModelValidationPayload | null {
+  const apiBase = String(config.api_base ?? '').trim();
+  const apiKey = String(config.api_key ?? '').trim();
+  const model = String(config.model ?? '').trim();
+  const modelProvider = (String(config.provider ?? '').trim() || 'OpenAI');
+  if (!apiBase || !apiKey || !model) return null;
+  const payload: ModelValidationPayload = {
+    api_base: apiBase,
+    api_key: apiKey,
+    model,
+    model_provider: modelProvider,
+    reasoning_level: '',
+  };
+  const endpointProfile = String(config.endpoint_profile ?? '').trim();
+  const vendorKey = String(config.vendor_key ?? '').trim();
+  if (endpointProfile) payload.endpoint_profile = endpointProfile;
+  if (vendorKey) payload.vendor_key = vendorKey;
+  return payload;
 }

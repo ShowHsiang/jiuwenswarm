@@ -25,10 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Final
 
+from agent_gateway.common.work_mode import SUPPORTED_WORK_MODES
+
+from jiuwenswarm.common.config import get_config
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
+from jiuwenswarm.common.sqlite_config import workspace_sqlite_journal_mode
 from jiuwenswarm.common.utils import get_agent_root_dir
 from jiuwenswarm.server.runtime.gateway_adapter.base import (
     GatewayAdapter,
@@ -78,6 +83,8 @@ def _is_previewable(item: object) -> bool:
     content = item.get("content")
     has_content = isinstance(content, str) and bool(content.strip())
     if role == "user":
+        if str(item.get("event_type") or "").startswith("design."):
+            return False
         return has_content
     # 非 user 记录只放行白名单内的对话类型（兼容团队成员回复的 teammate 等 role）
     return item.get("event_type") in _PREVIEW_CHAT_EVENT_TYPES and has_content
@@ -131,14 +138,18 @@ class SessionAdapter(GatewayAdapter):
                 guard(str(params.get("session_id") or request.session_id or ""))
             except LifecycleError as exc:
                 return build_error_response(request, str(exc), code=exc.code)
-        if method == ReqMethod.SESSION_GET_METADATA:
-            return await self._handle_get_metadata(request)
-        if method == ReqMethod.SESSION_PIN:
-            return await self._handle_pin(request)
-        if method == ReqMethod.SESSION_COLOR_SET:
-            return await self._handle_color_set(request)
-        if method == ReqMethod.SESSION_PREVIEW:
-            return await self._handle_preview(request)
+        if method in {
+            ReqMethod.SESSION_LIST,
+            ReqMethod.SESSION_GET_METADATA,
+            ReqMethod.SESSION_PIN,
+            ReqMethod.SESSION_COLOR_SET,
+            ReqMethod.SESSION_PREVIEW,
+        }:
+            from jiuwenswarm.server.control.repositories.session_repository import (
+                handle_session_request,
+            )
+
+            return await handle_session_request(request)
         if method == ReqMethod.HISTORY_LIST_TURNS:
             return await self._handle_history_list_turns(request)
         if method == ReqMethod.SESSION_RESTORE_FILES:
@@ -231,7 +242,28 @@ class SessionAdapter(GatewayAdapter):
             offset = parse_int_param(
                 params, "offset", 0, minimum=0, maximum=10**9
             )
-            sessions, total = get_all_sessions_metadata(limit=limit, offset=offset)
+            raw_work_mode = params.get("work_mode")
+            if isinstance(raw_work_mode, str) and raw_work_mode.strip():
+                work_mode = raw_work_mode.strip().lower()
+                if work_mode not in SUPPORTED_WORK_MODES:
+                    return build_error_response(
+                        request, f"invalid work_mode: {work_mode!r}", code="BAD_REQUEST"
+                    )
+                # Filtering must happen before pagination. Reload the complete
+                # metadata set so totals and offsets remain mode-local.
+                all_sessions, _ = get_all_sessions_metadata(
+                    limit=10**9,
+                    offset=0,
+                )
+                matching = [
+                    session
+                    for session in all_sessions
+                    if str(session.get("work_mode") or "").strip().lower() == work_mode
+                ]
+                total = len(matching)
+                sessions = matching[offset: offset + limit]
+            else:
+                sessions, total = get_all_sessions_metadata(limit=limit, offset=offset)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SessionAdapter] session.list failed: %s", exc)
             # 按通道保持迁移前的失败契约：
@@ -316,11 +348,20 @@ class SessionAdapter(GatewayAdapter):
             return build_error_response(
                 request, "pinned must be boolean", code="BAD_REQUEST"
             )
+        started = time.perf_counter()
         try:
-            result = set_session_pinned(sid, raw_pinned)
+            result = await asyncio.to_thread(set_session_pinned, sid, raw_pinned)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[SessionAdapter] session.pin failed: %s", exc)
+            logger.exception(
+                "[SessionAdapter] session.pin failed request_id=%s session_id=%s elapsed_ms=%.1f",
+                request.request_id, sid, (time.perf_counter() - started) * 1000,
+            )
             return build_error_response(request, str(exc), code="INTERNAL_ERROR")
+        logger.info(
+            "[SessionAdapter] session.pin request_id=%s session_id=%s pinned=%s elapsed_ms=%.1f found=%s",
+            request.request_id, sid, raw_pinned,
+            (time.perf_counter() - started) * 1000, result is not None,
+        )
         if result is None:
             return build_error_response(
                 request, "session not found", code="NOT_FOUND"
@@ -416,7 +457,7 @@ class SessionAdapter(GatewayAdapter):
             return build_error_response(
                 request, "session_id is required", code="BAD_REQUEST"
             )
-        from jiuwenswarm.common.mode_matrix import is_team_mode
+        from agent_gateway.common.mode_matrix import is_team_mode
         from jiuwenswarm.server.runtime.offline_session_cleanup import (
             delete_offline_session,
         )
@@ -459,7 +500,8 @@ class SessionAdapter(GatewayAdapter):
         # secondary, best-effort cleanup and must not rewrite that result.
         try:
             mailbox = SessionMessageStore(
-                get_agent_root_dir() / "session_messages.sqlite3"
+                get_agent_root_dir() / "session_messages.sqlite3",
+                journal_mode=workspace_sqlite_journal_mode(get_config()) or "WAL",
             )
             if mailbox.exists():
                 records = await asyncio.to_thread(

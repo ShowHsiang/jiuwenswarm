@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, InvokeInputs
 from openjiuwen.harness.rails.base import DeepAgentRail
 
@@ -323,7 +324,9 @@ class CircuitBreakerRail(DeepAgentRail):
 
     def cleanup_session(self, session_id: str = "") -> None:
         """Remove per-session history and lock for *session_id*."""
-        sid = session_id or "default"
+        # Key must match before_invoke's (stripped): the adapter calls this
+        # with the pre-normalized sid, so a raw key would never be evicted.
+        sid = str(session_id or "").strip() or "default"
         self._histories.pop(sid, None)
         self._locks.pop(sid, None)
 
@@ -376,8 +379,10 @@ class CircuitBreakerRail(DeepAgentRail):
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         if not isinstance(ctx.inputs, InvokeInputs):
             return
+        # Strip like StreamEventRail._sid_key: control-side cleanup arrives
+        # pre-normalized and must land on the same key.
         raw_conv_id = ctx.inputs.conversation_id or ""
-        sid = raw_conv_id or "default"
+        sid = raw_conv_id.strip() or "default"
         ctx.extra[self._SID_KEY] = sid
         _invoke_sid.set(sid)
         self._histories[sid] = []
@@ -402,6 +407,12 @@ class CircuitBreakerRail(DeepAgentRail):
         tool_result = ctx.inputs.tool_result
 
         if not tool_name:
+            return
+        # A paused call (a permission approval, ask_user) has no outcome yet:
+        # its result is recorded when the turn resumes. Counting the pause as
+        # an error trips unknown_tool_repeat when one turn pauses ten calls of
+        # the same tool.
+        if isinstance(ctx.exception, ToolInterruptException):
             return
 
         sid = self._resolve_sid(ctx)

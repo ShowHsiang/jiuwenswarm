@@ -152,7 +152,7 @@ If the service is already running it will auto-reload; otherwise run `jiuwenswar
    - `im:message:send`: Send messages as the app
    - `im:message.p2p_msg:readonly`: Get private messages sent to the bot
    - `im:message.group_at_msg:readonly`: Receive group chat @bot message events
-   - `im:resource:upload`: Upload images and files
+   - `im:resource`: Get and upload image or file resources
    - `contact:user.employee_id:readonly`: Get user ID information
 
 ![Feishu permissions](../assets/images/feishu_app_permission.png)
@@ -419,6 +419,10 @@ In JiuwenSwarm, open **Channels → DingTalk**, enable it, and configure **clien
 | `send_file_allowed` | Allow sending files |
 | `api_base` | v1.0 API domain, default `https://api.dingtalk.com` |
 | `oapi_base` | Legacy media API domain, default `https://oapi.dingtalk.com` |
+
+### 6. Authorize a DingTalk account for a team employee
+
+After binding a DingTalk app to an employee, open that employee's DingTalk connection and choose **Authorize DingTalk account**. Swarm can download, verify, and cache the DingTalk CLI on x64 and ARM64 Windows, macOS, and Linux without Node.js. Initial setup requires access to the official DingTalk CLI release on Gitee or GitHub. If the download fails, check your network and try again.
 
 ---
 

@@ -15,7 +15,7 @@ from jiuwenswarm.agents.harness.common.tools.session_messaging_toolkit import (
 )
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep as interface_deep_module
 from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
-from jiuwenswarm.symphony.llm import SYMPHONY_LLM_CONFIG_REF_KEY
+from jiuwenswarm.runtime.symphony.llm import SYMPHONY_LLM_CONFIG_REF_KEY
 
 
 def _assert_symphony_request_model_context(inputs: dict) -> None:
@@ -878,12 +878,19 @@ async def test_non_stream_error_answer_returns_failure_instead_of_empty_success(
     assert response.payload == {"error": "Error code: 401 - model access denied"}
     assert len(seen_inputs) == 1
     assert seen_inputs[0]["query"] == "run task"
+    assert "_turn_number" not in seen_inputs[0]
     _assert_symphony_request_model_context(seen_inputs[0])
 
 
 @pytest.mark.anyio
 async def test_agent_non_stream_slash_followup_continues_into_runner(monkeypatch):
     adapter = _adapter_ready_for_followup_execution(monkeypatch)
+    adapter._kv_cache_affinity_enabled = True
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_trajectory_turn",
+        lambda _params: SimpleNamespace(turn_id="turn-non-stream", turn_number=3),
+    )
     seen_inputs: list[dict] = []
     _install_interaction_followup_agent(
         adapter,
@@ -914,6 +921,7 @@ async def test_agent_non_stream_slash_followup_continues_into_runner(monkeypatch
     assert len(seen_inputs) == 1
     assert seen_inputs[0]["query"] == "review and evolve code-runner"
     assert seen_inputs[0]["_invoke_turn_id"] == "req-followup"
+    assert seen_inputs[0]["_turn_number"] == 3
     _assert_symphony_request_model_context(seen_inputs[0])
     assert response.ok is True
     assert response.payload == {"content": "agent completed"}
@@ -922,6 +930,12 @@ async def test_agent_non_stream_slash_followup_continues_into_runner(monkeypatch
 @pytest.mark.anyio
 async def test_agent_stream_slash_followup_continues_into_runner(monkeypatch):
     adapter = _adapter_ready_for_followup_execution(monkeypatch)
+    adapter._kv_cache_affinity_enabled = True
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_trajectory_turn",
+        lambda _params: SimpleNamespace(turn_id="turn-stream", turn_number=4),
+    )
     seen_inputs: list[dict] = []
     _install_interaction_followup_agent(
         adapter,
@@ -955,13 +969,15 @@ async def test_agent_stream_slash_followup_continues_into_runner(monkeypatch):
     assert len(seen_inputs) == 1
     assert seen_inputs[0]["query"] == "review and simplify code-runner"
     assert seen_inputs[0]["_invoke_turn_id"] == "req-followup-stream"
+    assert seen_inputs[0]["_turn_number"] == 4
     _assert_symphony_request_model_context(seen_inputs[0])
     assert chunks[0].payload == {"event_type": "chat.delta", "content": "agent delta"}
     assert chunks[-1].is_complete is True
 
 
 @pytest.mark.anyio
-async def test_team_stream_injects_image_tool_context_for_non_vision_model(monkeypatch):
+@pytest.mark.parametrize("image_status", ["unsupported", "disabled", "unknown"])
+async def test_team_stream_injects_image_tool_context_for_non_vision_model(monkeypatch, image_status):
     """Team mode must preserve the same local-image tool context as agent mode."""
     adapter = JiuWenSwarmDeepAdapter()
     adapter._instance = SimpleNamespace()  # pylint: disable=protected-access
@@ -976,7 +992,7 @@ async def test_team_stream_injects_image_tool_context_for_non_vision_model(monke
         lambda _model, **_kwargs: None,
     )
     monkeypatch.setattr(adapter, "_resolve_runtime_language", lambda: "cn")
-    monkeypatch.setattr(adapter, "_native_image_input_enabled", lambda *_args: False)
+    monkeypatch.setattr(adapter, "_native_image_input_status", lambda *_args: image_status)
     monkeypatch.setattr(adapter, "_write_runtime_state", lambda **_kwargs: None)
 
     async def _capture_team_inputs(_request, inputs, _instance):
@@ -1007,8 +1023,16 @@ async def test_team_stream_injects_image_tool_context_for_non_vision_model(monke
         is_stream=True,
     )
 
-    async for _ in adapter.process_message_stream_impl(request, {"query": "解析图片内容"}):
-        pass
+    chunks = [chunk async for chunk in adapter.process_message_stream_impl(request, {"query": "解析图片内容"})]
 
     assert "jiuwenswarm_image_tool_context" in captured["query"]
     assert "agent/sessions/sess-team-image/uploads/persisted.png" in captured["query"]
+    assert f'"imageInputStatus": "{image_status}"' in captured["query"]
+    notices = [chunk.payload for chunk in chunks if chunk.payload.get("event_type") == "chat.notice"]
+    assert len(notices) == 1
+    assert notices[0]["image_input_status"] == image_status
+    if image_status == "unknown":
+        assert "尚未确认" in notices[0]["content"]
+        assert "尚未确认" in captured["query"]
+    if image_status != "unsupported":
+        assert "不支持" not in notices[0]["content"]

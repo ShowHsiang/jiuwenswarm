@@ -6,6 +6,25 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
+def test_fork_history_drops_parent_cumulative_usage_but_keeps_turn_usage():
+    from jiuwenswarm.agents.harness.common.session_ops_service import _copy_fork_history_value
+
+    source = {
+        "event_type": "chat.usage_summary",
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+        "session_usage": {"session_id": "source", "revision": 9},
+    }
+    copied = _copy_fork_history_value(
+        source,
+        source_session_id="source",
+        target_session_id="fork",
+    )
+
+    assert "session_usage" not in copied
+    assert copied["usage"] == {"input_tokens": 10, "output_tokens": 2}
+    assert source["session_usage"]["session_id"] == "source"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -30,7 +49,7 @@ def _sync_enqueue_write():
     """Return a replacement for _enqueue_write that writes synchronously."""
     from jiuwenswarm.server.runtime.session.session_metadata import _write_metadata_sync
 
-    def _replacement(session_id: str, metadata: dict) -> None:
+    def _replacement(session_id: str, metadata: dict, *, sync_write: bool = False) -> None:
         _write_metadata_sync(session_id, metadata)
 
     return _replacement
@@ -79,6 +98,8 @@ class TestForkSessionChannelMetadata:
             "title": "My Test Session",
             "message_count": 5,
             "mode": "code.normal",
+            "moa_enabled": True,
+            "model_selection": {"type": "model_group", "id": "ordinary-pool", "route_id": "primary"},
             "channel_metadata": {
                 "project_dir": "/Users/test/my-project",
                 "cwd": "/Users/test/my-project",
@@ -92,7 +113,7 @@ class TestForkSessionChannelMetadata:
             "jiuwenswarm.agents.harness.common.session_ops_service.load_history_records",
             return_value=[],
         ), patch(
-            "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
+            "jiuwenswarm.server.runtime.session.session_metadata.collect_all_sessions_metadata",
             return_value=[],
         ):
             from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
@@ -108,6 +129,8 @@ class TestForkSessionChannelMetadata:
         assert result["source_session_id"] == source_id
 
         target_meta = _read_target_meta(sessions_dir, target_id)
+        assert target_meta["moa_enabled"] is True
+        assert target_meta["model_selection"] == source_meta["model_selection"]
         assert "channel_metadata" in target_meta, (
             "fork_session should copy channel_metadata from source"
         )
@@ -139,7 +162,7 @@ class TestForkSessionChannelMetadata:
             "jiuwenswarm.agents.harness.common.session_ops_service.load_history_records",
             return_value=[],
         ), patch(
-            "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
+            "jiuwenswarm.server.runtime.session.session_metadata.collect_all_sessions_metadata",
             return_value=[],
         ):
             from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
@@ -157,63 +180,61 @@ class TestForkSessionChannelMetadata:
             "fork_session should not add an empty channel_metadata"
         )
 
-    def test_side_conversation_is_ephemeral_and_keeps_parent_history(
-        self, tmp_path, monkeypatch
-    ):
+    def test_fork_copies_equipment_model_and_applies_current_selection(self, tmp_path, monkeypatch):
         sessions_dir = self._setup(monkeypatch, tmp_path)
-        source_id = "web_parent"
-        target_id = "web_side"
-        _write_source_meta(
-            sessions_dir,
-            source_id,
-            {
-                "session_id": source_id,
-                "title": "Parent chat",
-                "message_count": 2,
-                "mode": "agent.work.normal",
-                "model": "test-model",
-                "session_equipment": {"plugin_names": ["search"]},
+        _write_source_meta(sessions_dir, "source", {
+            "session_id": "source",
+            "title": "Configured chat",
+            "model": "selected-model",
+            "session_equipment": {
+                "agent_template_name": "expert-a",
+                "plugin_names": ["plugin-a"],
+                "mcp": ["connector-a"],
+            },
+        })
+
+        from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
+
+        fork_session(
+            source_session_id="source",
+            target_session_id="fork",
+            channel_id="web",
+            session_equipment_override={
+                "agent_template_name": "expert-b",
+                "mcp": ["connector-b", "connector-b"],
             },
         )
-        (sessions_dir / source_id / "history.jsonl").write_text("\n", encoding="utf-8")
-        records = [
-            {"id": "parent-user", "role": "user", "content": "Parent question"},
-            {
-                "id": "parent-answer",
-                "role": "assistant",
-                "event_type": "chat.final",
-                "content": "Parent answer",
-            },
-        ]
-        write_history = MagicMock()
 
-        with patch(
-            "jiuwenswarm.agents.harness.common.session_ops_service.history_exists",
-            return_value=True,
-        ), patch(
-            "jiuwenswarm.agents.harness.common.session_ops_service.load_history_records",
-            return_value=records,
-        ), patch(
-            "jiuwenswarm.agents.harness.common.session_ops_service.write_history_records",
-            write_history,
-        ):
-            from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
+        target_meta = _read_target_meta(sessions_dir, "fork")
+        assert target_meta["model"] == "selected-model"
+        assert target_meta["session_equipment"] == {
+            "agent_template_name": "expert-b",
+            "plugin_names": ["plugin-a"],
+            "mcp": ["connector-b"],
+        }
+        assert _read_target_meta(sessions_dir, "source")["session_equipment"]["agent_template_name"] == "expert-a"
 
-            result = fork_session(
-                source_session_id=source_id,
-                target_session_id=target_id,
+    def test_repeated_forks_get_distinct_branch_titles(self, tmp_path, monkeypatch):
+        sessions_dir = self._setup(monkeypatch, tmp_path)
+        _write_source_meta(sessions_dir, "source", {
+            "session_id": "source", "title": "接口调试",
+        })
+        from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
+
+        titles = [
+            fork_session(
+                source_session_id="source",
+                target_session_id=f"fork-{index}",
                 channel_id="web",
-                side_conversation=True,
-            )
+            )["title"]
+            for index in range(1, 4)
+        ]
 
-        assert result["ephemeral"] is True
-        target_meta = _read_target_meta(sessions_dir, target_id)
-        assert target_meta["ephemeral"] is True
-        assert target_meta["side_parent_session_id"] == source_id
-        assert target_meta["message_count"] == 0
-        assert target_meta["model"] == "test-model"
-        assert target_meta["session_equipment"] == {"plugin_names": ["search"]}
-        assert len(write_history.call_args.args[1]) == 2
+        assert titles == [
+            "接口调试 (Branch)",
+            "接口调试 (Branch 2)",
+            "接口调试 (Branch 3)",
+        ]
 
     def test_channel_metadata_is_deep_copied(self, tmp_path, monkeypatch):
         """Verify channel_metadata is a deep copy, not a shared reference."""
@@ -243,7 +264,7 @@ class TestForkSessionChannelMetadata:
             "jiuwenswarm.agents.harness.common.session_ops_service.load_history_records",
             return_value=[],
         ), patch(
-            "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
+            "jiuwenswarm.server.runtime.session.session_metadata.collect_all_sessions_metadata",
             return_value=[],
         ):
             from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
@@ -309,7 +330,7 @@ class TestForkSessionChannelMetadata:
             "jiuwenswarm.agents.harness.common.session_ops_service.write_history_records",
             write_history,
         ), patch(
-            "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
+            "jiuwenswarm.server.runtime.session.session_metadata.collect_all_sessions_metadata",
             return_value=[],
         ):
             from jiuwenswarm.agents.harness.common.session_ops_service import fork_session
@@ -402,7 +423,7 @@ class TestForkSessionChannelMetadata:
             "jiuwenswarm.agents.harness.common.session_ops_service.write_history_records",
             write_history,
         ), patch(
-            "jiuwenswarm.server.runtime.session.session_metadata.get_all_sessions_metadata",
+            "jiuwenswarm.server.runtime.session.session_metadata.collect_all_sessions_metadata",
             return_value=[],
         ):
             from jiuwenswarm.agents.harness.common.session_ops_service import fork_session

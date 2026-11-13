@@ -39,6 +39,7 @@ def _raw_record(
     parent_span_id: str = "",
     name: str = "agent.run",
     status_code: str = "STATUS_CODE_UNSET",
+    attributes: list[dict[str, Any]] | None = None,
 ) -> bytes:
     return json.dumps(
         {
@@ -57,7 +58,7 @@ def _raw_record(
                                     "startTimeUnixNano": "100",
                                     "endTimeUnixNano": "200",
                                     "status": {"code": status_code},
-                                    "attributes": [],
+                                    "attributes": attributes or [],
                                 }
                             ],
                         }
@@ -68,6 +69,13 @@ def _raw_record(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _turn_attributes(turn_id: str, turn_number: int) -> list[dict[str, Any]]:
+    return [
+        {"key": "openjiuwen.turn.id", "value": {"stringValue": turn_id}},
+        {"key": "openjiuwen.turn.number", "value": {"intValue": str(turn_number)}},
+    ]
 
 
 def _core_record(
@@ -260,6 +268,111 @@ def test_frames_name_their_span_once_instead_of_on_every_row(
     test_logger.info("64 frames name their span through one row")
 
 
+def _frame_rows(database_path: Path) -> tuple[list[int], int]:
+    """Return the frame sequences held, and how many spans are named."""
+    connection = sqlite3.connect(database_path)
+    try:
+        frames = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT sequence FROM trajectory_stream_frames ORDER BY sequence"
+            )
+        ]
+        spans = int(
+            connection.execute("SELECT COUNT(*) FROM trajectory_frame_spans").fetchone()[0]
+        )
+    finally:
+        connection.close()
+    return frames, spans
+
+
+def test_a_terminal_record_discards_the_frames_it_supersedes(tmp_path: Path) -> None:
+    """Frames stand in for an answer being written; the record states it in full.
+
+    From the moment a span's terminal record lands, nothing reads its frames:
+    the reader drops its own copy, the detail read never consults them, and an
+    archive excludes them. They are the largest table in the database, so they
+    go with the record that supersedes them rather than waiting for the turn
+    page to be retired.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([], frames=[_frame(index) for index in range(8)])
+        assert _frame_rows(database_path) == ([0, 1, 2, 3, 4, 5, 6, 7], 1)
+        # The same flush window may carry a span's last frames and its record.
+        store.write_records([_stored_record()], frames=[_frame(8), _frame(9)])
+    finally:
+        store.close()
+
+    # The span was named only so its frames could point at it.
+    assert _frame_rows(database_path) == ([], 0)
+    test_logger.info("a terminal record took its span's frames with it")
+
+
+def test_frames_of_a_running_span_outlive_its_snapshots(tmp_path: Path) -> None:
+    """Only a terminal record supersedes frames -- a snapshot is still partial.
+
+    A running span's snapshots restate what it has produced so far, but the
+    reader reaches a still-streaming answer through the frames. Discarding them
+    on a snapshot would blank a live answer mid-sentence.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([], frames=[_frame(0), _frame(1)])
+        store.write_records([_snapshot_record(1, name="agent.run")], frames=[_frame(2)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([0, 1, 2], 1)
+    test_logger.info("a snapshot left the live answer's frames in place")
+
+
+def test_frames_landing_after_their_span_ended_are_not_stored(tmp_path: Path) -> None:
+    """Records and frames queue separately, so a frame can arrive too late.
+
+    Nothing would delete such a frame afterwards: the discard runs as a record
+    lands, and that record has already landed. Retention's orphan sweep does
+    not reach it either, because that ages out frames of spans holding no
+    record at all. So it is refused at the door instead.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()])
+        store.write_records([], frames=[_frame(0), _frame(1)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([], 0)
+    test_logger.info("frames of an ended span were refused rather than stranded")
+
+
+def test_keeping_the_frames_of_ended_spans_is_configurable(tmp_path: Path) -> None:
+    """Replaying a finished answer frame by frame needs those frames kept.
+
+    Nothing reads them today, so they are discarded by default. This is the
+    switch that a frame-by-frame replay of a completed turn would need, and
+    with it off the frames live as long as their turn page does.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path, discard_final_span_frames=False)
+    store.initialize()
+    try:
+        store.write_records([_stored_record()], frames=[_frame(0)])
+        # Also kept when the frame arrives after its span's record.
+        store.write_records([], frames=[_frame(1)])
+    finally:
+        store.close()
+
+    assert _frame_rows(database_path) == ([0, 1], 1)
+    test_logger.info("frames of ended spans were kept for replay")
+
+
 def test_a_span_name_lives_exactly_as_long_as_its_frames(tmp_path: Path) -> None:
     """Nothing refers to a span once its frames are gone, so it goes with them.
 
@@ -307,6 +420,72 @@ def test_a_span_name_lives_exactly_as_long_as_its_frames(tmp_path: Path) -> None
     finally:
         store.close()
     test_logger.info("span names are swept with the last frame that used them")
+
+
+@pytest.mark.asyncio
+async def test_frame_pages_skip_ineligible_traces_without_losing_the_cursor(
+    tmp_path: Path,
+) -> None:
+    """A frame page walks frame_seq and filters each frame by its trace.
+
+    Frames of a trace the viewer may not see sit between eligible ones and
+    after the last of them. They must neither appear in a page, nor stop the
+    cursor short, nor count toward the watermark a reader resumes against.
+    """
+    database_path = tmp_path / "trajectory.sqlite3"
+    store = TrajectoryStore(database_path, discard_final_span_frames=False)
+    store.initialize()
+
+    def frame(trace_id: str, sequence: int) -> StreamFrameData:
+        return StreamFrameData(
+            session_id="session-1",
+            execution_subject_id="main",
+            trace_id=trace_id,
+            span_id=_ROOT_SPAN_ID,
+            sequence=sequence,
+            kind="text-delta",
+            timestamp_unix_nano=1_000 + sequence,
+            text=f"{trace_id[0]}{sequence}",
+        )
+
+    try:
+        store.write_records([
+            _stored_record(),
+            _stored_record(trace_id=_SECOND_TRACE_ID, agent_mode="unknown.mode"),
+        ])
+        # frame_seq 1..6, eligible ones at 1, 3 and 5.
+        store.write_records([], frames=[
+            frame(_TRACE_ID, 0),
+            frame(_SECOND_TRACE_ID, 0),
+            frame(_TRACE_ID, 1),
+            frame(_SECOND_TRACE_ID, 1),
+            frame(_TRACE_ID, 2),
+            frame(_SECOND_TRACE_ID, 2),
+        ])
+    finally:
+        store.close()
+
+    reader = AsyncTrajectoryReader(database_path)
+    first = await reader.get_stream_frames("session-1", since_frame_seq=0, limit=2)
+    assert first is not None
+    assert [item["frame_seq"] for item in first["frames"]] == [1, 3]
+    assert [item["text"] for item in first["frames"]] == ["10", "11"]
+    assert first["frame_seq"] == 5
+    assert first["has_more"] is True
+    assert first["reset"] is False
+    assert first["next_since_frame_seq"] == 3
+
+    second = await reader.get_stream_frames(
+        "session-1",
+        since_frame_seq=first["next_since_frame_seq"],
+        limit=2,
+    )
+    assert second is not None
+    assert [item["frame_seq"] for item in second["frames"]] == [5]
+    assert second["has_more"] is False
+    assert second["reset"] is False
+    assert second["next_since_frame_seq"] == 5
+    test_logger.info("frame pages skipped another trace's frames in place")
 
 
 def test_store_preserves_exact_raw_and_records_hash_conflict(tmp_path: Path) -> None:
@@ -1252,11 +1431,19 @@ async def test_partial_retention_rotates_epoch_and_rebuilds_remaining_view(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "trajectory.sqlite3"
-    expired = TraceRecordData.from_core_record(_core_record(), created_at=1)
+    # Retention removes whole turns: the expired turn goes, the turn written
+    # inside the window stays.
+    expired = TraceRecordData.from_core_record(
+        _core_record(
+            raw_json=_raw_record(_TRACE_ID, _ROOT_SPAN_ID, attributes=_turn_attributes("turn-1", 1)),
+        ),
+        created_at=1,
+    )
     retained = TraceRecordData.from_core_record(
         _core_record(
+            trace_id=_SECOND_TRACE_ID,
             span_id=_CHILD_SPAN_ID,
-            raw_json=_raw_record(_TRACE_ID, _CHILD_SPAN_ID),
+            raw_json=_raw_record(_SECOND_TRACE_ID, _CHILD_SPAN_ID, attributes=_turn_attributes("turn-2", 2)),
         ),
         created_at=100,
     )
@@ -1507,13 +1694,13 @@ def test_error_probe_skips_parsing_when_no_status_code_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parses: list[bytes] = []
-    original = store_module._strict_otlp_payload
+    original = store_module.strict_otlp_payload
 
     def _counting(raw_json: bytes) -> Any:
         parses.append(raw_json)
         return original(raw_json)
 
-    monkeypatch.setattr(store_module, "_strict_otlp_payload", _counting)
+    monkeypatch.setattr(store_module, "strict_otlp_payload", _counting)
     # Core serializes an unset span status as {}, so the whole payload can be
     # ruled out without decoding it.
     without_code = json.dumps(
@@ -1628,7 +1815,8 @@ def test_payload_decoding_round_trips_compressed_and_empty_rows() -> None:
     test_logger.info("payload decoding handled compressed and empty rows")
 
 
-def test_incompatible_schema_version_discards_database(tmp_path: Path) -> None:
+def test_incompatible_schema_version_archives_database(tmp_path: Path) -> None:
+    """Rebuilding the active store preserves the old schema and raw history."""
     database_path = tmp_path / "trajectory.sqlite3"
     store = TrajectoryStore(database_path)
     store.initialize()
@@ -1659,7 +1847,15 @@ def test_incompatible_schema_version_discards_database(tmp_path: Path) -> None:
     assert version == store_module._SCHEMA_VERSION
     assert record_count == 0
     assert "trajectory_changes" not in tables
-    test_logger.info("a database from another schema version was rebuilt empty")
+    archives = list(tmp_path.glob("*.archive/trajectory.sqlite3"))
+    assert len(archives) == 1
+    with sqlite3.connect(archives[0]) as archived:
+        assert archived.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert archived.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert archived.execute("SELECT COUNT(*) FROM otlp_span_records").fetchone()[0] == 1
+        stored = archived.execute("SELECT raw_json FROM otlp_span_records").fetchone()[0]
+        assert store_module._decode_payload(stored) == _stored_record().raw_json
+    test_logger.info("incompatible schema was archived intact before rebuilding")
 
 
 @pytest.mark.asyncio
@@ -1716,3 +1912,118 @@ def test_change_seq_comes_from_store_state_and_never_rewinds(tmp_path: Path) -> 
         reopened.close()
     assert int(state["max_change_seq"]) == 2
     test_logger.info("revision counter kept growing across retention and restart")
+
+
+def test_zero_retention_preserves_expired_frames_after_reopen(tmp_path: Path) -> None:
+    """Startup and repeated expiry passes keep old data indefinitely."""
+    database = tmp_path / "forever.sqlite3"
+    store = TrajectoryStore(database, retention_days=0)
+    store.initialize()
+    try:
+        store.write_records([], frames=[_frame(0, timestamp_unix_nano=1)])
+        assert store.delete_expired(now=999_999_999) == 0
+    finally:
+        store.close()
+    store = TrajectoryStore(database, retention_days=0)
+    store.initialize()
+    try:
+        assert store.delete_expired(now=1_999_999_999) == 0
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM trajectory_stream_frames").fetchone() == (1,)
+    finally:
+        store.close()
+    test_logger.info("zero retention preserved old trajectory frames across reopen")
+
+
+def test_schema_archive_includes_uncheckpointed_wal(tmp_path: Path) -> None:
+    """The archive is readable without WAL sidecars and retains committed rows."""
+    database = tmp_path / "wal.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("PRAGMA user_version=3")
+    connection.execute("CREATE TABLE legacy_history (payload TEXT)")
+    connection.execute("INSERT INTO legacy_history VALUES ('historical trace')")
+    connection.commit()
+    assert database.with_name(f"{database.name}-wal").stat().st_size > 0
+    store = TrajectoryStore(database)
+    try:
+        store._archive_incompatible_database(connection, 3)
+    finally:
+        connection.close()
+
+    archives = list(tmp_path.glob("*.archive/wal.sqlite3"))
+    assert len(archives) == 1
+    with sqlite3.connect(archives[0]) as archived:
+        assert archived.execute("SELECT payload FROM legacy_history").fetchone() == ("historical trace",)
+        assert archived.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert not database.exists()
+    assert not database.with_name(f"{database.name}-wal").exists()
+    test_logger.info("schema archive consolidated committed WAL data into a standalone database")
+
+
+@pytest.mark.parametrize("failure_stage", ["directory", "backup"])
+def test_failed_schema_archive_preserves_active_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Archive failures stop initialization before removing the original history."""
+    database = tmp_path / "preserved.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version=3")
+        connection.execute("CREATE TABLE legacy_history (payload TEXT)")
+        connection.execute("INSERT INTO legacy_history VALUES ('keep me')")
+    connection.close()
+    store = TrajectoryStore(database)
+    original_mkdir = Path.mkdir
+    original_connect = sqlite3.connect
+
+    def fail_archive_directory(path: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False) -> None:
+        if path.name.endswith(".archive"):
+            raise OSError("archive directory unavailable")
+        original_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    class FailingBackupConnection(sqlite3.Connection):
+        """Source connection simulating an archive write failure."""
+
+        def backup(self, target: sqlite3.Connection) -> None:
+            """Fail before removing any source data."""
+            raise sqlite3.OperationalError("archive write failed")
+
+    if failure_stage == "directory":
+        monkeypatch.setattr(Path, "mkdir", fail_archive_directory)
+    else:
+        monkeypatch.setattr(
+            store,
+            "_open_writer_connection",
+            lambda: original_connect(database, factory=FailingBackupConnection),
+        )
+    with pytest.raises((OSError, sqlite3.OperationalError), match="archive"):
+        store.initialize()
+
+    assert store._connection is None
+    with original_connect(database) as preserved:
+        assert preserved.execute("PRAGMA user_version").fetchone() == (3,)
+        assert preserved.execute("SELECT payload FROM legacy_history").fetchone() == ("keep me",)
+    test_logger.info("archive failure at %s left original schema and history intact", failure_stage)
+
+
+def test_repeated_schema_rebuilds_keep_separate_archives(tmp_path: Path) -> None:
+    """Subsequent upgrades never overwrite or expire previous schema archives."""
+    database = tmp_path / "repeated.sqlite3"
+    for version in (2, 3):
+        with sqlite3.connect(database) as connection:
+            connection.execute(f"PRAGMA user_version={version}")
+        connection.close()
+        store = TrajectoryStore(database, retention_days=1)
+        store.initialize()
+        store.close()
+    archives = list(tmp_path.glob("*.archive/repeated.sqlite3"))
+    assert len(archives) == 2
+    versions = set()
+    for archive in archives:
+        with sqlite3.connect(archive) as connection:
+            versions.add(connection.execute("PRAGMA user_version").fetchone()[0])
+    assert versions == {2, 3}
+    test_logger.info("successive schema rebuilds kept independent historical archives")

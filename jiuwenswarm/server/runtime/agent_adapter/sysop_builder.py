@@ -22,13 +22,17 @@ from openjiuwen.core.sys_operation.config import (
 
 from jiuwenswarm.common.config import (
     get_sandbox_endpoint,
+    get_sandbox_network_mode,
     get_sandbox_runtime,
     get_sandbox_startup_mode,
 )
+from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
 from jiuwenswarm.common.utils import (
     get_agent_root_dir,
     get_agent_workspace_dir,
     get_config_file,
+    get_user_home,
+    get_user_workspace_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,6 +188,17 @@ def _resolve_config_ro_path() -> Path | None:
     return resolved
 
 
+def _is_jiuwenswarm_data_root(resolved: Path) -> bool:
+    """Skip the data root only with AgentOS's dedicated workspace mount."""
+    if not is_agentos_runtime():
+        return False
+    try:
+        data_root = get_user_workspace_dir().expanduser().resolve()
+    except OSError:
+        return False
+    return resolved == data_root
+
+
 def _resolve_project_dir(override: str | Path | None) -> Path | None:
     """Resolve the host directory to bind into the sandbox as ``rw``.
 
@@ -196,8 +211,10 @@ def _resolve_project_dir(override: str | Path | None) -> Path | None:
          ``build_filesystem_policy`` is called.
 
     Returns ``None`` when the resolved path doesn't exist, isn't a directory,
-    or is the filesystem root (we refuse to ``rw``-bind ``/``; that would
-    expose every other host file the user didn't intend to share).
+    is the filesystem root (we refuse to ``rw``-bind ``/``; that would
+    expose every other host file the user didn't intend to share), or is the
+    jiuwenswarm data root (``.jiuwenswarm`` / ``JIUWENSWARM_DATA_DIR``) in
+    AgentOS, where the dedicated workspace mount already covers that tree.
     """
     candidates: list[Path] = []
     if override is not None:
@@ -234,6 +251,16 @@ def _resolve_project_dir(override: str | Path | None) -> Path | None:
                 resolved,
             )
             return None
+        if _is_jiuwenswarm_data_root(resolved):
+            # ``jiuwenswarm-start`` often runs with cwd under the data root;
+            # mounting that whole tree as project_dir duplicates the dedicated
+            # agent workspace mount and exposes unrelated host state.
+            logger.debug(
+                "[sysop_builder] project_dir candidate %s is the jiuwenswarm "
+                "data root; skipping mount",
+                resolved,
+            )
+            continue
         return resolved
     return None
 
@@ -247,8 +274,49 @@ def _sandbox_isolation_custom_id(project_dir: str | Path | None) -> str:
     return f"project_{digest}"
 
 
+def _resolve_posix_id(value: str, *, kind: Literal["user", "group"]) -> str | None:
+    """Return a numeric uid/gid string; resolve name lookups when ``value`` is not digits."""
+    if value.isdigit():
+        return value
+    try:
+        if kind == "user":
+            import pwd
+
+            return str(pwd.getpwnam(value).pw_uid)
+        import grp
+
+        return str(grp.getgrnam(value).gr_gid)
+    except KeyError:
+        logger.warning(
+            "[sysop_builder] yuanrong sandbox %s %r could not be resolved to a numeric id",
+            kind,
+            value,
+        )
+        return None
+    except ImportError:
+        logger.warning(
+            "[sysop_builder] posix user/group lookup is unavailable; cannot resolve %s %r",
+            kind,
+            value,
+        )
+        return None
+
+
+def _yuanrong_sandbox_user(endpoint: dict[str, Any]) -> str | None:
+    """Build yuanrong docker ``user`` as numeric ``"<uid>:<gid>"`` from sandbox config."""
+    user = "" if endpoint.get("user") is None else str(endpoint["user"]).strip()
+    group = "" if endpoint.get("group") is None else str(endpoint["group"]).strip()
+    if not user or not group:
+        return None
+    uid = _resolve_posix_id(user, kind="user")
+    gid = _resolve_posix_id(group, kind="group")
+    if uid is None or gid is None:
+        return None
+    return f"{uid}:{gid}"
+
+
 def _resolve_agent_root_dir() -> Path | None:
-    """Resolve agent_root for yuanrong identity mount (enterprise_dev-style)."""
+    """Resolve develop's original YuanRong identity mount for personal use."""
     try:
         agent_root = Path(get_agent_root_dir()).expanduser().resolve()
     except OSError as exc:
@@ -263,17 +331,10 @@ def _resolve_agent_root_dir() -> Path | None:
     try:
         agent_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        logger.warning(
-            "[sysop_builder] could not ensure agent_root %s: %s",
-            agent_root,
-            exc,
-        )
+        logger.warning("[sysop_builder] could not ensure agent_root %s: %s", agent_root, exc)
         return None
     if not agent_root.is_dir():
-        logger.warning(
-            "[sysop_builder] agent_root %s is not a directory; skipping mount",
-            agent_root,
-        )
+        logger.warning("[sysop_builder] agent_root %s is not a directory; skipping mount", agent_root)
         return None
     return agent_root
 
@@ -282,82 +343,172 @@ def _merge_yuanrong_mounts(
     agent_root_mount: dict[str, Any],
     config_mounts: list[Any] | None,
 ) -> list[dict[str, Any]]:
-    """Merge forced agent_root mount with optional yaml mounts; dedupe by source+target."""
-    merged: list[dict[str, Any]] = [dict(agent_root_mount)]
-    seen = {
-        (
-            str(agent_root_mount.get("source") or ""),
-            str(agent_root_mount.get("target") or ""),
-        )
-    }
+    """Keep develop's personal mount merge and source/target deduplication."""
+    merged = [dict(agent_root_mount)]
+    seen = {(str(agent_root_mount.get("source") or ""), str(agent_root_mount.get("target") or ""))}
     for entry in config_mounts or []:
         if not isinstance(entry, dict):
             continue
         source = str(entry.get("source") or "").strip()
         target = str(entry.get("target") or source).strip()
-        if not source or not target:
+        if not source or not target or (source, target) in seen:
             continue
-        key = (source, target)
-        if key in seen:
-            continue
-        seen.add(key)
-        mount = {
-            "source": source,
-            "target": target,
-            "readonly": bool(entry.get("readonly", False)),
-        }
-        merged.append(mount)
+        seen.add((source, target))
+        merged.append({"source": source, "target": target, "readonly": bool(entry.get("readonly", False))})
     return merged
 
 
+def _build_agentos_yuanrong_mounts() -> tuple[list[dict[str, Any]], str]:
+    """Port agent_os's workspace and host user-directory mapping."""
+    workspace = _resolve_workspace_dir()
+    project = Path("~/workspace").expanduser().resolve()
+    if workspace is None:
+        raise ValueError("yuanrong sandbox requires a resolvable workspace directory")
+    real_workspace = None
+    real_project = None
+    user_dir = os.environ.get("JIUWENSWARM_USER_DIRECTORY", None)
+    if user_dir:
+        real_workspace = Path(user_dir) / ".jiuwenswarm" / "agent" / "workspace"
+        real_project = Path(user_dir) / "workspace"
+
+    workspace_str = str(workspace)
+    project_str = str(project)
+    mounts: list[dict[str, Any]] = [
+        {
+            "source": str(real_workspace) if real_workspace else workspace_str,
+            "target": workspace_str,
+            "readonly": False,
+        }
+    ]
+
+    if real_project is not None:
+        if project.is_dir():
+            mounts.append({
+                "source": str(real_project),
+                "target": project_str,
+                "readonly": False,
+            })
+        else:
+            logger.warning(
+                "[sysop_builder] project dir %s does not exist; skipping mount",
+                project,
+            )
+
+    return mounts, workspace_str
+
+
 def _build_yuanrong_extra_params() -> dict[str, Any]:
-    """Assemble yuanrong provider extra_params; always identity-mount agent_root."""
+    """Select AgentOS mounts explicitly; preserve develop's personal config."""
     endpoint = get_sandbox_endpoint()
     executor = str(endpoint.get("executor") or "docker").strip().lower() or "docker"
-    agent_root = _resolve_agent_root_dir()
-    if agent_root is None:
-        raise ValueError("yuanrong sandbox requires a resolvable agent_root directory")
+    agentos = is_agentos_runtime()
+    if agentos:
+        mounts, default_workdir = _build_agentos_yuanrong_mounts()
+    else:
+        agent_root = _resolve_agent_root_dir()
+        if agent_root is None:
+            raise ValueError("yuanrong sandbox requires a resolvable agent_root directory")
+        default_workdir = str(agent_root)
+        agent_root_mount = {"source": default_workdir, "target": default_workdir, "readonly": False}
+        config_mounts = endpoint.get("mounts")
+        mounts = _merge_yuanrong_mounts(
+            agent_root_mount, config_mounts if isinstance(config_mounts, list) else None,
+        )
 
-    agent_root_str = str(agent_root)
-    agent_root_mount = {
-        "source": agent_root_str,
-        "target": agent_root_str,
-        "readonly": False,
-    }
-    config_mounts = endpoint.get("mounts")
-    if not isinstance(config_mounts, list):
-        config_mounts = None
-
-    extra_params: dict[str, Any] = {
-        "executor": executor,
-        "mounts": _merge_yuanrong_mounts(agent_root_mount, config_mounts),
-    }
+    extra_params: dict[str, Any] = {"executor": executor, "mounts": mounts}
+    if agentos:
+        sandbox_user = _yuanrong_sandbox_user(endpoint)
+        if sandbox_user is not None:
+            extra_params["user"] = sandbox_user
 
     workdir = endpoint.get("workdir")
     if workdir is not None and str(workdir).strip():
         extra_params["workdir"] = str(workdir).strip()
     else:
-        extra_params["workdir"] = agent_root_str
+        extra_params["workdir"] = default_workdir
 
-    for key in ("image", "cpu", "cpu_limit", "memory", "mem_limit", "rootfs"):
+    for key in ("image", "cpu", "cpu_limit", "memory", "mem_limit", "rootfs", "idle_timeout"):
         if key not in endpoint:
             continue
         value = endpoint[key]
         if key == "rootfs":
             if isinstance(value, dict):
                 rootfs = dict(value)
-                existing = rootfs.get("mounts")
-                rootfs["mounts"] = _merge_yuanrong_mounts(
-                    agent_root_mount,
-                    existing if isinstance(existing, list) else None,
-                )
+                if agentos:
+                    rootfs["mounts"] = mounts
+                else:
+                    existing = rootfs.get("mounts")
+                    rootfs["mounts"] = _merge_yuanrong_mounts(
+                        agent_root_mount, existing if isinstance(existing, list) else None,
+                    )
                 if "workdir" not in rootfs or not str(rootfs.get("workdir") or "").strip():
                     rootfs["workdir"] = extra_params["workdir"]
                 extra_params["rootfs"] = rootfs
             continue
         if value is not None:
             extra_params[key] = value
+    _apply_tool_sandbox_env_overrides(extra_params)
     return extra_params
+
+
+def _build_adx_extra_params() -> dict[str, Any]:
+    """Map the AgentOS workspaces to the tool Environment."""
+    endpoint = get_sandbox_endpoint()
+    workspace = _resolve_workspace_dir()
+    if workspace is None:
+        raise ValueError("ADX sandbox requires a workspace directory")
+    setting_keys = (
+        "image", "runtime", "cpu", "cpu_limit", "memory", "mem_limit", "idle_timeout", "user",
+        "group", "network", "connection", "env", "create_timeout", "schedule_timeout",
+    )
+    extra = {key: endpoint[key] for key in setting_keys if key in endpoint}
+    mounts = list(endpoint.get("mounts") or [])
+    if is_agentos_runtime():
+        user_dir = os.environ.get("JIUWENSWARM_USER_DIRECTORY", "").strip()
+        if (not user_dir.startswith("/") or user_dir == "/"
+                or any(part in (".", "..") for part in user_dir.split("/"))):
+            raise ValueError("ADX sandbox requires an absolute AgentOS user directory")
+        workspace_mounts, _ = _build_agentos_yuanrong_mounts()
+        home = get_user_home()
+        if not home.is_absolute() or home == Path(home.anchor):
+            raise ValueError("ADX sandbox requires an absolute AgentOS home")
+        task_root = home / "Documents" / "JiuwenSwarm"
+        task_root.mkdir(parents=True, exist_ok=True)
+        workspace_mounts.append({
+            "source": str(Path(user_dir) / "Documents" / "JiuwenSwarm"),
+            "target": str(task_root), "readonly": False,
+        })
+        for mount in reversed(workspace_mounts):
+            target = mount["target"]
+            if any(isinstance(item, dict) and item.get("target") == target for item in mounts):
+                raise ValueError("ADX sandbox mounts cannot replace an AgentOS workspace")
+            mounts.insert(0, {
+                "host_path": mount["source"], "target": target, "options": ["rw"],
+            })
+    extra["mounts"] = mounts
+    extra["workdir"] = str(endpoint.get("workdir") or workspace)
+    _apply_tool_sandbox_env_overrides(extra)
+    return extra
+
+
+_TOOL_SANDBOX_ENV_OVERRIDES = (
+    ("TOOL_SANDBOX_CPU", "cpu"),
+    ("TOOL_SANDBOX_MEMORY", "memory"),
+    ("TOOL_SANDBOX_IDLE_TIMEOUT", "idle_timeout"),
+)
+
+
+def _apply_tool_sandbox_env_overrides(extra_params: dict[str, Any]) -> None:
+    """Override yuanrong cpu / memory / idle_timeout when the env vars are set."""
+    for env_name, key in _TOOL_SANDBOX_ENV_OVERRIDES:
+        raw = os.environ.get(env_name)
+        if raw is None or not str(raw).strip():
+            continue
+        text = str(raw).strip()
+        try:
+            extra_params[key] = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{env_name} must be an integer, got {raw!r}") from exc
 
 
 def build_yuanrong_sandbox_status_view() -> dict[str, Any]:
@@ -372,16 +523,18 @@ def build_yuanrong_sandbox_status_view() -> dict[str, Any]:
             "[sysop_builder] yuanrong status mounts fallback: %s",
             exc,
         )
-        config_mounts = endpoint.get("mounts")
-        mounts = [
-            {
-                "source": str(entry.get("source") or "").strip(),
-                "target": str(entry.get("target") or entry.get("source") or "").strip(),
-                "readonly": bool(entry.get("readonly", False)),
-            }
-            for entry in (config_mounts if isinstance(config_mounts, list) else [])
-            if isinstance(entry, dict) and str(entry.get("source") or "").strip()
-        ]
+        mounts = []
+        if not is_agentos_runtime():
+            config_mounts = endpoint.get("mounts")
+            mounts = [
+                {
+                    "source": str(entry.get("source") or "").strip(),
+                    "target": str(entry.get("target") or entry.get("source") or "").strip(),
+                    "readonly": bool(entry.get("readonly", False)),
+                }
+                for entry in (config_mounts if isinstance(config_mounts, list) else [])
+                if isinstance(entry, dict) and str(entry.get("source") or "").strip()
+            ]
     return {
         "type": "yuanrong",
         "enabled": bool(runtime.get("enabled")),
@@ -390,12 +543,164 @@ def build_yuanrong_sandbox_status_view() -> dict[str, Any]:
     }
 
 
+def _team_context_from_spec(spec: Any) -> dict[str, str] | None:
+    """Derive the team mount context from a ``TeamAgentSpec``.
+
+    The team home ALWAYS resolves through openjiuwen's authoritative
+    ``team_home(team_name)`` — never reverse-derived from the workspace root.
+    Two verified facts make this safe for every layout (PR #9847 review):
+
+    1. Member real workspaces live under ``team_home(team_name)/workspaces/``
+       regardless of the spec's workspace root shape — openjiuwen's member
+       workspace layout keys off the team NAME only (see its team workspace
+       binder / paths modules), never off the spec's workspace root. A group-chat child team (workspace root =
+       ``<outer>/runs/<hash>``) still has its members' workspaces under the
+       standard team home.
+    2. jiuwenswarm aligns the openjiuwen home to its own data root at startup
+       (``configure_openjiuwen_home(get_domain_data_dir())``, bootstrap.py),
+       so ``team_home(team_name)`` and the jiuwenswarm-side team directory
+       are the same tree — there is no second data root to diverge.
+
+    The workspace root is carried for information only (it is NOT used to
+    derive mounts). An empty/missing root keeps the default
+    ``team_home(team_name) / "team-workspace"`` value for the field.
+
+    Returns:
+        ``{"team_name", "session_id", "team_home", "workspace_root"}``,
+        or None when the spec carries no resolvable team identity.
+    """
+    from openjiuwen.agent_teams.paths import team_home
+
+    team_name = str(getattr(spec, "team_name", "") or "").strip()
+    if not team_name:
+        return None
+    team_home_dir = team_home(team_name)
+    workspace = getattr(spec, "workspace", None)
+    raw_root = getattr(workspace, "root_path", None) if workspace is not None else None
+    root_str = str(raw_root or "").strip()
+    try:
+        if root_str:
+            workspace_root = Path(root_str).expanduser().resolve()
+        else:
+            workspace_root = team_home_dir / "team-workspace"
+    except OSError as exc:
+        # Unresolvable root string: mounts do not depend on it (team home is
+        # authoritative), so keep the context and carry the raw string.
+        logger.warning(
+            "[sysop_builder] team workspace root resolution failed (team=%s): %s",
+            team_name,
+            exc,
+        )
+        workspace_root = Path(root_str or str(team_home_dir / "team-workspace"))
+    return {
+        "team_name": team_name,
+        "session_id": "",
+        "team_home": str(team_home_dir),
+        "workspace_root": str(workspace_root),
+    }
+
+
+def _team_mount_intent(team_context: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Type-neutral team mount intent: ``(host_path, "rw")`` pairs.
+
+    Deliberately free of any jiuwenbox/bwrap dialect (design D-20261105-1041
+    §3.1): consumers encode this list into their own create protocol. No mkdir
+    and no existence check here — creation is the encoding side's concern so
+    a missing directory degrades through the bind-mount tolerance path
+    (D-20261104-1000) instead of failing policy construction.
+
+    Covers, for the current team only:
+      - ``<team_home>/workspaces/``            in-team member workspace links
+      - ``<team_home>/team-workspace/``        shared artifacts tree
+      - ``<team_home>/sessions/<sid>/worktrees/`` session-scoped worktrees
+      - ``<team_home>/../jiuwen_team_members/`` dynamic/predefined member
+        real directories (outside the team tree; the in-team entries are
+        only links and link-creation failure retreats to this directory).
+      - ``workspace_root`` — when it is NOT the default
+        ``<team_home>/team-workspace`` (e.g. a group-chat child team's
+        private runs workspace). Projectless members' cwd lives under
+        ``workspace_root/artifacts/<date>/chat-n>/work/<member>/``, so
+        without this bind their cwd is invisible inside the sandbox
+        (PR #9847 review). Mounted only when it passes a pure-geometry
+        boundary check (see below).
+
+    Boundary check for the workspace-root bind (zero-state, spec-only):
+    the root must live inside the ``.agent_teams`` tree (the deployment's
+    team state root, == ``team_home.parent``) at depth >= 2. Depth 0 is the
+    teams root itself (all teams + team.db — never mountable via this
+    path); depth 1 is some other team's home. The symlinks are already
+    resolved by the context builder, so a link pointing outside the tree
+    resolves outside and is rejected here. Anything outside the teams tree
+    (a tampered spec value) is rejected with a warning.
+    """
+    if not team_context:
+        return []
+    team_home_dir = Path(team_context["team_home"])
+    # Sanitize the session id through openjiuwen's canonical rule (the same
+    # one team_session_dir uses) so an untrusted id can never escape the team
+    # tree: "../../etc" becomes a single segment, never a path traversal.
+    from openjiuwen.agent_teams.paths import safe_path_segment
+
+    session_id = safe_path_segment(str(team_context.get("session_id") or ""), "default")
+    paths = [
+        team_home_dir / "workspaces",
+        team_home_dir / "team-workspace",
+        team_home_dir / "sessions" / session_id / "worktrees",
+        team_home_dir.parent / "jiuwen_team_members",
+    ]
+    # Group-chat / relocated workspace root: mount it so projectless member
+    # cwd (its artifacts tree) resolves in the sandbox (PR #9847 review).
+    # Pure-geometry boundary: inside the teams tree at depth >= 2; the
+    # default layout is already covered by the team-workspace entry above.
+    ws_root_raw = str(team_context.get("workspace_root") or "").strip()
+    approved_ws_root = None
+    if ws_root_raw:
+        ws_root = Path(ws_root_raw)
+        teams_root = team_home_dir.parent
+        is_default_layout = ws_root == team_home_dir / "team-workspace"
+        in_tree_deep = (
+            teams_root in ws_root.parents
+        ) and ws_root.parent != teams_root
+        if is_default_layout:
+            pass  # default layout: the team-workspace entry already covers it
+        elif in_tree_deep:
+            # inside the teams tree at depth >= 2 (e.g. <outer>/runs/<hash>,
+            # legacy team-runs/<key>/workspace) — mount it
+            approved_ws_root = ws_root
+            paths.append(ws_root)
+        else:
+            logger.warning(
+                "[sysop_builder] workspace root %s is outside the teams "
+                "tree or too shallow; skipping its mount (projectless "
+                "member cwd may be invisible in the sandbox) (team=%s)",
+                ws_root,
+                team_context.get("team_name", ""),
+            )
+    # Defense in depth: every in-team path must stay inside team_home (the
+    # members dir is the sanctioned sibling). A composed path that escaped
+    # (impossible with the sanitizer above, kept as a guard) is dropped.
+    # The geometry-approved workspace root (outside team_home by design for
+    # relocated layouts) rides through as a third sanctioned shape.
+    team_home_resolved = team_home_dir
+    safe_paths = []
+    for p in paths:
+        if "jiuwen_team_members" in p.name:
+            if p.parent == team_home_dir.parent:
+                safe_paths.append(p)
+        elif team_home_resolved == p or team_home_resolved in p.parents:
+            safe_paths.append(p)
+        elif approved_ws_root is not None and p == approved_ws_root:
+            safe_paths.append(p)
+    return [(str(p), "rw") for p in safe_paths]
+
+
 def build_filesystem_policy(
     files_runtime: dict[str, Any] | None,
     *,
     project_dir: str | Path | None = None,
     is_code_agent: bool = False,
     startup_mode: str | None = None,
+    team_context: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """build jiuwenbox filesystem policy."""
     del is_code_agent  # retained for caller compatibility
@@ -480,15 +785,13 @@ def build_filesystem_policy(
         - ``mode=ro`` makes the first-pass mount land in bwrap's
           ``--ro-bind`` stage, which is the natural and self-documenting
           encoding for "ro intrinsic resource".
-        - The :data:`read_only_promote` entry survives the case where a
-          later rw parent bind (e.g. a user-configured ``files.allow`` on
-          the parent directory of ``config.yaml``) overlays the same
-          subtree and silently upgrades the mount back to rw. bwrap's
-          ``created_paths`` set is the union of ro_binds + rw_binds
-          destinations (see ``bwrap.py``), so the trailing
-          ``--remount-ro <path>`` is guaranteed to fire on this dst and
-          flip it back to read-only regardless of which stage owned the
-          mount last.
+        - The :data:`read_only_promote` entry adds the path to the policy
+          ``read_only`` list, granting Landlock read-only access and
+          scheduling a trailing ``--remount-ro``. That remount flips the file
+          back to read-only when a later rw bind overlays it; it resolves
+          because :meth:`BwrapConfig.to_args` emits binds in destination
+          depth order, so a bind nested under a rw parent is always emitted
+          after that parent (see ``bwrap.py``).
         """
         bind_mounts.append({
             "host_path": host_path,
@@ -514,6 +817,24 @@ def build_filesystem_policy(
     resolved_project = _resolve_project_dir(project_dir)
     if resolved_project is not None:
         _mount_rw_dir(resolved_project)
+
+    # Team member mounts (design D-20261105-1041 KD3): encode the type-neutral
+    # intent into the jiuwenbox dialect. Each intent path is created on demand
+    # (worktrees and member workspaces materialize after card construction);
+    # a directory that cannot be created degrades with a warning instead of
+    # failing the whole policy build (bind-mount tolerance, D-20261104-1000).
+    for intent_host, _intent_mode in _team_mount_intent(team_context):
+        intent_path = Path(intent_host)
+        try:
+            intent_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "[sysop_builder] team mount dir unavailable, skipping: %s (%s)",
+                intent_host,
+                exc,
+            )
+            continue
+        _mount_rw_dir(intent_path)
 
     if effective_startup_mode == "internal":
         config_path = _resolve_config_ro_path()
@@ -568,6 +889,21 @@ def build_filesystem_policy(
     return {"filesystem_policy": fs_policy}, upload_list
 
 
+def _entry_custom_id(
+    isolation_custom_id: str | None,
+    project_dir: str | Path | None,
+) -> str:
+    """Resolve the isolation custom id: caller-supplied entry id wins over project hash.
+
+    Team entry cards (design D-20261105-1041 KD2) pass a deterministic
+    ``entry_<team>_<entry>`` id so every spec entry maps to its own isolation
+    key; the single-agent path keeps the project-hash derivation unchanged.
+    """
+    if isolation_custom_id:
+        return isolation_custom_id
+    return _sandbox_isolation_custom_id(project_dir)
+
+
 def create_sandbox_sysop_card(
     sandbox_url: str,
     sandbox_type: str,
@@ -580,6 +916,8 @@ def create_sandbox_sysop_card(
     project_dir: str | Path | None = None,
     is_code_agent: bool = False,
     startup_mode: str | None = None,
+    isolation_custom_id: str | None = None,
+    team_context: dict[str, str] | None = None,
 ) -> SysOperationCard | None:
     """Create sandbox SysOperationCard (jiuwenbox or yuanrong)."""
     # 触发 sandbox provider 注册（@SandboxRegistry.provider 装饰器副作用）
@@ -587,16 +925,35 @@ def create_sandbox_sysop_card(
 
     normalized_type = str(sandbox_type or "").strip().lower()
     try:
-        if normalized_type == "jiuwenbox":
+        if normalized_type in {"jiuwenbox", "jiuwenbox-conch"}:
             from jiuwenswarm.server.runtime.no_host_fallback_jiuwenbox import (
                 install_no_host_fallback_jiuwenbox_providers,
             )
 
             install_no_host_fallback_jiuwenbox_providers()
 
+        if normalized_type == "adx-environment":
+            gateway_config = SandboxGatewayConfig(
+                isolation=SandboxIsolationConfig(
+                    container_scope=ContainerScope.CUSTOM,
+                    custom_id=_entry_custom_id(isolation_custom_id, project_dir),
+                ),
+                launcher_config=PreDeployLauncherConfig(
+                    base_url=sandbox_url,
+                    sandbox_type="adx-environment",
+                    idle_ttl_seconds=idle_ttl_seconds,
+                    extra_params=_build_adx_extra_params(),
+                ),
+            )
+            return SysOperationCard(
+                mode=OperationMode.SANDBOX,
+                work_config=LocalWorkConfig(shell_allowlist=None),
+                gateway_config=gateway_config,
+            )
+
         if normalized_type == "yuanrong":
             extra_params = _build_yuanrong_extra_params()
-            isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+            isolation_custom_id = "default"
             gateway_config = SandboxGatewayConfig(
                 isolation=SandboxIsolationConfig(
                     container_scope=ContainerScope.CUSTOM,
@@ -619,13 +976,14 @@ def create_sandbox_sysop_card(
                 "  base_url=%s sandbox_type=yuanrong\n"
                 "  isolation_custom_id=%s\n"
                 "  idle_ttl=%s\n"
-                "  executor=%s workdir=%s\n"
+                "  executor=%s workdir=%s user=%s\n"
                 "  mounts(%d)=%s",
                 sandbox_url,
                 isolation_custom_id,
                 idle_ttl_seconds,
                 extra_params.get("executor"),
                 extra_params.get("workdir"),
+                extra_params.get("user"),
                 len(extra_params.get("mounts") or []),
                 extra_params.get("mounts") or [],
             )
@@ -636,7 +994,16 @@ def create_sandbox_sysop_card(
             project_dir=project_dir,
             is_code_agent=is_code_agent,
             startup_mode=startup_mode,
+            team_context=team_context,
         )
+        # Forward the configured sandbox network mode in the client policy
+        # fragment: jiuwenbox's append-merge only preserves fields present in
+        # the fragment, so a root-policy-only ``network.mode`` (e.g. ``host``
+        # on privilege-limited hosts) is lost after merge and the sandbox
+        # creation would fall back to isolated networking.
+        network_mode = get_sandbox_network_mode()
+        if network_mode:
+            policy = {**policy, "network": {"mode": network_mode}}
         extra_params = {
             "policy": policy,
             "policy_mode": "append",
@@ -646,10 +1013,43 @@ def create_sandbox_sysop_card(
             "preserve_files_upload": upload_list,
         }
 
+        if normalized_type == "jiuwenbox-conch":
+            endpoint = get_sandbox_endpoint()
+            template_name = str(endpoint.get("template_name") or "").strip()
+            if not template_name:
+                raise ValueError("sandbox.template_name is required for jiuwenbox-conch")
+            if any(value for value in files_runtime.values()) or upload_list:
+                raise ValueError("jiuwenbox-conch supports directory mounts, not sandbox.files uploads/allow/deny")
+            conch = dict(endpoint.get("conch") or {})
+            mounts = []
+            for entry in policy.get("filesystem_policy", {}).get("bind_mounts", []):
+                mount = dict(entry)
+                host = Path(mount["host_path"])
+                config_path = _resolve_config_ro_path()
+                if host.is_file() and config_path is not None and host.resolve() == config_path:
+                    # Conch cannot mount a single file. Do not widen this bind
+                    # to the config directory, which may contain credentials.
+                    logger.info("[sysop_builder] Conch omits the single-file config bind")
+                    continue
+                elif not host.is_dir():
+                    raise ValueError("Conch mounts require host directories")
+                mounts.append(mount)
+            conch.update(template_name=template_name, filesystem_policy={"bind_mounts": mounts})
+            user = "" if endpoint.get("user") is None else str(endpoint["user"]).strip()
+            group = "" if endpoint.get("group") is None else str(endpoint["group"]).strip()
+            if bool(user) != bool(group):
+                raise ValueError("sandbox.user and sandbox.group must both be set for Conch")
+            if user:
+                conch.update(run_as_user=user, run_as_group=group)
+            extra_params["policy"] = {"conch": conch}
+            extra_params["api_sandbox_runtime"] = "conch"
+            extra_params["fallback_on_failure"] = False
+            sandbox_type = "jiuwenbox"
+
         if idle_check_interval is not None:
             extra_params["idle_check_interval"] = idle_check_interval
 
-        isolation_custom_id = _sandbox_isolation_custom_id(project_dir)
+        isolation_custom_id = _entry_custom_id(isolation_custom_id, project_dir)
         gateway_config = SandboxGatewayConfig(
             isolation=SandboxIsolationConfig(
                 container_scope=ContainerScope.CUSTOM,
@@ -848,21 +1248,25 @@ def list_auto_managed_sandbox_paths(
     else:
         resolved_project = _resolve_project_dir(None)
 
-    if (
-        resolved_project is not None
-        and resolved_project.is_dir()
-        and resolved_project != Path(resolved_project.anchor)
-    ):
-        project_str = str(resolved_project)
-        if not any(item.get("path", "").rstrip("/") == project_str for item in allow):
-            _append_unique(
-                allow,
-                {
-                    "path": project_str + "/",
-                    "access": "rw",
-                    "kind": "directory",
-                },
-            )
+    if resolved_project is not None:
+        is_mountable_project = (
+            resolved_project.is_dir()
+            and resolved_project != Path(resolved_project.anchor)
+            and not _is_jiuwenswarm_data_root(resolved_project)
+        )
+        if is_mountable_project:
+            project_str = str(resolved_project)
+            if not any(
+                item.get("path", "").rstrip("/") == project_str for item in allow
+            ):
+                _append_unique(
+                    allow,
+                    {
+                        "path": project_str + "/",
+                        "access": "rw",
+                        "kind": "directory",
+                    },
+                )
 
     if effective_startup_mode == "internal":
         config_path = _resolve_config_ro_path()

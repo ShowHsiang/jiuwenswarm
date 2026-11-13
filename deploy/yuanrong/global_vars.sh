@@ -35,6 +35,17 @@ declare -A DEPLOY_VARS=(
     # Cron 作业持久化：file（单节点，默认）| etcd（一体机主备）；AgentOS 一体机模板默认 etcd
     ["CRON_STORE_BACKEND"]="etcd"
     ["ETCD_ENDPOINTS"]=""
+    ["AGENTOS_CODE_GRAPH_PROFILE"]="off"
+    ["TOOL_SANDBOX_TYPE"]="jiuwenbox"
+    ["TOOL_SANDBOX_ENABLE"]="true"
+    ["TOOL_SANDBOX_EXECUTOR"]="bubblewrap"
+    ["TOOL_SANDBOX_IMAGE"]=""
+    ["TOOL_SANDBOX_CPU"]=""
+    ["TOOL_SANDBOX_MEMORY"]=""
+    ["TOOL_SANDBOX_USER"]=""
+    ["TOOL_SANDBOX_GROUP"]=""
+    ["CONCH_TEMPLATE_NAME"]=""
+    ["CONCH_SDK_CONFIG"]=""
     ["MODEL_PROVIDER"]=""
     ["MODEL_NAME"]=""
     ["API_BASE"]=""
@@ -66,8 +77,4 @@ declare -A DEPLOY_VARS=(
     # AgentOS IAM; empty URL → http://MASTER_NODE_IP:8090 at deploy check time
     ["AGENTOS_AUTH_SERVICE_URL"]=""
     ["AGENTOS_AUTH_TIMEOUT"]=""
-    # jiuwenswarm-web 的 /auth-api 反代目标;空则 check_web_up_dependency 复用 AGENTOS_AUTH_SERVICE_URL
-    ["IAM_AUTH_SERVICE_URL"]=""
-    # 一体机模式开关; "true" 时启动 jiuwenswarm-web 带 --remote, 前端显示登出按钮
-    ["WEB_REMOTE_MODE"]=""
 )

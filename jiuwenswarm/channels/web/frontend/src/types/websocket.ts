@@ -34,12 +34,15 @@ export interface WsEvent {
 export type WebMessage = WsRequest | WsResponse | WsEvent;
 
 export interface WebRequestOptions {
+  /** Zero disables the request deadline; abort and connection errors still reject. */
   timeoutMs?: number;
   signal?: AbortSignal;
   /** 对应协议里请求消息的顶层 is_stream 字段（如 command.goal 的 set/resume） */
   isStream?: boolean;
   /** Keep the existing request pending until the runtime confirms acceptance. */
   awaitRuntimeAccepted?: boolean;
+  /** Called before sending, so supplemental receipts can be associated with this request. */
+  onRequestId?: (requestId: string) => void;
 }
 
 export interface WebConnectOptions {
@@ -54,6 +57,8 @@ export interface WebError extends Error {
   code?: string;
   requestId?: string;
   retriable?: boolean;
+  /** The HTTP client could not map this method to a local REST route. */
+  httpRouteMissing?: true;
   /**
    * 失败响应的 payload 原样透传（此前 webClient.resolvePending 只取 message.error 拼成
    * Error，payload 整个丢弃）。专家与插件装备-前端接口_v2.md §1.6.3 的 install 两阶段流程
@@ -148,7 +153,9 @@ export interface Question {
   header: string;
   options: QuestionOption[];
   multi_select?: boolean;
+  /** @deprecated Not recommended for new identity logic; echo until alias retirement. */
   card_id?: string;
+  matched_rule?: string;
   tool_payload?: unknown;
   reviewer_metadata?: AutoReviewerMetadata;
 }
@@ -157,6 +164,8 @@ export interface Question {
  * 用户问题请求 Payload（服务端 -> 客户端）
  */
 export interface AskUserQuestionPayload {
+  duplexJobId?: string;
+  interruptId?: string;
   request_id: string;
   questions: Question[];
   source?: string; // 来源标识，用于区分自进化确认和工具权限确认
@@ -171,6 +180,10 @@ export interface AskUserQuestionPayload {
     correlation_id: string;
     agent_id: string;
     agent_name: string;
+    /** Member name currently hosting the run; null/absent = no team context (no popup source prefix). */
+    executor?: string | null;
+    /** The run's META name, shown in the popup source prefix. */
+    workflow_name?: string | null;
   };
 }
 
@@ -185,6 +198,7 @@ export interface UserAnswer {
   question?: string;
   selected_options: string[];
   custom_input?: string;
+  /** @deprecated Not recommended for new identity logic; echo until alias retirement. */
   card_id?: string;
 }
 

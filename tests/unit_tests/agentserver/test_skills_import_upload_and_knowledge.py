@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from jiuwenswarm.common.schema.agent import AgentRequest
+from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server.runtime.skill.archive_store import ARCHIVE_DIRNAME
 from jiuwenswarm.server.runtime.skill.skill_manager import (
@@ -319,6 +319,102 @@ async def test_create_from_knowledge_prompt_lists_occupied_names(
     assert "禁止复用" in payload["followup_prompt"]
 
 
+def _set_preferred_language(monkeypatch: pytest.MonkeyPatch, lang: str) -> None:
+    monkeypatch.setattr(
+        "jiuwenswarm.common.config.get_config",
+        lambda: {"preferred_language": lang},
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_from_knowledge_prompt_follows_english_preference(
+    manager: SkillManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4899: preferred_language=en must not send the hidden agent a Chinese prompt."""
+    _set_preferred_language(monkeypatch, "en")
+    existing = manager._skills_dir / "keep-out"
+    existing.mkdir(parents=True)
+    (existing / "SKILL.md").write_text(_skill_md("keep-out"), encoding="utf-8")
+
+    payload = await manager.handle_skills_create_from_knowledge(
+        {
+            "link": "https://example.com/guide",
+            "skill_name": "risk-grader",
+            "skill_description": "output a risk level",
+        }
+    )
+    prompt = payload["followup_prompt"]
+    assert payload["result_type"] == "followup"
+    assert payload["skills"] == ["skill-omni-creation"]
+    assert prompt.startswith("Generate a complete, installable Skill")
+    assert str(payload["output_dir"]) in prompt
+    assert "never write to workspace/skills/<name>" in prompt
+    assert "skip code-writer/code-verifier" in prompt
+    assert "Installed Skill names (do not reuse): keep-out" in prompt
+    assert "risk-grader" in prompt
+    assert "output a risk level" in prompt
+    assert "Knowledge source link: https://example.com/guide" in prompt
+    assert re.search(r"[\u4e00-\u9fff]", prompt) is None
+
+
+@pytest.mark.asyncio
+async def test_create_from_knowledge_file_prompt_english(
+    manager: SkillManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_preferred_language(monkeypatch, "en")
+    doc = tmp_path / "guide.pdf"
+    doc.write_bytes(b"%PDF-1.4")
+    payload = await manager.handle_skills_create_from_knowledge({"file_path": str(doc)})
+    assert payload["skills"] == ["skill-creator-router"]
+    assert "Absolute path of the local knowledge document: " in payload["followup_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_create_from_knowledge_prompt_stays_chinese_for_zh(
+    manager: SkillManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_preferred_language(monkeypatch, "zh")
+    payload = await manager.handle_skills_create_from_knowledge(
+        {"link": "https://example.com/guide"}
+    )
+    assert payload["followup_prompt"].startswith("请根据以下知识来源生成")
+
+
+@pytest.mark.parametrize(
+    ("lang", "expected"),
+    [
+        ("en", "No valid Skill was found in the output directory (SKILL.md is missing)"),
+        ("zh", "未在输出目录找到有效 Skill（缺少 SKILL.md）"),
+    ],
+)
+def test_finalize_create_from_knowledge_missing_skill_md_follows_language(
+    manager: SkillManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lang: str,
+    expected: str,
+) -> None:
+    _set_preferred_language(monkeypatch, lang)
+    out = tmp_path / "empty-gen"
+    out.mkdir()
+    with pytest.raises(SkillRpcError) as exc:
+        manager.finalize_create_from_knowledge(out, existing_skill_names=set())
+    assert exc.value.code == ERROR_SKILL_INVALID_PACKAGE
+    assert expected in str(exc.value)
+
+
+def test_knowledge_language_falls_back_to_chinese_when_config_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from jiuwenswarm.server.runtime.skill import skill_manager as sm
+
+    def _boom():
+        raise OSError("config missing")
+
+    monkeypatch.setattr("jiuwenswarm.common.config.get_config", _boom)
+    assert sm._knowledge_skill_language() == "zh"
+
+
 def test_multipart_import_http_local(manager: SkillManager, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "jiuwenswarm.server.runtime.skill.skills_multipart_http.SkillManager",
@@ -474,3 +570,91 @@ def test_parse_multipart_roundtrip() -> None:
     fields = parse_multipart_form(content_type, body)
     assert fields["link"] == "https://a.example"
     assert fields["skill_description"] == "desc"
+
+
+async def _serve_skill_rpc_mock_server(handler: Any) -> Any:
+    """在空闲端口起一个协议兼容的 Mock AgentServer，返回 (server, uri)."""
+    import socket
+
+    from websockets.legacy.server import serve as legacy_serve
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = await legacy_serve(handler, "127.0.0.1", port)
+    return server, f"ws://127.0.0.1:{port}"
+
+
+@pytest.mark.asyncio
+async def test_skill_rpc_client_skips_ack_and_decoy_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最小 WS 客户端须先消费 connection.ack，并按 request_id 丢弃无关帧。"""
+    from jiuwenswarm.common.e2a.wire_codec import encode_agent_response_for_wire
+    from jiuwenswarm.server.runtime.skill import skills_multipart_http as mod
+
+    seen: list[dict[str, Any]] = []
+
+    async def handler(ws: Any) -> None:
+        await ws.send(json.dumps({"type": "event", "event": "connection.ack", "params": {}}))
+        request = json.loads(await ws.recv())
+        seen.append(request)
+        # 先发一条 request_id 不匹配的帧，再发迟到的事件帧，最后才是真正的响应。
+        decoy = encode_agent_response_for_wire(
+            AgentResponse(request_id="someone-else", channel_id="web", ok=True, payload={}),
+            response_id="someone-else",
+        )
+        await ws.send(json.dumps(decoy, ensure_ascii=False))
+        await ws.send(json.dumps({"type": "event", "event": "connection.ack", "params": {}}))
+        good = encode_agent_response_for_wire(
+            AgentResponse(
+                request_id=request["request_id"],
+                channel_id="web",
+                ok=True,
+                payload={"success": True, "skill": {"name": "from-ws"}},
+            ),
+            response_id=request["request_id"],
+        )
+        await ws.send(json.dumps(good, ensure_ascii=False))
+
+    server, uri = await _serve_skill_rpc_mock_server(handler)
+    monkeypatch.setenv("AGENT_SERVER_URL", uri)
+    try:
+        payload = await mod._call_agent_skill_rpc(
+            method=ReqMethod.SKILLS_IMPORT_UPLOAD,
+            params={"path": "/tmp/x.zip", "overwrite": False},
+            timeout_s=10.0,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert payload["success"] is True
+    assert payload["skill"]["name"] == "from-ws"
+    assert seen and seen[0]["request_id"].startswith("file-api-")
+
+
+@pytest.mark.asyncio
+async def test_skill_rpc_client_rejects_missing_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未收到 connection.ack 时应直接失败，避免把非 ack 帧当作响应。"""
+    from jiuwenswarm.server.runtime.skill import skills_multipart_http as mod
+
+    async def handler(ws: Any) -> None:
+        await ws.send(json.dumps({"type": "event", "event": "unexpected"}))
+
+    server, uri = await _serve_skill_rpc_mock_server(handler)
+    monkeypatch.setenv("AGENT_SERVER_URL", uri)
+    try:
+        with pytest.raises(SkillRpcError) as excinfo:
+            await mod._call_agent_skill_rpc(
+                method=ReqMethod.SKILLS_IMPORT_UPLOAD,
+                params={"path": "/tmp/x.zip"},
+                timeout_s=10.0,
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert "connection.ack" in excinfo.value.message

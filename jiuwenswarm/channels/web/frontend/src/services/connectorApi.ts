@@ -34,6 +34,7 @@ interface RawConnectorSummary {
   name: string;
   package_name?: string;
   display_name: string;
+  display_name_i18n?: { zh?: string; en?: string };
   description: string;
   category: string;
   integration_type: ConnectorSummary['integrationType'];
@@ -126,6 +127,9 @@ interface RawConnectResponse {
   applied?: boolean;
   item?: Record<string, unknown>;
   error?: string;
+  code?: string;
+  runtime?: string;
+  install_cmd?: string;
   installed_skills?: string[];
   server_id_scope?: string;
   credentials_required?: boolean;
@@ -135,12 +139,17 @@ interface RawConnectResponse {
   description?: string;
   doc_url?: string | null;
   doc_label?: string;
+  oauth_doc_url?: string;
+  oauth_success_prefix?: string;
   fields?: Record<string, ConnectorCredentialField>;
   step_index?: number;
   steps_total?: number;
+  auth_pending?: boolean;
+  host_oauth?: boolean;
   auth_url?: string | null;
   auth_domain?: string;
   command?: string;
+  flow?: string;
 }
 
 function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
@@ -150,6 +159,9 @@ function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
     applied: raw.applied,
     item: raw.item,
     error: raw.error,
+    code: raw.code,
+    runtime: raw.runtime,
+    installCmd: raw.install_cmd,
     installedSkills: raw.installed_skills,
     serverIdScope: raw.server_id_scope,
     credentialsRequired: raw.credentials_required,
@@ -159,12 +171,17 @@ function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
     description: raw.description,
     docUrl: raw.doc_url,
     docLabel: raw.doc_label,
+    oauthDocUrl: raw.oauth_doc_url,
+    oauthSuccessPrefix: raw.oauth_success_prefix,
     fields: raw.fields,
     stepIndex: raw.step_index,
     stepsTotal: raw.steps_total,
+    authPending: raw.auth_pending,
+    hostOAuth: raw.host_oauth,
     authUrl: raw.auth_url,
     authDomain: raw.auth_domain,
     command: raw.command,
+    flow: raw.flow,
   };
 }
 
@@ -172,6 +189,7 @@ function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
 // （文档 §1.3：10min），不能用默认的 15s。
 const WAIT_AUTH_TIMEOUT_MS = 10 * 60 * 1000;
 const REGISTER_CUSTOM_TIMEOUT_MS = 10 * 60 * 1000;
+const UNINSTALL_TIMEOUT_MS = 60 * 1000;
 // mcp.connect 同样可能是 hold-open 的一次性握手（CLI 探活/OAuth 首步），后端最长等 10min 才回——
 // 之前漏了这个超时覆盖，一直用 webClient 的默认 15s，CLI 类连接器随手一连就客户端先超时报错，
 // 而后端其实还在正常跑，事后会把真实结果覆盖回来，造成"明明连上了却弹超时"的假象
@@ -183,8 +201,13 @@ export const connectorApi = {
   // (local，= 已连接的预置 + 全部自定义)。实测过 dev_aipc_feat_v2 分支：缺省 filter 时后端按
   // "builtin" 处理，之前不传 filter 的单次调用会让"我的MCP"完全看不到自定义 MCP，是真实 bug，
   // 不是理论风险（评估过程见 cjh/feature/MCP/_migration/mcp-interface-v2-gap-assessment.md）。
-  list: async (filter: 'builtin' | 'local'): Promise<CatalogItems<ConnectorSummary>> => {
-    const payload = await requestEquipmentList<{ items: RawConnectorSummary[]; cache?: CatalogCacheMetadata }>(webRequest, 'mcp.list', { filter });
+  list: async (filter: 'builtin' | 'local', query = ''): Promise<CatalogItems<ConnectorSummary>> => {
+    const payload = await requestEquipmentList<{ items: RawConnectorSummary[]; cache?: CatalogCacheMetadata }>(
+      webRequest,
+      'mcp.list',
+      { filter, ...(query ? { query } : {}) },
+      !query,
+    );
     return withCatalogCache(payload.items.map(fromRawSummary), payload.cache);
   },
   show: async (id: string): Promise<ConnectorDetail> => {
@@ -204,7 +227,7 @@ export const connectorApi = {
     };
   },
   uninstall: (id: string): Promise<ConnectorUninstallResponse> =>
-    webRequest<ConnectorUninstallResponse>('mcp.uninstall', { id }),
+    webRequest<ConnectorUninstallResponse>('mcp.uninstall', { id }, { timeoutMs: UNINSTALL_TIMEOUT_MS }),
   connect: async (name: string): Promise<ConnectorConnectResponse> => {
     const payload = await webRequest<RawConnectResponse>('mcp.connect', { name }, { timeoutMs: CONNECT_TIMEOUT_MS });
     return fromRawConnect(payload);
@@ -220,6 +243,20 @@ export const connectorApi = {
     );
     return fromRawConnect(payload);
   },
+  startOAuth: async (name: string): Promise<ConnectorConnectResponse> => {
+    const callbackUrl = window.location.origin;
+    const payload = await webRequest<RawConnectResponse>(
+      'mcp.oauth.start',
+      { name, callback_url: callbackUrl },
+      { timeoutMs: 5 * 60 * 1000 },
+    );
+    return fromRawConnect(payload);
+  },
+  // 用户在中途放弃连接/授权（误操作想重新走一遍 OAuth，或等太久了）。后端把正在 hold-open 的
+  // mcp.connect/mcp.wait_auth 收尾成 cancelled，杀掉挂起的 CLI 授权进程并回滚 connecting 记录。
+  // 幂等，连接没在进行中时调用也无副作用。
+  cancelConnect: (name: string) =>
+    webRequest<{ type: 'cancelled'; name: string; applied?: boolean }>('mcp.cancel_connect', { name }),
   disconnect: (name: string) =>
     webRequest<{ type: 'disconnected'; name: string; applied: boolean; item: Record<string, unknown> }>(
       'mcp.disconnect',

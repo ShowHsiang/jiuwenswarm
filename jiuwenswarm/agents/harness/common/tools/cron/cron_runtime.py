@@ -21,8 +21,9 @@ from jiuwenswarm.runtime.cron.models import (
 )
 from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import CronToolRoute, CronTools
 from jiuwenswarm.common.schema.message import Message, ReqMethod
+from jiuwenswarm.common.scheduled_task_policy import is_scheduled_task_supported
 from jiuwenswarm.common.utils import logger
-from jiuwenswarm.runtime.host_services import send_runtime_wake
+from jiuwenswarm.common.host_services import send_runtime_wake
 
 
 class _CronToolsCronBackend(CronToolBackend):
@@ -103,6 +104,14 @@ class _CronToolsCronBackend(CronToolBackend):
         # 发起会话的用户路由键：AgentOS 下由 CronToolContext.user_id 透传
         # （deep adapter 从 E2A 请求 user_id 注入），供 job 归属创建者。
         user_id = str(getattr(context, "user_id", "") or "").strip()
+        # 企业版群/机器人：与 Gateway 一致，读顶层 user_id + metadata.routing。
+        from jiuwenswarm.common.request_identity import web_routing_identity
+
+        identity = web_routing_identity(metadata)
+        if not user_id:
+            user_id = str(identity.get("user_id") or "").strip()
+        group_id = str(identity.get("group_id") or "").strip()
+        bot_id = str(identity.get("bot_id") or "").strip()
         return CronToolRoute(
             request_id=request_id,
             channel_id=channel_id,
@@ -114,6 +123,8 @@ class _CronToolsCronBackend(CronToolBackend):
             model_name=model_name,
             app_id=app_id,
             user_id=user_id,
+            group_id=group_id,
+            bot_id=bot_id,
         )
 
     @staticmethod
@@ -145,9 +156,17 @@ class _CronToolsCronBackend(CronToolBackend):
             inherited = str(meta.get("model") or "").strip()
             if not inherited:
                 return payload
-            from jiuwenswarm.runtime.cron.models import validate_cron_model
+            from jiuwenswarm.enterprise import is_enterprise
 
-            canonical = validate_cron_model(inherited)
+            # 企业版不在本机核对：名单在 Gateway 企业库。这里只把会话模型带上。
+            if is_enterprise():
+                canonical = inherited
+            else:
+                from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import (
+                    resolve_agent_cron_model,
+                )
+
+                canonical = resolve_agent_cron_model(inherited)
             if canonical:
                 out = dict(payload)
                 out["model_name"] = canonical
@@ -165,6 +184,43 @@ class _CronToolsCronBackend(CronToolBackend):
                 exc,
             )
         return payload
+
+    @staticmethod
+    def _inherit_session_mode(
+        payload: dict[str, Any],
+        context: CronToolContext | None,
+    ) -> dict[str, Any]:
+        """Use the creating chat session's mode, not a team member's agent mode."""
+        session_id = getattr(context, "session_id", None)
+        if not (isinstance(session_id, str) and session_id.strip()):
+            return payload
+        try:
+            from jiuwenswarm.server.runtime.session.session_metadata import (
+                get_session_metadata,
+            )
+            from jiuwenswarm.runtime.cron.models import normalize_cron_job_mode
+
+            meta = get_session_metadata(session_id, cache_bust=True)
+            mode = str(meta.get("mode") or "").strip() if isinstance(meta, dict) else ""
+            if not mode:
+                return payload
+            inherited = normalize_cron_job_mode(mode)
+            out = dict(payload)
+            out["mode"] = inherited
+            logger.info(
+                "[CronRuntimeBridge] cron job reuses chat-session mode: "
+                "session=%s mode=%s",
+                session_id,
+                inherited,
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001 - 继承失败不阻断创建
+            logger.debug(
+                "[CronRuntimeBridge] reuse session mode failed session=%s: %s",
+                session_id,
+                exc,
+            )
+            return payload
 
     @staticmethod
     def _inherit_session_mcp(
@@ -228,6 +284,22 @@ class _CronToolsCronBackend(CronToolBackend):
             return None
         return self._to_backend_job(job)
 
+    async def get_authoritative_job(
+        self, job_id: str, *, user_id: str, request_id: str = "", session_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Query with explicit trusted ownership, independent of bound tool contexts."""
+        route = CronToolRoute(user_id=user_id, request_id=request_id, session_id=session_id, channel_id="")
+        route_token = self._cron_tools.push_cron_route(route)
+        try:
+            job = await self._cron_tools.get_authoritative_job(job_id)
+        finally:
+            self._cron_tools.reset_cron_route(route_token)
+        if job is None:
+            return None
+        if str(job.get("user_id") or "").strip() != user_id:
+            raise RuntimeError("authoritative cron job owner mismatch")
+        return self._to_backend_job(job)
+
     async def create_job(
         self,
         params: dict[str, Any],
@@ -248,6 +320,7 @@ class _CronToolsCronBackend(CronToolBackend):
             sorted(list((params or {}).keys())),
         )
         payload = _extract_legacy_params(dict(params or {}), context=context, require_schedule=True)
+        payload = self._inherit_session_mode(payload, context=context)
         # cron 的模型直接复用创建它的 chat-session 的模型配置（用户在对话中选用的
         # 模型，如免费模型 mimo-v2.5-free），保证 cron 执行与创建它的会话使用同一
         # 模型配置，而不是回退到 config 默认模型。
@@ -291,6 +364,11 @@ class _CronToolsCronBackend(CronToolBackend):
     async def run_now(self, job_id: str) -> str:
         run_result = await self._with_route(None, self._cron_tools.run_now(job_id))
         if isinstance(run_result, dict):
+            # CronTools 的 ack 形状是 {"action": ..., "data": {"run_id": ...}}；
+            # 顶层 run_id 仅兼容旧实现，未拿到 ack（data 为 None）时保持空串。
+            data = run_result.get("data")
+            if isinstance(data, dict):
+                return str(data.get("run_id") or run_result.get("run_id") or "")
             return str(run_result.get("run_id") or "")
         return str(run_result or "")
 
@@ -709,16 +787,177 @@ def _patch_cron_tool_cards(tools: list[Any]) -> list[Any]:
     return tools
 
 
-class _NoCreateCronBackend:
-    """Backend view that forbids creating new cron jobs.
+# --- cron 执行会话：统一 cron 工具 schema 摘除被禁动作 ---
+# 仅靠 _RestrictedCronBackend 运行时报错不够：统一 cron 工具的 schema 仍把
+# 被禁 action（add / update）列为合法值，描述里也照常宣传，模型按 schema
+# 行事会先试一次再吃到报错，甚至反复重试。在工具注册前直接改写 ToolCard，
+# 把禁止信号前移到模型调用前可见的 schema 层（与下掉 cron_create_job /
+# cron_update_job 是同一道防线）。
+_CRON_DISABLED_ACTION_LABELS: dict[str, dict[str, str]] = {
+    "cn": {
+        "add": "add（创建新定时任务）",
+        "update": "update（修改定时任务）",
+    },
+    "en": {
+        "add": "add (creating new cron jobs)",
+        "update": "update (modifying cron jobs)",
+    },
+}
 
-    用于 cron 执行会话的工具集：统一 ``cron`` 工具的 ``add`` 动作与
-    ``cron_create_job`` 都汇聚到 ``create_job``，在这里统一拒绝，防止
-    cron 运行中再派生出新 cron；其余管理操作照常委托内层 backend。
+# 描述中明文宣传被禁动作的句段；openjiuwen 改版导致失配时仅剩 notice 兜底，
+# 不影响 action 枚举层的硬摘除。
+_CRON_DISABLED_ACTION_ADVERTISE_FIXES: dict[str, tuple[tuple[str, str], ...]] = {
+    "add": (
+        ("用于 add 的任务对象", "保留的兼容字段；当前会话不支持 add 创建新任务"),
+        ("Job object for add", "Reserved compatibility field; add is unavailable in this session"),
+    ),
+    "update": (
+        ("用于 update 的补丁对象", "保留的兼容字段；当前会话不支持 update 修改任务"),
+        ("Patch object used by update", "Reserved compatibility field; update is unavailable in this session"),
+        ("用于 update/remove/run/runs 的任务 ID", "用于 remove/run/runs 的任务 ID"),
+        ("Job id used by update/remove/run/runs", "Job id used by remove/run/runs"),
+    ),
+}
+
+# 统一工具描述开头的 action 清单原文（摘除被禁动作后整体替换）。
+_CRON_ACTION_LIST_ORIGINAL = {
+    "cn": "status、list、add、update、remove、run、runs、wake",
+    "en": "status, list, add, update, remove, run, runs, and wake",
+}
+
+
+def _cron_restricted_notice(language: str, disabled_actions: set[str]) -> str:
+    """按被禁动作集合生成统一工具描述开头的禁止声明。"""
+    labels = _CRON_DISABLED_ACTION_LABELS.get(language) or _CRON_DISABLED_ACTION_LABELS["cn"]
+    ordered = [action for action in ("add", "update") if action in disabled_actions]
+    if language == "en":
+        listed = " and ".join(labels[action] for action in ordered)
+        return (
+            "[IMPORTANT] This session is a scheduled-job execution session; "
+            f"these cron actions are unavailable: {listed}. "
+            "Only manage existing jobs (list/get/delete/toggle/run). "
+            "Create or modify cron jobs from a normal chat session instead.\n\n"
+        )
+    listed = "、".join(labels[action] for action in ordered)
+    return (
+        "【重要】当前会话是定时任务的执行会话，以下动作不可用："
+        f"{listed}；只能查看/删除/启停/立即执行已有任务。"
+        "如需新建或修改定时任务，请在普通对话会话中操作。\n\n"
+    )
+
+
+def _stripped_action_list(language: str, disabled_actions: set[str]) -> str:
+    """action 清单原文摘除被禁动作后的替换文本。"""
+    original = _CRON_ACTION_LIST_ORIGINAL.get(language) or _CRON_ACTION_LIST_ORIGINAL["cn"]
+    separator = ", " if language == "en" else "、"
+    return separator.join(
+        part for part in original.split(separator) if part not in disabled_actions
+    )
+
+
+def _apply_disabled_action_advertise_fixes(
+    value: Any, disabled_actions: set[str]
+) -> Any:
+    """递归摘除描述文本中对被禁动作的宣传（str 替换，dict/list 递归重建）。"""
+    if isinstance(value, str):
+        for action in disabled_actions:
+            for old, new in _CRON_DISABLED_ACTION_ADVERTISE_FIXES.get(action, ()):
+                if old in value:
+                    value = value.replace(old, new)
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _apply_disabled_action_advertise_fixes(item, disabled_actions)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _apply_disabled_action_advertise_fixes(item, disabled_actions)
+            for item in value
+        ]
+    return value
+
+
+def _patch_unified_cron_tool_restricted(
+    tools: list[Any], *, language: str, disabled_actions: set[str]
+) -> list[Any]:
+    """改写统一 ``cron`` 工具 card：摘除被禁 action 并声明不可用（幂等）。"""
+    if not disabled_actions:
+        return tools
+    notice = _cron_restricted_notice(language, disabled_actions)
+    ordered = [action for action in ("add", "update") if action in disabled_actions]
+    verb_phrases = {
+        "cn": {"add": "创建", "update": "修改"},
+        "en": {"add": "creating", "update": "modifying"},
+    }
+    verbs = verb_phrases.get(language) or verb_phrases["cn"]
+    if language == "en":
+        phrase = "/".join(verbs[action] for action in ordered if action in verbs)
+        action_desc = (
+            "Cron action to execute; unavailable in this session: "
+            f"{'/'.join(ordered)} (scheduled-job execution session forbids "
+            f"{phrase} cron jobs)"
+        )
+    else:
+        phrase = "或".join(verbs[action] for action in ordered if action in verbs)
+        action_desc = (
+            "要执行的 cron 操作；本会话不支持 "
+            f"{'/'.join(ordered)}（定时任务执行会话禁止{phrase}定时任务）"
+        )
+    for tool in tools:
+        card = getattr(tool, "card", None)
+        if str(getattr(card, "name", "") or "") != "cron":
+            continue
+        description = str(getattr(card, "description", None) or "")
+        if notice not in description:
+            description = _apply_disabled_action_advertise_fixes(
+                description, disabled_actions
+            )
+            original_list = (
+                _CRON_ACTION_LIST_ORIGINAL.get(language)
+                or _CRON_ACTION_LIST_ORIGINAL["cn"]
+            )
+            if original_list in description:
+                description = description.replace(
+                    original_list, _stripped_action_list(language, disabled_actions)
+                )
+            card.description = notice + description
+        if getattr(card, "input_params", None) is not None:
+            card.input_params = _apply_disabled_action_advertise_fixes(
+                card.input_params, disabled_actions
+            )
+        input_params = getattr(card, "input_params", None)
+        if not isinstance(input_params, dict):
+            continue
+        action = (input_params.get("properties") or {}).get("action")
+        if not isinstance(action, dict) or not isinstance(action.get("enum"), list):
+            continue
+        action["enum"] = [
+            item for item in action["enum"] if str(item) not in disabled_actions
+        ]
+        action["description"] = action_desc
+    return tools
+
+
+class _RestrictedCronBackend:
+    """Backend view that forbids mutating cron jobs from a cron session.
+
+    用于 cron 执行会话的工具集：统一 ``cron`` 工具的 ``add`` / ``update``
+    动作与 ``cron_create_job`` / ``cron_update_job`` 分别汇聚到 ``create_job``
+    / ``update_job``，在这里按开关统一拒绝，防止 cron 运行中再派生新 cron、
+    或改写已有 cron（含自我续期/改期）；其余管理操作照常委托内层 backend。
     """
 
-    def __init__(self, inner: CronToolBackend) -> None:
+    def __init__(
+        self,
+        inner: CronToolBackend,
+        *,
+        allow_create: bool = True,
+        allow_update: bool = True,
+    ) -> None:
         self._inner = inner
+        self._allow_create = allow_create
+        self._allow_update = allow_update
 
     async def create_job(
         self,
@@ -726,11 +965,28 @@ class _NoCreateCronBackend:
         *,
         context: CronToolContext | None = None,
     ) -> dict[str, Any]:
-        _ = (params, context)
-        raise ValueError(
-            "Creating new cron jobs from a cron session is not allowed; "
-            "manage existing jobs (list/get/update/delete) instead"
-        )
+        if not self._allow_create:
+            _ = (params, context)
+            raise ValueError(
+                "Creating new cron jobs from a cron session is not allowed; "
+                "manage existing jobs (list/get/delete/toggle/run) instead"
+            )
+        return await self._inner.create_job(params, context=context)
+
+    async def update_job(
+        self,
+        job_id: str,
+        patch: dict[str, Any],
+        *,
+        context: CronToolContext | None = None,
+    ) -> dict[str, Any]:
+        if not self._allow_update:
+            _ = (job_id, patch, context)
+            raise ValueError(
+                "Updating cron jobs from a cron session is not allowed; "
+                "manage existing jobs (list/get/delete/toggle/run) instead"
+            )
+        return await self._inner.update_job(job_id, patch, context=context)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -742,6 +998,10 @@ class CronRuntimeBridge:
     def __init__(self) -> None:
         self._backend_override: CronToolBackend | None = None
         self._resolved_backend: CronToolBackend | None = None
+        # 后台调度器启动 Task 的强引用集合：CPython 对未引用 Task 只持弱引用，
+        # 不持有会被 GC 提前回收（"Task was destroyed but it is pending"），
+        # 调度器未完成启动、定时任务到点无人调度。完成后经 done 回调移除，不泄漏。
+        self._scheduler_start_tasks: set[asyncio.Task] = set()
 
     def set_backend(self, backend: CronToolBackend | None) -> None:
         self._backend_override = backend
@@ -763,18 +1023,39 @@ class CronRuntimeBridge:
         backend = self.get_backend()
         if backend is None:
             return
-        
+
         if not isinstance(backend, _CronToolsCronBackend):
             return
-        
+
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.create_task(backend.ensure_scheduler_started())
+                task = asyncio.create_task(
+                    self._start_scheduler_guarded(backend.ensure_scheduler_started())
+                )
+                # 持有强引用直到完成，避免被 GC 提前回收。
+                self._scheduler_start_tasks.add(task)
+                task.add_done_callback(self._scheduler_start_tasks.discard)
             else:
                 loop.run_until_complete(backend.ensure_scheduler_started())
         except Exception as exc:
             logger.warning("[CronRuntimeBridge] Failed to start scheduler: %s", exc)
+
+    @staticmethod
+    async def _start_scheduler_guarded(coro: Any) -> None:
+        """运行后台调度器启动协程并记录其内部异常。
+
+        asyncio.create_task 外层的 try/except 只能捕获创建 Task 的同步异常；
+        协程内部异常若不在此捕获，只会变成 "Task exception was never retrieved"，
+        调用方（build_tools）完全无感知，表现为静默失败。
+        """
+        try:
+            await coro
+        except Exception:
+            logger.warning(
+                "[CronRuntimeBridge] Background scheduler start failed",
+                exc_info=True,
+            )
 
     def build_tools(
         self,
@@ -783,13 +1064,18 @@ class CronRuntimeBridge:
         agent_id: Optional[str],
         language: str = "cn",
         allow_create: bool = True,
+        allow_update: bool = True,
     ) -> list[Any]:
         """Build cron tools.
 
         Args:
-            allow_create: False 时下掉创建类工具（``cron_create_job``），并让
-                统一 ``cron`` 工具的 ``add`` 动作直接报错。用于 cron 执行会话，
-                禁止 cron 再派生新 cron；list/get/update/delete 等管理能力保留。
+            allow_create: False 时下掉创建类工具（``cron_create_job``）、
+                摘除统一工具的 ``add`` 并让 ``add`` 动作运行时报错。用于
+                cron 执行会话，禁止 cron 再派生新 cron。
+            allow_update: False 时同样下掉 ``cron_update_job`` 与统一工具的
+                ``update`` 动作，禁止 cron 会话内改写已有 cron（含自我
+                续期/改期）。管理类工具（list/get/delete/toggle/preview）
+                不受影响。
         """
         backend = self.get_backend()
         if backend is None:
@@ -806,28 +1092,63 @@ class CronRuntimeBridge:
 
         logger.info("[CronRuntimeBridge] Building cron tools for context: %s",
                     getattr(context, 'tool_scope', 'unknown'))
-        effective_backend = backend if allow_create else _NoCreateCronBackend(backend)
+        effective_backend = backend
+        if not allow_create or not allow_update:
+            effective_backend = _RestrictedCronBackend(
+                backend, allow_create=allow_create, allow_update=allow_update
+            )
         tools = create_cron_tools(
             effective_backend,
             context=context,
-            target_channels=[channel.value for channel in CronTargetChannel],
+            target_channels=[
+                channel.value
+                for channel in CronTargetChannel
+                if is_scheduled_task_supported(channel.value)
+            ],
             default_target_channel=None,
             agent_id=agent_id,
             language=language,
         )
         tools = list(tools or [])
+        # cron 执行会话下架的独立工具：cron_create_job / cron_update_job。
+        disabled_tool_names: set[str] = set()
         if not allow_create:
-            # 创建类工具下掉：cron 会话内不暴露 cron_create_job。
+            disabled_tool_names.add("cron_create_job")
+        if not allow_update:
+            disabled_tool_names.add("cron_update_job")
+        if disabled_tool_names:
             tools = [
                 tool
                 for tool in tools
-                if getattr(getattr(tool, "card", None), "name", "") != "cron_create_job"
+                if getattr(getattr(tool, "card", None), "name", "") not in disabled_tool_names
             ]
+            # 统一 cron 工具保留（list/get 等管理能力仍可用），但 schema
+            # 层摘除被禁动作并声明不可用：运行时报错之外，让模型在调用前
+            # 就看到"本会话不能建/改任务"，不再按 schema 宣传的动作反复尝试。
+            disabled_actions: set[str] = set()
+            if not allow_create:
+                disabled_actions.add("add")
+            if not allow_update:
+                disabled_actions.add("update")
+            tools = _patch_unified_cron_tool_restricted(
+                tools, language=language, disabled_actions=disabled_actions
+            )
         # 修正 openjiuwen 工具描述中的 dow 编号语义（1=SUN→0=SUN，与 croniter 一致），
         # 见模块顶部 _CRON_DOW_SEMANTIC_FIXES 说明。
         tools = _patch_cron_tool_cards(tools)
-        logger.info("[CronRuntimeBridge] Built %d cron tools (create_enabled=%s): %s",
+        logger.info("[CronRuntimeBridge] Built %d cron tools (create_enabled=%s, update_enabled=%s): %s",
                     len(tools),
                     allow_create,
+                    allow_update,
                     [tool.card.name if hasattr(tool, 'card') else str(tool) for tool in tools])
         return tools
+
+
+async def query_authoritative_cron_job(
+    job_id: str, *, user_id: str, request_id: str = "", session_id: str = "",
+) -> dict[str, Any] | None:
+    """Query with explicit trusted ownership, independent of bound tool contexts."""
+    backend = _CronToolsCronBackend(CronTools())
+    return await backend.get_authoritative_job(
+        job_id, user_id=user_id, request_id=request_id, session_id=session_id,
+    )

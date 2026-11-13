@@ -63,6 +63,7 @@ def shell_tool_names() -> list[str]:
 _CODE_TOOLS = {"code"}
 _PATH_TOOLS = {
     "apply_patch",
+    "lsp",
     "read_file",
     "read_pdf",
     "write_file",
@@ -100,13 +101,14 @@ _LEGACY_TODO_TOOLS = {
     "todo_complete",
     "todo_remove",
 }
-_SESSION_STATUS_TOOLS = {"session_list", "session_message_list"}
+_SESSION_STATUS_TOOLS = {"session_list", "session_message_list", "session_read"}
 _SESSION_SEND_TOOLS = {"session_send_message"}
-_SESSION_MESSAGE_MANAGEMENT_TOOLS = {"session_message_resolve"}
+_SESSION_MESSAGE_MANAGEMENT_TOOLS = {"session_message_resolve", "session_continue_queued"}
 _INTERNAL_READONLY_TOOLS = {
     "cron_list_jobs", "cron_get_job", "cron_preview_job",
     "heartbeat_list_jobs", "heartbeat_get_job", "heartbeat_preview_job",
     "read_terminal_output", "wait_for_terminal_exit", "convert_timestamp_to_utc8_time",
+    "tool_search", "skill_index", "list_skill", "get_current_goal", "recall_compressed_context",
 }
 _ASK_USER_TOOLS = {"ask_user"}
 _SKILL_READ_TOOLS = {"skill_tool"}
@@ -148,6 +150,7 @@ _REVIEWED_MEMORY_READ_TOOLS = {
     "viking_search",
 }
 _FIXED_BROWSER_TOOLS = {
+    "browser_phase",
     "browser_probe_cards",
     "browser_probe_interactives",
     "browser_recall_offload",

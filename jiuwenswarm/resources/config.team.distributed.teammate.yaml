@@ -13,6 +13,25 @@ logging:
   agent_server: INFO
   full: INFO
 
+# ============================================================
+# 沙箱（jiuwenbox）——分布式 teammate 节点按需开启
+# 开启前须在本节点部署并启动 jiuwenbox，url 指向本机可达地址。
+# leader 的沙箱配置不跨节点传播：本节点在收到 bootstrap 后按此处的
+# 本机配置重建成员沙箱。未开启时成员在本节点本地执行。
+# team_fail_closed=true：本机沙箱不可用时拒绝收养成员（不降级）。
+# 部署步骤见 docs/zh/分布式Team.md（英文: docs/en/DistributedTeam.md）。
+# ============================================================
+# sandbox:
+#   enabled: true
+#   type: jiuwenbox
+#   url: http://127.0.0.1:18080
+#   team_fail_closed: false
+# network_mode: 可选(如 host)。显式把网络模式写进成员沙箱的 client policy
+# fragment;仅在 jiuwenbox 根 policy 配 network.mode 时需要(append-merge 会丢失
+# 未出现在 fragment 的字段)。无特权主机(WSL/容器)设 host 可避免 netns 权限要求。
+# 不配置 = 不转发,行为与旧版一致。
+#   network_mode: host
+
 memory:
   # ============================================================
   # 记忆系统配置
@@ -171,7 +190,10 @@ telemetry:
   exporter: otlp                    # otlp / console / none
   endpoint: http://localhost:4317   # OTLP endpoint
   protocol: grpc                    # grpc / http
-  headers: {}                       # 公共 OTLP headers，可被 traces/metrics 覆盖
+  # 公共 OTLP headers，可被 traces/metrics 覆盖。留空而不是 {}：本模板同时
+  # 充当升级时的键白名单，写成映射会被当作允许的子键全集，操作员自己加的
+  # header 会被 _deep_merge 一并删掉。
+  headers:
   log_messages: true                # 是否在 span event 中记录完整消息内容
   service_name: jiuwenclaw
   provider_factory:                 # 自定义 provider factory，格式：module:function
@@ -179,12 +201,12 @@ telemetry:
     exporter:                       # trace exporter，默认回退到 telemetry.exporter
     endpoint:                       # trace endpoint，默认回退到 telemetry.endpoint
     protocol:                       # trace protocol，默认回退到 telemetry.protocol
-    headers: {}                     # trace headers，默认回退到 telemetry.headers
+    headers:                        # trace headers，默认回退到 telemetry.headers；留空而非 {}，理由同上
   metrics:
     exporter:                       # metrics exporter，默认回退到 telemetry.exporter
     endpoint:                       # metrics endpoint，默认回退到 telemetry.endpoint
     protocol:                       # metrics protocol，默认回退到 telemetry.protocol
-    headers: {}                     # metrics headers，默认回退到 telemetry.headers
+    headers:                        # metrics headers，默认回退到 telemetry.headers；留空而非 {}，理由同上
 
 kv_cache_affinity_config:
   enable_kv_cache_affinity: false
@@ -696,7 +718,10 @@ permissions:
     # path_ask_* → file_guard.paths（match: glob）
 
   # 数字分身 owner-scoped 权限（默认空，不生效）
-  owner_scopes: {}
+  # 键是 channel_id，由操作员或 Web 设置页写入，本模板无从预知。留空而不是
+  # {}：模板同时充当升级时的键白名单，写成映射会被当作允许的子键全集，写进
+  # 去的授权会被 _deep_merge 一并删掉——包括设置页刚刚保存的那一份。
+  owner_scopes:
   deny_guidance_message: ""
 
   file_guard:
@@ -771,7 +796,7 @@ team:
     leader:
       workspace:
         stable_base: true
-      max_iterations: 200
+      # Leader 不受 max_iterations 限制，配置了也会被忽略，保证长程任务持续执行
       completion_timeout: 600.0
     teammate:
       workspace:
@@ -857,7 +882,7 @@ modes:
         leader:
           workspace:
             stable_base: true
-          max_iterations: 200
+          # Leader 不受 max_iterations 限制，配置了也会被忽略，保证长程任务持续执行
           completion_timeout: 600.0
 
       workspace:

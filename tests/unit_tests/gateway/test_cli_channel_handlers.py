@@ -3,18 +3,21 @@
 import asyncio
 
 import pytest
-
-from jiuwenswarm.common.schema.agent import AgentResponse
-from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.gateway.channel_manager.tui import tui_connect as tui_connect_module
-from jiuwenswarm.gateway.channel_manager.tui.tui_connect import (
+from openjiuwen_protocol.e2a.agent_models import AgentResponse
+from openjiuwen_protocol.message import ReqMethod
+from agent_gateway.common.config_panel import tui_models_handlers
+from agent_gateway.channel_manager.tui import tui_connect as tui_connect_module
+from agent_gateway.channel_manager.tui.tui_connect import (
     CliHandlersBindParams,
     CliRouteBindParams,
     build_cli_route_binding,
     register_cli_handlers,
 )
-from jiuwenswarm.gateway.routing.agent_client import WebSocketAgentServerClient
-from jiuwenswarm.gateway.heartbeat import HeartbeatServiceUnavailableError
+from agent_gateway.routing.agent_client import WebSocketAgentServerClient
+from agent_gateway.heartbeat import HeartbeatServiceUnavailableError
+
+from tests.unit_tests.gateway.config_routing_harness import make_config_routing_client
+from jiuwenswarm.common.config_panel import tui_models_handlers as _server_tui_models_handlers
 
 
 class FakeGatewayServer:
@@ -220,7 +223,7 @@ async def test_memory_list_forwards_to_agentserver_with_routing_user(monkeypatch
         return True
 
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.proxy_unary_request",
+        "agent_gateway.routing.e2a_proxy.proxy_unary_request",
         fake_proxy_unary_request,
     )
     register_cli_handlers(
@@ -442,7 +445,7 @@ async def test_harmonyos_dev_init_legacy_client_falls_back_to_local(monkeypatch)
     server = FakeGatewayServer()
     _install_failing_dev_init_send(monkeypatch)
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
+        "agent_gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
         lambda client: True,
     )
 
@@ -453,7 +456,7 @@ async def test_harmonyos_dev_init_legacy_client_falls_back_to_local(monkeypatch)
         return {"ok": True, "source": "local-fallback"}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "agent_gateway.channel_manager.tui.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -492,7 +495,7 @@ async def test_harmonyos_dev_init_remote_client_error_without_fallback(monkeypat
     server = FakeGatewayServer()
     _install_failing_dev_init_send(monkeypatch)
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
+        "agent_gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
         lambda client: False,
     )
 
@@ -503,7 +506,7 @@ async def test_harmonyos_dev_init_remote_client_error_without_fallback(monkeypat
         return {"ok": True}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "agent_gateway.channel_manager.tui.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -552,7 +555,7 @@ async def test_harmonyos_dev_init_business_failure_does_not_rerun_locally(monkey
         business_failure_send,
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
+        "agent_gateway.routing.e2a_proxy.is_legacy_shared_directory_client",
         lambda client: True,
     )
 
@@ -563,7 +566,7 @@ async def test_harmonyos_dev_init_business_failure_does_not_rerun_locally(monkey
         return {"ok": True}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "agent_gateway.channel_manager.tui.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -834,7 +837,7 @@ async def test_config_validate_model_handler_uses_local_probe(monkeypatch):
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
-            agent_client=None,
+            agent_client=make_config_routing_client(),
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -851,7 +854,7 @@ async def test_config_validate_model_handler_uses_local_probe(monkeypatch):
         async def invoke(self, *args, **kwargs):
             return {"content": "hello"}
 
-    monkeypatch.setattr("jiuwenswarm.gateway.channel_manager.tui.tui_connect.Model", FakeModel)
+    monkeypatch.setattr("jiuwenswarm.common.config_panel.tui_models_handlers.Model", FakeModel)
 
     await cli_handlers["config.validate_model"](
         object(),
@@ -887,7 +890,7 @@ async def test_config_validate_model_retries_failed_probe_with_more_tokens(
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
-            agent_client=None,
+            agent_client=make_config_routing_client(),
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -907,7 +910,7 @@ async def test_config_validate_model_retries_failed_probe_with_more_tokens(
                 return {"content": "", "reasoning_content": ""}
             return {"content": "hello"}
 
-    monkeypatch.setattr(tui_connect_module, "Model", FakeModel)
+    monkeypatch.setattr(_server_tui_models_handlers, "Model", FakeModel)
 
     await server.local_handlers["/tui"]["config.validate_model"](
         object(),
@@ -961,18 +964,19 @@ async def test_command_model_switch_sends_scoped_agent_reload(monkeypatch):
         return mutator(data)
 
     monkeypatch.setattr(tui_connect_module, "_send_tui_agent_request", fake_send_tui_agent_request)
-    monkeypatch.setattr(tui_connect_module, "update_config", fake_update_config)
+    monkeypatch.setattr(tui_models_handlers, "update_config", fake_update_config)
     monkeypatch.setattr(
-        tui_connect_module,
+        tui_models_handlers,
         "get_config_raw",
         lambda: {"models": {"defaults": defaults}},
     )
-    monkeypatch.setattr(tui_connect_module, "get_config", lambda: {"models": {"defaults": defaults}})
+    monkeypatch.setattr(tui_models_handlers, "get_config", lambda: {"models": {"defaults": defaults}})
 
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
             agent_client=_offline_local_client(),
+            force_local_config=True,
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -1052,20 +1056,21 @@ async def test_command_model_delete_matches_by_name_when_index_drifted(monkeypat
         return mutator(data)
 
     monkeypatch.setattr(tui_connect_module, "_send_tui_agent_request", fake_send_tui_agent_request)
-    monkeypatch.setattr(tui_connect_module, "update_config", fake_update_config)
+    monkeypatch.setattr(tui_models_handlers, "update_config", fake_update_config)
     monkeypatch.setattr(
-        tui_connect_module,
+        tui_models_handlers,
         "get_config_raw",
         lambda: {"models": {"defaults": current_defaults}},
     )
     monkeypatch.setattr(
-        tui_connect_module, "get_config", lambda: {"models": {"defaults": current_defaults}}
+        tui_models_handlers, "get_config", lambda: {"models": {"defaults": current_defaults}}
     )
 
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
             agent_client=_offline_local_client(),
+            force_local_config=True,
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -1137,20 +1142,21 @@ async def test_command_model_delete_rejects_when_index_and_name_mismatch(monkeyp
         return mutator(data)
 
     monkeypatch.setattr(tui_connect_module, "_send_tui_agent_request", fake_send_tui_agent_request)
-    monkeypatch.setattr(tui_connect_module, "update_config", fake_update_config)
+    monkeypatch.setattr(tui_models_handlers, "update_config", fake_update_config)
     monkeypatch.setattr(
-        tui_connect_module,
+        tui_models_handlers,
         "get_config_raw",
         lambda: {"models": {"defaults": current_defaults}},
     )
     monkeypatch.setattr(
-        tui_connect_module, "get_config", lambda: {"models": {"defaults": current_defaults}}
+        tui_models_handlers, "get_config", lambda: {"models": {"defaults": current_defaults}}
     )
 
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
             agent_client=_offline_local_client(),
+            force_local_config=True,
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -1189,9 +1195,9 @@ async def test_command_model_lists_agentos_models_without_defaults(monkeypatch):
             "model_config_obj": {},
         }
     ]
-    monkeypatch.setattr(tui_connect_module, "get_model_names", lambda: [])
+    monkeypatch.setattr(tui_models_handlers, "get_model_names", lambda: [])
     monkeypatch.setattr(
-        tui_connect_module,
+        tui_models_handlers,
         "get_config_raw",
         lambda: {"models": {"defaults": [], "agentos": agentos_models}},
     )
@@ -1200,6 +1206,7 @@ async def test_command_model_lists_agentos_models_without_defaults(monkeypatch):
         CliHandlersBindParams(
             channel=server,
             agent_client=_offline_local_client(),
+            force_local_config=True,
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -1236,7 +1243,7 @@ async def test_session_list_returns_agent_timeout_before_tui_request_timeout(mon
             await asyncio.Event().wait()
 
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS",
+        "agent_gateway.routing.agent_request_timeout._TUI_DEFAULT_UNARY_TIMEOUT_SECONDS",
         0.01,
         raising=False,
     )
@@ -1400,17 +1407,24 @@ def test_model_meta_index_field_matches_raw_defaults_position():
 
 
 # ── 单用户 AgentServer 不可达时的本地回落（P2 遗留修复回归） ──────────────────
+# Front 控制面 RPC（session.list/color_set/preview）离线时不得由 Gateway 顶替。
 
 def _offline_local_client() -> WebSocketAgentServerClient:
     """server_ready=False 的本地 WebSocketAgentServerClient（共享目录单用户）。"""
     return WebSocketAgentServerClient()  # server_ready defaults to False
 
 
+def _assert_control_method_unavailable(server: FakeGatewayServer) -> None:
+    resp = server.responses[-1]
+    assert resp["ok"] is False
+    assert resp["code"] == "SERVICE_UNAVAILABLE"
+
+
 @pytest.mark.asyncio
-async def test_session_color_set_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_color_set_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgentServer 不可达时，TUI session.color_set 经薄代理回落到本地适配器查询。"""
+    """session.color_set is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1430,15 +1444,14 @@ async def test_session_color_set_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-color", {"session_id": "sess-1"}, "sess-1"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"]["accent_color"] == "blue"
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_list_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_list_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TUI resume list must not become empty during a local AgentServer restart."""
+    """session.list is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1461,15 +1474,14 @@ async def test_session_list_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-list", {"all_projects": True}, "current"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"]["sessions"][0]["session_id"] == "legacy"
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_preview_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_preview_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgentServer 不可达时，TUI session.preview 经薄代理回落到本地适配器。"""
+    """session.preview is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1492,16 +1504,12 @@ async def test_session_preview_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-preview", {"session_id": "sess-1"}, "sess-1"
     )
 
-    assert server.responses[-1]["ok"] is True
-    messages = server.responses[-1]["payload"]["preview_messages"]
-    assert [m["role"] for m in messages] == ["user", "assistant"]
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_delete_falls_back_to_shared_dir_when_agent_offline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-) -> None:
-    """AgentServer 不可达时，TUI session.delete 恢复迁移前本地删除路径。"""
+async def test_session_delete_unavailable_when_agent_offline() -> None:
+    """session.delete is execution-plane; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1511,84 +1519,21 @@ async def test_session_delete_falls_back_to_shared_dir_when_agent_offline(
             on_config_saved=None,
             path="/tui",
         )
-    )
-    session_dir = tmp_path / "sessions" / "sess-del"
-    session_dir.mkdir(parents=True)
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
-        lambda *args, **kwargs: {"mode": "agent"},
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_history.resolve_session_dir",
-        lambda *args, **kwargs: (session_dir, None),
-    )
-
-    class _Session:
-        async def release_kvc(self):
-            return True
-
-    monkeypatch.setattr(
-        "openjiuwen.core.session.agent.create_agent_session",
-        lambda **_kwargs: _Session(),
     )
 
     await server.local_handlers["/tui"]["session.delete"](
         object(), "req-del", {"session_id": "sess-del"}, "sess-del"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"] == {"session_id": "sess-del"}
-    assert not session_dir.exists()
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
 async def test_session_rebind_project_falls_back_to_shared_dir_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgentServer 不可达时，TUI session.rebind_project 恢复迁移前本地重绑路径。"""
-    server = FakeGatewayServer()
-    register_cli_handlers(
-        CliHandlersBindParams(
-            channel=server,
-            agent_client=_offline_local_client(),
-            message_handler=None,
-            on_config_saved=None,
-            path="/tui",
-        )
-    )
-    project = type(
-        "Project",
-        (),
-        {
-            "project_id": "proj-1",
-            "project_dir": "/home/user/projects/foo",
-            "project_name": "foo",
-            "name": "foo",
-            "work_mode": "code",
-        },
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
-        lambda *args, **kwargs: {"session_id": "sess-1"},
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.project_store.find_or_create_code_project_for_tui_params",
-        lambda *args, **kwargs: project,
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.rebind_session_project",
-        lambda *args, **kwargs: True,
-    )
-
-    await server.local_handlers["/tui"]["session.rebind_project"](
-        object(),
-        "req-rebind",
-        {"session_id": "sess-1", "project_dir": "/home/user/projects/foo"},
-        "sess-1",
-    )
-
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"]["project_id"] == "proj-1"
+    """A2g：AgentServer 不可达时报 SERVICE_UNAVAILABLE，不再本地 rebib。"""
+    pytest.skip("A2g deleted legacy local rebind fallback; E2A-only")
 
 
 @pytest.mark.asyncio
@@ -1633,10 +1578,10 @@ class _DictOwnedCronController:
         }
         self.update_calls: list[tuple[str, dict]] = []
 
-    async def get_job(self, job_id):
+    async def get_job(self, job_id, **_kwargs):
         return dict(self.job) if job_id == self.job["id"] else None
 
-    async def update_job(self, job_id, patch):
+    async def update_job(self, job_id, patch, **_kwargs):
         self.update_calls.append((job_id, dict(patch)))
         return {"id": job_id, **self.job, **patch}
 
@@ -1701,10 +1646,10 @@ async def test_cron_job_update_accepts_matching_owner_with_object_job() -> None:
             self.job = SimpleNamespace(id="cron-obj-owner", user_id="user-owner")
             self.update_calls = 0
 
-        async def get_job(self, job_id):
+        async def get_job(self, job_id, **_kwargs):
             return self.job if job_id == self.job.id else None
 
-        async def update_job(self, job_id, patch):
+        async def update_job(self, job_id, patch, **_kwargs):
             self.update_calls += 1
             return {"id": job_id, **patch}
 
@@ -1741,7 +1686,7 @@ async def test_agentos_cron_update_project_fields_with_dict_job(monkeypatch) -> 
         )
     )
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.is_agentos_routing_client",
+        "agent_gateway.routing.e2a_proxy.is_agentos_routing_client",
         lambda _client: True,
     )
 
@@ -1751,7 +1696,7 @@ async def test_agentos_cron_update_project_fields_with_dict_job(monkeypatch) -> 
         return True, {"project_id": "user-proj-1", "work_mode": "code"}
 
     monkeypatch.setattr(
-        "jiuwenswarm.gateway.routing.e2a_proxy.resolve_agent_cron_project_binding",
+        "agent_gateway.routing.e2a_proxy.resolve_agent_cron_project_binding",
         _fake_resolve_agent_cron_project_binding,
     )
 
@@ -1777,7 +1722,7 @@ async def test_models_list_builds_the_list_off_the_event_loop(monkeypatch):
     register_cli_handlers(
         CliHandlersBindParams(
             channel=server,
-            agent_client=None,
+            agent_client=make_config_routing_client(),
             message_handler=None,
             on_config_saved=None,
             path="/tui",
@@ -1793,8 +1738,8 @@ async def test_models_list_builds_the_list_off_the_event_loop(monkeypatch):
             seen["on_event_loop"] = False
         return [{"model_client_config": {"model_name": "m", "api_key": "k"}}]
 
-    monkeypatch.setattr(tui_connect_module, "get_config", lambda: {})
-    monkeypatch.setattr(tui_connect_module, "get_available_models", fake_available)
+    monkeypatch.setattr(_server_tui_models_handlers, "get_config", lambda: {})
+    monkeypatch.setattr(_server_tui_models_handlers, "get_available_models", fake_available)
 
     await server.local_handlers["/tui"]["models.list"](object(), "req-models", {}, "sess-1")
 

@@ -59,6 +59,7 @@ export default {
           strong: color('--color-border-strong'),
           hover: color('--color-border-hover'),
           accent: translucentColor('--color-border-accent'),
+          'input-strong': color('--color-border-input-strong'),
         },
         accent: {
           DEFAULT: color('--color-action-primary'),
@@ -109,6 +110,7 @@ export default {
           'tool-icon-surface': color('--color-connector-tool-icon-surface'),
           'tool-icon-border': color('--color-connector-tool-icon-border'),
           'add-hover-surface': color('--color-connector-add-hover-surface'),
+          'json-paste-surface': color('--color-connector-json-paste-surface'),
         },
         overlay: {
           'cron-dialog': color('--color-overlay-cron-dialog'),

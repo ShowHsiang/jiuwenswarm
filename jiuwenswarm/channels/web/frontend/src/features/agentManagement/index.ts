@@ -5,5 +5,8 @@ export * from './groupClient';
 export * from './port';
 export * from './state';
 export * from './upload';
+export * from './installOutcome';
 export * from './viewModel';
 export * from './presentation';
+export * from './selection';
+export * from './pendingInstallQueue';

@@ -11,353 +11,34 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
-from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
-from jiuwenswarm.common.schema.message import ReqMethod
-from jiuwenswarm.common.work_mode import (
-    DEFAULT_PROJECT_ID_CODE,
-    DEFAULT_PROJECT_ID_WORK,
-    DEFAULT_TUI_WORK_MODE,
+from agent_gateway.common.work_mode import (
     DEFAULT_WEB_WORK_MODE,
     is_default_project_id,
 )
+
+from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
+from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server.runtime.gateway_adapter.base import (
     GatewayAdapter,
     build_error_response,
 )
 from jiuwenswarm.server.runtime.session import project_store
-from jiuwenswarm.server.runtime.session.lifecycle import LifecycleError, projection as lifecycle_projection
-from jiuwenswarm.server.runtime.session.session_metadata import (
-    collect_all_sessions_metadata,
+from jiuwenswarm.server.runtime.session.lifecycle import LifecycleError
+from jiuwenswarm.server.control.store.project_queries import (
+    load_pinned_sessions as _load_pinned_sessions,
+    load_project_cron_sessions as _load_project_cron_sessions,
+    load_project_info as _load_project_info,
+    load_project_list as _load_project_list,
+    load_project_sessions as _load_project_sessions,
+    project_info_payload as _project_info_payload,
+    resolve_cron_binding as _resolve_cron_binding,
 )
-from jiuwenswarm.server.runtime.session.session_info import to_session_info
+from jiuwenswarm.server.runtime.session.session_metadata import collect_all_sessions_metadata
 from jiuwenswarm.server.runtime.session.work_mode import resolve_request_work_mode
 
 logger = logging.getLogger(__name__)
-
-
-def _attribute_session_project(
-    metadata: dict[str, Any], visible_project_ids: set[str]
-) -> str:
-    """Return the visible project ID, or the matching virtual default project."""
-    project_id = str(metadata.get("project_id") or "")
-    if project_id and project_id in visible_project_ids:
-        return project_id
-    return (
-        DEFAULT_PROJECT_ID_CODE
-        if str(metadata.get("work_mode") or "") == DEFAULT_TUI_WORK_MODE
-        else DEFAULT_PROJECT_ID_WORK
-    )
-
-
-def _project_info_payload(
-    project: Any | None,
-    *,
-    default_id: str | None = None,
-    stats: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Serialize project.info exactly like the existing Web contract."""
-    statistics = stats or {
-        "session_count": 0,
-        "last_message_at": None,
-        "last_user_message_at": None,
-    }
-    git_defaults = {
-        "enabled": False,
-        "repo_root": "",
-        "initialized_by_jiuwenswarm": False,
-        "detected_at": 0,
-        "status": "disabled",
-        "branch": "",
-        "error": "",
-        "error_code": "",
-        "hint": "",
-        "is_dirty": False,
-    }
-    raw_git = getattr(project, "git", {}) if project is not None else {}
-    git = {**git_defaults, **dict(raw_git)} if isinstance(raw_git, dict) and raw_git else git_defaults
-    if default_id is not None:
-        return {
-            "project_id": default_id,
-            "name": "默认项目",
-            "project_dir": "",
-            "pinned": False,
-            "pin_order": 0,
-            "is_default": True,
-            "lifecycle_operation": None,
-            "execution_blocked": False,
-            "stop_pending": False,
-            "work_mode": (
-                DEFAULT_TUI_WORK_MODE
-                if default_id == DEFAULT_PROJECT_ID_CODE
-                else DEFAULT_WEB_WORK_MODE
-            ),
-            "git": git,
-            "session_count": statistics["session_count"],
-            "last_message_at": statistics["last_message_at"],
-            "last_user_message_at": statistics["last_user_message_at"],
-            "created_at": 0,
-            "updated_at": 0,
-        }
-    return {
-        "project_id": project.project_id,
-        "name": project.name,
-        "project_dir": project.project_dir,
-        "pinned": project.pinned,
-        "pin_order": project.pin_order,
-        "is_default": False,
-        **lifecycle_projection("project", project.project_id),
-        "work_mode": getattr(project, "work_mode", "") or DEFAULT_WEB_WORK_MODE,
-        "git": git,
-        "session_count": statistics["session_count"],
-        "last_message_at": statistics["last_message_at"],
-        "last_user_message_at": statistics["last_user_message_at"],
-        "created_at": project.created_at,
-        "updated_at": getattr(project, "updated_at", 0),
-    }
-
-
-def _load_project_info(params: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    project_id = str(params.get("project_id") or "").strip()
-    if not project_id:
-        return None, "project_id is required", "BAD_REQUEST"
-
-    all_projects = project_store.list_projects(include_hidden=True, cache_bust=True)
-    visible_project_ids = {project.project_id for project in all_projects}
-    stats: dict[str, Any] = {
-        "session_count": 0,
-        "last_message_at": None,
-        "last_user_message_at": None,
-    }
-    for session in collect_all_sessions_metadata():
-        if session.get("channel_id") != "web" or session.get("pinned") or session.get("cron_id"):
-            continue
-        if _attribute_session_project(session, visible_project_ids) != project_id:
-            continue
-        stats["session_count"] += 1
-        for key in ("last_message_at", "last_user_message_at"):
-            value = session.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if stats[key] is None or value > stats[key]:
-                    stats[key] = value
-
-    if is_default_project_id(project_id):
-        info = _project_info_payload(None, default_id=project_id, stats=stats)
-        return {"project": info, **info}, None, None
-
-    project = project_store.get_project_by_id(project_id, cache_bust=True)
-    if project is None:
-        return None, "project not found", "NOT_FOUND"
-    info = _project_info_payload(project, stats=stats)
-    return {"project": info, **info}, None, None
-
-
-def _load_pinned_sessions() -> dict[str, Any]:
-    """Return the Web projection of pinned sessions from this user's directory."""
-    sessions = collect_all_sessions_metadata()
-    pinned = [
-        session
-        for session in sessions
-        if session.get("pinned") and session.get("channel_id") == "web"
-    ]
-    pinned.sort(key=lambda session: int(session.get("pin_order", 0) or 0))
-    return {"sessions": [to_session_info(session) for session in pinned]}
-
-
-def _resolve_cron_binding(
-    params: dict[str, Any], channel_id: str
-) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    """Resolve a cron project against this AgentServer's injected directory."""
-    work_mode, error = resolve_request_work_mode(params, channel_id=channel_id or "web")
-    if error is not None:
-        return None, f"invalid work_mode: {params.get('work_mode')!r}", "BAD_REQUEST"
-    binding = project_store.resolve_cron_project_binding(
-        params.get("project_id"), params.get("project_dir"), work_mode,
-    )
-    if binding.error is not None:
-        return None, binding.error, binding.code or "BAD_REQUEST"
-    return {
-        "project_id": binding.project_id,
-        "work_mode": binding.work_mode,
-    }, None, None
-
-
-def _parse_page(params: dict[str, Any]) -> tuple[int | None, int]:
-    """Preserve the Web handler's permissive pagination parsing."""
-    raw_limit = params.get("limit")
-    limit: int | None = None
-    if isinstance(raw_limit, int) and not isinstance(raw_limit, bool):
-        limit = raw_limit
-    elif isinstance(raw_limit, float) and raw_limit.is_integer():
-        limit = int(raw_limit)
-    elif isinstance(raw_limit, str) and raw_limit.strip().isdigit():
-        limit = int(raw_limit.strip())
-    raw_offset = params.get("offset")
-    offset = 0
-    if isinstance(raw_offset, int) and not isinstance(raw_offset, bool):
-        offset = raw_offset
-    elif isinstance(raw_offset, float) and raw_offset.is_integer():
-        offset = int(raw_offset)
-    elif isinstance(raw_offset, str) and raw_offset.strip().isdigit():
-        offset = int(raw_offset.strip())
-    return (max(1, limit) if limit is not None else None), max(0, offset)
-
-
-def _load_project_sessions(
-    params: dict[str, Any], _user_id: str
-) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    project_id = str(params.get("project_id") or "").strip()
-    if not project_id:
-        return None, "project_id is required", "BAD_REQUEST"
-    limit, offset = _parse_page(params)
-    all_projects = project_store.list_projects(include_hidden=True, cache_bust=True)
-    visible_project_ids = {project.project_id for project in all_projects}
-    if not is_default_project_id(project_id):
-        project = project_store.get_project_by_id(project_id, cache_bust=True)
-        if project is None:
-            return None, "project not found", "NOT_FOUND"
-
-    matched: list[dict[str, Any]] = []
-    for session in collect_all_sessions_metadata():
-        if session.get("pinned") or session.get("cron_id") or session.get("channel_id") != "web":
-            continue
-        if _attribute_session_project(session, visible_project_ids) != project_id:
-            continue
-        matched.append(session)
-    matched.sort(
-        key=lambda session: (
-            float(session["last_user_message_at"])
-            if isinstance(session.get("last_user_message_at"), (int, float))
-            and not isinstance(session.get("last_user_message_at"), bool)
-            else 0.0
-        ),
-        reverse=True,
-    )
-    total = len(matched)
-    page = matched[offset:offset + limit] if limit is not None else matched[offset:]
-    return {
-        "sessions": [to_session_info(session) for session in page],
-        "total": total,
-    }, None, None
-
-
-def _load_project_cron_sessions(
-    params: dict[str, Any], _user_id: str
-) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    """Return cron execution sessions from this AgentServer's user directory."""
-    project_id = str(params.get("project_id") or "").strip()
-    if not project_id:
-        return None, "project_id is required", "BAD_REQUEST"
-    cron_id = str(params.get("cron_id") or "").strip()
-    limit, offset = _parse_page(params)
-    all_projects = project_store.list_projects(include_hidden=True, cache_bust=True)
-    visible_project_ids = {project.project_id for project in all_projects}
-    if not is_default_project_id(project_id):
-        project = project_store.get_project_by_id(project_id, cache_bust=True)
-        if project is None:
-            return None, "project not found", "NOT_FOUND"
-    matched: list[dict[str, Any]] = []
-    for session in collect_all_sessions_metadata():
-        if session.get("pinned") or not session.get("cron_id"):
-            continue
-        if _attribute_session_project(session, visible_project_ids) != project_id:
-            continue
-        if cron_id and session.get("cron_id") != cron_id:
-            continue
-        matched.append(session)
-    matched.sort(
-        key=lambda session: (
-            float(session["last_user_message_at"])
-            if isinstance(session.get("last_user_message_at"), (int, float))
-            and not isinstance(session.get("last_user_message_at"), bool)
-            else 0.0
-        ),
-        reverse=True,
-    )
-    total = len(matched)
-    page = matched[offset:offset + limit] if limit is not None else matched[offset:]
-    return {
-        "sessions": [to_session_info(session) for session in page],
-        "total": total,
-    }, None, None
-
-
-def _load_project_list(
-    params: dict[str, Any]
-) -> tuple[dict[str, Any] | None, str | None, str | None]:
-    """Build the existing Web project-list view in the injected directory."""
-    filter_value = str(params.get("filter") or "all").strip() or "all"
-    if filter_value not in {"all", "pinned", "unpinned"}:
-        filter_value = "all"
-    raw_work_mode = params.get("work_mode")
-    work_mode: str | None = None
-    if isinstance(raw_work_mode, str) and raw_work_mode.strip():
-        candidate = raw_work_mode.strip().lower()
-        if candidate not in {DEFAULT_WEB_WORK_MODE, DEFAULT_TUI_WORK_MODE}:
-            return None, f"invalid work_mode: {candidate!r}, must be 'code' or 'work'", "BAD_REQUEST"
-        work_mode = candidate
-
-    all_projects = project_store.list_projects(include_hidden=True, cache_bust=True)
-    projects = [p for p in all_projects if work_mode is None or (p.work_mode or DEFAULT_WEB_WORK_MODE) == work_mode]
-    visible_project_ids = {project.project_id for project in all_projects}
-    stats: dict[str, dict[str, Any]] = {}
-
-    def stats_for(project_id: str) -> dict[str, Any]:
-        return stats.setdefault(
-            project_id,
-            {"session_count": 0, "last_message_at": None, "last_user_message_at": None},
-        )
-
-    for session in collect_all_sessions_metadata():
-        if session.get("channel_id") != "web" or session.get("pinned") or session.get("cron_id"):
-            continue
-        entry = stats_for(_attribute_session_project(session, visible_project_ids))
-        entry["session_count"] += 1
-        for key in ("last_message_at", "last_user_message_at"):
-            value = session.get(key)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if entry[key] is None or value > entry[key]:
-                    entry[key] = value
-
-    zero = {"session_count": 0, "last_message_at": None, "last_user_message_at": None}
-
-    def item(project: Any | None, default_id: str | None = None) -> dict[str, Any]:
-        if default_id is not None:
-            return _project_info_payload(None, default_id=default_id, stats=stats.get(default_id, zero))
-        return _project_info_payload(
-            project,
-            stats=stats.get(project.project_id, zero),
-        )
-
-    default_ids: list[str] = []
-    if work_mode in (None, DEFAULT_WEB_WORK_MODE):
-        default_ids.append(DEFAULT_PROJECT_ID_WORK)
-    if work_mode in (None, DEFAULT_TUI_WORK_MODE):
-        default_ids.append(DEFAULT_PROJECT_ID_CODE)
-    default_items = [item(None, default_id) for default_id in default_ids]
-
-    def user_sort(info: dict[str, Any]) -> float:
-        value = info["last_user_message_at"]
-        return (
-            float(value)
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-            else 0.0
-        )
-    if filter_value == "pinned":
-        result = [item(project) for project in projects if project.pinned]
-        result.sort(key=lambda info: info["pin_order"])
-    elif filter_value == "unpinned":
-        result = [item(p) for p in projects if not p.pinned]
-        result.sort(key=user_sort, reverse=True)
-        result.extend(default_items)
-    else:
-        pinned = [item(project) for project in projects if project.pinned]
-        pinned.sort(key=lambda info: info["pin_order"])
-        unpinned = [item(p) for p in projects if not p.pinned]
-        unpinned.sort(key=user_sort, reverse=True)
-        result = pinned + unpinned + default_items
-    return {"projects": result}, None, None
 
 
 def _rename_project(
@@ -398,7 +79,7 @@ def _pin_project(
     if is_default_project_id(project_id):
         return None, "default project cannot be pinned", "FORBIDDEN"
     project = project_store.get_project_by_id(project_id, cache_bust=True)
-    if project is None:
+    if project is None or project.hidden:
         return None, "project not found", "NOT_FOUND"
     project.pinned = pinned
     if not pinned:
@@ -474,6 +155,281 @@ def _create_project(
         "work_mode": project.work_mode or DEFAULT_WEB_WORK_MODE,
         "git": info["git"],
         "project": info,
+    }, None, None
+
+
+def _count_project_conversations(project_id: str) -> int:
+    """Count the active Web conversations a project remove/restore moves.
+
+    ``collect_all_sessions_metadata`` already excludes archived sessions, so
+    this is exactly the set that disappears from the workspace when the project
+    is removed and comes back when it is restored; archived sessions stay in
+    the archive page either way.  Pinned conversations are counted because
+    removal hides those too, keeping their ``pinned`` flag for the restore.
+    Cron execution sessions are excluded, as in every other conversation count
+    in this module.
+    """
+    return _project_conversation_state(project_id)[0]
+
+
+def _project_conversation_state(
+    project_id: str, runtime: Any = None, *, ignore_heartbeats: bool = False,
+) -> tuple[int, list[str]]:
+    """Count Web conversations and check all channels for running sessions.
+
+    与会话删除/归档共用 Runtime 的执行判定：空闲团队和常驻响应流不算 busy。
+
+    ``ignore_heartbeats`` 把后台 Heartbeat 执行排除在读之外,回答"停掉心跳后
+    本会话是否仍在跑"。预检用它,避免把即将被停掉的心跳读成阻塞项。
+    """
+    count = 0
+    busy: list[str] = []
+    for session in collect_all_sessions_metadata():
+        session_id = str(session.get("session_id") or "")
+        if session.get("cron_id") or session_id.startswith("cron_"):
+            continue
+        if str(session.get("project_id") or "") != project_id:
+            continue
+        if session.get("channel_id") == "web":
+            count += 1
+        if runtime is None:
+            continue
+        if not session_id or not runtime.is_session_running(
+            session_id, ignore_heartbeats=ignore_heartbeats
+        ):
+            continue
+        busy.append(session_id)
+    return count, busy
+
+
+def _project_running_sessions(project_id: str, runtime: Any) -> list[str]:
+    """Sessions that still own work when a project is removed.
+
+    Removal is accepted first; these sessions are stopped in the background.
+    Heartbeat sessions are excluded from ``collect_all_sessions_metadata``, so
+    they are added from the admission controller and filtered by project.
+    """
+    if runtime is None or not project_id:
+        return []
+    sessions = list(
+        _project_conversation_state(
+            project_id, runtime, ignore_heartbeats=False
+        )[1]
+    )
+    controller = getattr(runtime, "_admission_controller", None)
+    active = getattr(controller, "active_heartbeat_sessions", None)
+    if not callable(active):
+        return sessions
+    from jiuwenswarm.server.runtime.session import lifecycle as lc
+
+    for session_id in list(active() or ()):
+        if session_id in sessions:
+            continue
+        try:
+            meta = lc.raw_metadata(session_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if str(meta.get("project_id") or "") == project_id:
+            sessions.append(session_id)
+    return sessions
+
+
+def _project_stop_snapshot(
+    project_id: str, runtime: Any
+) -> list[tuple[str, str, int | None]]:
+    """Capture (session, channel, generation) before the project is hidden."""
+    if runtime is None or not project_id:
+        return []
+    from jiuwenswarm.server.runtime.session import lifecycle as lc
+
+    coordinator = getattr(runtime, "_session_coordinator", None)
+    snapshot: list[tuple[str, str, int | None]] = []
+    for session_id in _project_running_sessions(project_id, runtime):
+        try:
+            meta = lc.raw_metadata(session_id)
+        except Exception:  # noqa: BLE001
+            meta = {}
+        channel_id = str(meta.get("channel_id") or "")
+        generation: int | None = None
+        probe = getattr(coordinator, "snapshot_session", None)
+        if callable(probe):
+            try:
+                generation = getattr(probe(session_id), "generation", None)
+            except Exception:  # noqa: BLE001
+                generation = None
+        snapshot.append((session_id, channel_id, generation))
+    return snapshot
+
+
+# Project removal starts a best-effort stop after the project is hidden.  It is
+# not a durable operation: a restart simply forgets these sessions, which are
+# already invisible and will be stopped on their next lifecycle action.
+_PROJECT_STOP_TASKS: set[asyncio.Task] = set()
+_PROJECT_STOP_MAX_ATTEMPTS = 2
+_PROJECT_STOP_BACKOFF_SECONDS = (5.0, 30.0)
+
+
+def _schedule_project_stop(
+    runtime: Any,
+    snapshot: list[tuple[str, str, int | None]],
+    project_id: str,
+) -> None:
+    if runtime is None or not project_id:
+        return
+    try:
+        task = asyncio.create_task(
+            _stop_project_sessions(runtime, snapshot, project_id)
+        )
+    except RuntimeError:
+        logger.debug("[ProjectAdapter] no running loop for project stop task")
+        return
+    _PROJECT_STOP_TASKS.add(task)
+    task.add_done_callback(_PROJECT_STOP_TASKS.discard)
+
+
+async def _stop_project_sessions(
+    runtime: Any,
+    snapshot: list[tuple[str, str, int | None]],
+    project_id: str,
+) -> None:
+    """Stop removed-project sessions with a fixed, small retry budget."""
+    # Best-effort second snapshot: a turn admitted just after the pre-hide
+    # snapshot would otherwise never be stopped.  Existing entries keep the
+    # generation captured before hiding, so a Session reopened after a project
+    # restore is never stopped by the stale removal intent.
+    merged = {sid: (sid, channel, generation) for sid, channel, generation in snapshot}
+    try:
+        project = await asyncio.to_thread(
+            project_store.get_project_by_id, project_id, cache_bust=True
+        )
+    except Exception:  # noqa: BLE001
+        project = None
+    if project is None or project.hidden:
+        try:
+            refreshed = await asyncio.to_thread(
+                _project_stop_snapshot, project_id, runtime
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[ProjectAdapter] project stop rescan failed: project_id=%s",
+                project_id,
+                exc_info=True,
+            )
+            refreshed = []
+        for sid, channel, generation in refreshed:
+            # Never overwrite a pre-hide generation: a newer one belongs to a
+            # runtime created after the project was restored.
+            merged.setdefault(sid, (sid, channel, generation))
+    else:
+        logger.debug(
+            "[ProjectAdapter] project restored before cleanup; not expanding "
+            "stop set: project_id=%s",
+            project_id,
+        )
+    snapshot = list(merged.values())
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def _one(
+        session_id: str, channel_id: str, generation: int | None
+    ) -> None:
+        async with semaphore:
+            for attempt in range(1, _PROJECT_STOP_MAX_ATTEMPTS + 1):
+                try:
+                    await runtime.stop_session_for_lifecycle(
+                        channel_id=channel_id,
+                        session_id=session_id,
+                        generation=generation,
+                        # The project is hidden, not permanently deleted: stop
+                        # the Team Runner instead of deferring it to a delete.
+                        stop_runner=True,
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    if attempt >= _PROJECT_STOP_MAX_ATTEMPTS:
+                        logger.warning(
+                            "[ProjectAdapter] giving up on session stop after "
+                            "project removal: session_id=%s attempts=%d",
+                            session_id,
+                            attempt,
+                            exc_info=True,
+                        )
+                        return
+                    await asyncio.sleep(
+                        _PROJECT_STOP_BACKOFF_SECONDS[attempt - 1]
+                    )
+
+    await asyncio.gather(
+        *(_one(sid, channel, gen) for sid, channel, gen in snapshot)
+    )
+
+
+def _remove_project(
+    params: dict[str, Any],
+    runtime: Any = None,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Hide a project, reporting how many active conversations it takes with it.
+
+    Running conversations no longer block removal: the project is hidden
+    immediately and its live sessions are stopped in the background.
+    """
+    project_id = str(params.get("project_id") or "").strip()
+    if not project_id:
+        return None, "project_id is required", "BAD_REQUEST"
+    if is_default_project_id(project_id):
+        return None, "default project cannot be removed", "FORBIDDEN"
+    project = project_store.get_project_by_id(project_id, cache_bust=True)
+    if project is None:
+        return None, "project not found", "NOT_FOUND"
+    if project.hidden:
+        return {"project_id": project_id, "hidden": True, "affected_sessions": 0}, None, None
+
+    affected, _busy = _project_conversation_state(project_id, runtime)
+
+    hidden = project_store.hide_project(project_id)
+    if hidden is None:
+        return {"project_id": project_id, "hidden": True, "affected_sessions": 0}, None, None
+    project_store.reindex_project_pin_orders()
+    return {
+        "project_id": project_id,
+        "hidden": True,
+        "affected_sessions": affected,
+    }, None, None
+
+
+def _restore_project(
+    params: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """Restore a hidden project, reporting how many conversations come back."""
+    project_id = str(params.get("project_id") or "").strip()
+    if not project_id:
+        return None, "project_id is required", "BAD_REQUEST"
+    if is_default_project_id(project_id):
+        return None, "default project cannot be restored", "FORBIDDEN"
+    project = project_store.get_project_by_id(project_id, cache_bust=True)
+    if project is None:
+        return None, "project not found", "NOT_FOUND"
+    if not project.hidden:
+        return None, "project is not hidden", "CONFLICT"
+
+    affected = _count_project_conversations(project_id)
+    try:
+        restored = project_store.restore_project(project_id)
+    except project_store.ProjectNameConflict:
+        # 与撤销归档的连带恢复(session_archive._restore_hidden_project)同码,
+        # 前端用同一套 i18n 文案提示"先重命名占用方再重试"。
+        return (
+            None,
+            "a project with this name exists; rename it before restoring",
+            "PROJECT_NAME_CONFLICT",
+        )
+    if restored is None:
+        return None, "project is not hidden", "CONFLICT"
+    return {
+        "project_id": restored.project_id,
+        "restored": True,
+        "work_mode": restored.work_mode or DEFAULT_WEB_WORK_MODE,
+        "affected_sessions": affected,
     }, None, None
 
 
@@ -1300,6 +1256,12 @@ async def _run_threaded(
 class ProjectAdapter(GatewayAdapter):
     """Project-domain adapter: project/git CRUD, diff status, session queries."""
 
+    def __init__(self, runtime_probe: Callable[[], Any] | None = None) -> None:
+        # project.remove 的 busy 扫描要读 AgentRuntime 的会话执行状态。
+        # 传探针而非实例:agent_manager 重建后 _execution_runtime 会换新实例,
+        # 每次移除时探针总能取到当前 runtime。
+        self._runtime_probe = runtime_probe
+
     methods: frozenset[str] = frozenset(
         {
             ReqMethod.PROJECT_INFO.value,
@@ -1307,10 +1269,13 @@ class ProjectAdapter(GatewayAdapter):
             ReqMethod.PROJECT_GET_SESSIONS.value,
             ReqMethod.PROJECT_GET_CRON_SESSIONS.value,
             ReqMethod.PROJECT_CRON_RESOLVE_BINDING.value,
+            ReqMethod.PROJECT_LIFECYCLE.value,
             ReqMethod.PROJECT_LIST.value,
             ReqMethod.PROJECT_CREATE.value,
             ReqMethod.PROJECT_RENAME.value,
             ReqMethod.PROJECT_PIN.value,
+            ReqMethod.PROJECT_REMOVE.value,
+            ReqMethod.PROJECT_RESTORE.value,
             ReqMethod.PROJECT_GIT_STATUS.value,
             ReqMethod.PROJECT_GIT_PROBE.value,
             ReqMethod.PROJECT_GIT_INIT.value,
@@ -1330,7 +1295,8 @@ class ProjectAdapter(GatewayAdapter):
         method = request.req_method
         params = _request_params(request)
         if method not in {ReqMethod.PROJECT_LIST, ReqMethod.PROJECT_INFO, ReqMethod.PROJECT_PINNED_SESSIONS,
-                          ReqMethod.PROJECT_GET_SESSIONS, ReqMethod.PROJECT_GET_CRON_SESSIONS}:
+                          ReqMethod.PROJECT_GET_SESSIONS, ReqMethod.PROJECT_GET_CRON_SESSIONS,
+                          ReqMethod.PROJECT_LIFECYCLE}:
             from jiuwenswarm.server.runtime.session.lifecycle import guard
             try:
                 guard(project_id=str(params.get("project_id") or ""))
@@ -1394,6 +1360,41 @@ class ProjectAdapter(GatewayAdapter):
             return await _run_threaded(
                 request, "project.create", _create_project, params, request.channel_id,
             )
+        if method == ReqMethod.PROJECT_REMOVE:
+            runtime = self._runtime_probe() if self._runtime_probe is not None else None
+            project_id = str(params.get("project_id") or "").strip()
+            # Snapshot before hiding: the removal response must not wait for
+            # these sessions, and new work must not join the stop set.  The
+            # scan reads every session's metadata, so it must leave the event
+            # loop; a failed scan degrades to the post-hide rescan instead of
+            # blocking a removal the user already asked for.
+            try:
+                stop_snapshot = await asyncio.to_thread(
+                    _project_stop_snapshot, project_id, runtime
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[ProjectAdapter] project stop snapshot failed; removal "
+                    "proceeds: project_id=%s",
+                    project_id,
+                    exc_info=True,
+                )
+                stop_snapshot = []
+            response = await _run_threaded(
+                request, "project.remove", _remove_project, params,
+                runtime=runtime,
+            )
+            if response.ok:
+                _schedule_project_stop(runtime, stop_snapshot, project_id)
+                if isinstance(response.payload, dict):
+                    # The Gateway owns the client-visible busy cache; hand it
+                    # the sessions this removal stops so it can clear them.
+                    response.payload["stopped_sessions"] = [
+                        session_id for session_id, _channel, _generation in stop_snapshot
+                    ]
+            return response
+        if method == ReqMethod.PROJECT_RESTORE:
+            return await _run_threaded(request, "project.restore", _restore_project, params)
         if method == ReqMethod.PROJECT_PINNED_SESSIONS:
             return await _run_threaded(
                 request, "project.pinned_sessions", _load_pinned_sessions,
@@ -1413,6 +1414,28 @@ class ProjectAdapter(GatewayAdapter):
             return await _run_threaded(
                 request, "project.cron.resolve_binding", _resolve_cron_binding,
                 params, request.channel_id,
+            )
+        if method == ReqMethod.PROJECT_LIFECYCLE:
+            from jiuwenswarm.server.runtime.session.lifecycle import (
+                events_feed,
+                inventory_feed,
+                project_admission_snapshot,
+            )
+
+            # 与 WS ``_handle_lifecycle_request`` 同契约：events / inventory
+            # 无 project_id；单项目准入才走 project_admission_snapshot。
+            if params.get("events"):
+                return await _run_threaded(
+                    request, "project.lifecycle", events_feed, result_mode="plain",
+                )
+            if params.get("inventory"):
+                return await _run_threaded(
+                    request, "project.lifecycle", inventory_feed, result_mode="plain",
+                )
+            return await _run_threaded(
+                request, "project.lifecycle", project_admission_snapshot,
+                str(params.get("project_id") or ""),
+                result_mode="plain",
             )
         if method == ReqMethod.PROJECT_INFO:
             return await _run_threaded(request, "project.info", _load_project_info, params)

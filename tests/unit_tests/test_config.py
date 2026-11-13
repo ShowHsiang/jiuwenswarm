@@ -3,13 +3,19 @@
 """Unit tests for config module."""
 
 import math
+import os
+import subprocess
+import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 # TEST ONLY: new URL fixtures use RFC-reserved domains; provider URLs are compared
 # only as configuration strings. These tests do not open sockets.
 
+import portalocker
 import pytest
 import yaml
 
@@ -27,30 +33,181 @@ from jiuwenswarm.common.config import (
     get_ttse_embedding_config,
     get_ttse_enabled,
     migrate_config_from_template,
+    prune_external_cli_path_histories_in_config,
     replace_teams_in_config,
     reset_external_cli_agents_in_config,
     resolve_sandbox_enabled,
     resolve_env_vars,
     update_external_cli_agents_in_config,
+    update_external_cli_path_histories_in_config,
     update_sandbox_runtime,
     update_permissions_profile_in_config,
     update_skill_retrieval_in_config,
     update_setup_guide_enabled_in_config,
     update_xiaoyi_runtime_in_config,
 )
-from jiuwenswarm.symphony import config as symphony_config_module
+from jiuwenswarm.common import symphony_config as symphony_config_module
+
+
+def test_config_refreshes_same_version_build_date_and_preserves_user_values(tmp_path, monkeypatch):
+    from jiuwenswarm.common import version
+
+    monkeypatch.setattr(version, "get_runtime_version", lambda: "0.2.8.dev20261026")
+    monkeypatch.setattr(version, "get_runtime_build_date", lambda: "2026-10-26")
+    template = tmp_path / "template.yaml"
+    config = tmp_path / "config.yaml"
+    template.write_text('config_version: ""\nsetting: default\nnew_option: true\n', encoding="utf-8")
+    config.write_text('# Keep this comment\nconfig_version: "0.2.8.dev20261026 · 2026-10-20"\nsetting: custom\n', encoding="utf-8")
+
+    assert migrate_config_from_template(template, config) is True
+    migrated = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert migrated["config_version"] == "0.2.8.dev20261026 · 2026-10-26"
+    assert migrated["new_option"] is True
+    assert migrated["setting"] == "custom"
+    assert "app_version" not in migrated
+    assert "build_date" not in migrated
+    assert "# Keep this comment" in config.read_text(encoding="utf-8")
+    assert migrate_config_from_template(template, config) is False
+
+    monkeypatch.setattr(version, "get_runtime_build_date", lambda: "")
+    assert migrate_config_from_template(template, config) is True
+    assert yaml.safe_load(config.read_text(encoding="utf-8"))["config_version"] == "0.2.8.dev20261026"
+
+
+def test_config_refreshes_same_version_build_date_and_preserves_user_values(tmp_path, monkeypatch):
+    from jiuwenswarm.common import version
+
+    monkeypatch.setattr(version, "get_runtime_version", lambda: "0.2.8.dev20261026")
+    monkeypatch.setattr(version, "get_runtime_build_date", lambda: "2026-10-26")
+    template = tmp_path / "template.yaml"
+    config = tmp_path / "config.yaml"
+    template.write_text('config_version: ""\nsetting: default\nnew_option: true\n', encoding="utf-8")
+    config.write_text('# Keep this comment\nconfig_version: "0.2.8.dev20261026 · 2026-10-20"\nsetting: custom\n', encoding="utf-8")
+
+    assert migrate_config_from_template(template, config) is True
+    migrated = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert migrated["config_version"] == "0.2.8.dev20261026 · 2026-10-26"
+    assert migrated["new_option"] is True
+    assert migrated["setting"] == "custom"
+    assert "app_version" not in migrated
+    assert "build_date" not in migrated
+    assert "# Keep this comment" in config.read_text(encoding="utf-8")
+    assert migrate_config_from_template(template, config) is False
+
+    monkeypatch.setattr(version, "get_runtime_build_date", lambda: "")
+    assert migrate_config_from_template(template, config) is True
+    assert yaml.safe_load(config.read_text(encoding="utf-8"))["config_version"] == "0.2.8.dev20261026"
+
+
+@pytest.mark.parametrize(
+    ("team", "extensions", "expected_dir"),
+    [
+        pytest.param({}, None, "${EXTENSION_DIRS:-jiuwenswarm/extensions}", id="local-default"),
+        pytest.param(
+            {"runtime": {"mode": "local"}, "transport": {"type": "inprocess"}},
+            None,
+            "${EXTENSION_DIRS:-jiuwenswarm/extensions}",
+            id="explicit-local",
+        ),
+        pytest.param({}, {"extension_dirs": ""}, "", id="explicit-empty"),
+        pytest.param({}, {"extension_dirs": "${EXTENSION_DIRS:-}"}, "${EXTENSION_DIRS:-}", id="legacy-empty"),
+        pytest.param({"runtime": {"mode": "distributed"}}, None, None, id="distributed-mode"),
+        pytest.param({"transport": {"type": "pyzmq"}}, None, None, id="distributed-transport"),
+        pytest.param({"transport": {"type": "${DUPLEX_TEST_TRANSPORT:-inprocess}"}}, None, None, id="env-transport"),
+        pytest.param({"runtime": None}, None, None, id="unknown-runtime"),
+        pytest.param({"runtime": {"mode": "unknown"}}, None, None, id="unknown-mode"),
+    ],
+)
+def test_workswarm_extension_migration_only_recovers_known_local_config(tmp_path, team, extensions, expected_dir):
+    template = Path(__file__).resolve().parents[2] / "jiuwenswarm" / "resources" / "config.yaml"
+    config = tmp_path / "config.yaml"
+    user_config = {"extensions": extensions}
+    if team:
+        user_config["team"] = team
+    config.write_text(yaml.safe_dump(user_config), encoding="utf-8")
+
+    assert migrate_config_from_template(template, config)
+    migrated = yaml.safe_load(config.read_text(encoding="utf-8"))
+    expected_extensions = None if expected_dir is None else {"extension_dirs": expected_dir}
+    assert migrated["extensions"] == expected_extensions
+    assert not migrate_config_from_template(template, config)
+
+
+@pytest.mark.parametrize("launch", ["instance-dotenv", "--dotenv", "--name"])
+def test_extension_migration_preserves_null_when_dotenv_changes_in_child(tmp_path, monkeypatch, launch):
+    from jiuwenswarm import dotenv_early
+
+    for key in ("DUPLEX_TEST_TEAM_MODE", "DUPLEX_TEST_LATER"):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "")
+    monkeypatch.setenv("JIUWENSWARM_HOME", str(tmp_path))
+    monkeypatch.setattr(dotenv_early, "_parsed_dotenv", None)
+    monkeypatch.setattr(dotenv_early, "_component_name", "jiuwenswarm")
+    template = Path(__file__).resolve().parents[2] / "jiuwenswarm" / "resources" / "config.yaml"
+    workspace = tmp_path / "workspace"
+    config = workspace / "config" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    marker = "${DUPLEX_TEST_TEAM_MODE:-local}"
+    config.write_text(
+        yaml.safe_dump({"team": {"runtime": {"mode": marker}}, "extensions": None}),
+        encoding="utf-8",
+    )
+    dotenv_path = config.with_name(".env") if launch == "instance-dotenv" else workspace / ".env"
+    dotenv_path.write_text(
+        "DUPLEX_TEST_TEAM_MODE=${DUPLEX_TEST_LATER:-local}\nDUPLEX_TEST_LATER=distributed\n",
+        encoding="utf-8",
+    )
+
+    if launch != "instance-dotenv":
+        if launch == "--name":
+            registry = tmp_path / ".jiuwenswarm" / "instances.yaml"
+            registry.parent.mkdir()
+            registry.write_text(yaml.safe_dump({"instances": {"duplex": {"workspace": str(workspace)}}}), encoding="utf-8")
+        argument = "duplex" if launch == "--name" else str(dotenv_path)
+        monkeypatch.setattr(sys, "argv", ["jiuwenswarm-app", launch, argument])
+        assert dotenv_early.parse_dotenv_early("jiuwenswarm-app") == dotenv_path
+        assert resolve_env_vars(marker) == "local"
+
+    assert migrate_config_from_template(template, config)
+    migrated = yaml.safe_load(config.read_text(encoding="utf-8"))
+    if launch == "instance-dotenv":
+        assert "DUPLEX_TEST_TEAM_MODE" not in os.environ
+        dotenv_early.load_dotenv_runtime(dotenv_path, override=True)
+    assert resolve_env_vars(marker) == "local"
+
+    # The supervisor passes a named instance's resolved bootstrap file as --dotenv.
+    child_args = (
+        ["--dotenv", str(dotenv_path)] if launch != "instance-dotenv" else [str(dotenv_path)]
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys; from jiuwenswarm import dotenv_early; "
+            "dotenv_early.parse_dotenv_early('worker') if sys.argv[1] == '--dotenv' "
+            "else dotenv_early.load_dotenv_runtime(sys.argv[1], override=True); "
+            "assert os.environ['DUPLEX_TEST_TEAM_MODE'] == 'distributed'",
+            *child_args,
+        ],
+        cwd=template.parents[2],
+        check=True,
+        timeout=15,
+    )
+    assert migrated["extensions"] is None
+    assert migrated["team"]["runtime"]["mode"] == marker
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("evolution_enabled", [False, True])
-def test_symphony_evolution_requires_both_switches(
+def test_discovery_switch_does_not_require_hidden_symphony_switch(
     enabled: bool,
     evolution_enabled: bool,
 ) -> None:
     config = {
         "symphony": {"enabled": enabled, "evolution": {"enabled": evolution_enabled}}
     }
-    assert get_symphony_evolution_enabled(config) is (enabled and evolution_enabled)
+    assert get_symphony_evolution_enabled(config) is evolution_enabled
 
 
 @pytest.mark.parametrize("switch", ["symphony", "evolution"])
@@ -84,9 +241,11 @@ def test_symphony_evolution_switch_matches_full_parser(
     raw: dict[str, Any] = {"enabled": True, "evolution": {"enabled": True}}
     target = raw if switch == "symphony" else raw["evolution"]
     target["enabled"] = value
+    expected = True if switch == "symphony" else expected
     parsed = symphony_config_module.symphony_config_from_dict(raw)
     assert get_symphony_evolution_enabled({"symphony": raw}) is expected
-    assert expected is (parsed.enabled and parsed.evolution.enabled)
+    # enabled 已移到 evolution.flow 下；evolution 层的旧位置靠回退兼容
+    assert expected is (parsed.enabled and parsed.evolution.flow.enabled)
 
 
 @pytest.mark.parametrize("value", [None, {}, [], "invalid", True, 1])
@@ -120,7 +279,7 @@ def test_symphony_evolution_getter_reads_only_passed_switches(
     assert get_symphony_evolution_enabled(None) is False
     assert get_symphony_evolution_enabled({}) is False
     evolution_only = {"symphony": {"evolution": {"enabled": True}}}
-    assert get_symphony_evolution_enabled(evolution_only) is False
+    assert get_symphony_evolution_enabled(evolution_only) is True
     assert get_symphony_evolution_enabled({"symphony": {"enabled": True}}) is False
     enabled_config = {
         "symphony": {
@@ -131,6 +290,32 @@ def test_symphony_evolution_getter_reads_only_passed_switches(
         },
     }
     assert get_symphony_evolution_enabled(enabled_config) is True
+
+
+def test_saved_discovery_setting_controls_all_product_gates(temp_config_file, monkeypatch):
+    from jiuwenswarm.agents.harness.common.rails.symphony.skillpack_route import direct_route_mode
+    from jiuwenswarm.server.runtime.marketplace.skillpack_publish_config import skillpack_publish_profile
+    from jiuwenswarm.server.runtime.skill.skillpack_config import skillpack_productization_enabled
+
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+    monkeypatch.setattr(config_module, "get_config_file", lambda: temp_config_file)
+    monkeypatch.setenv("SKILLPACK_PRODUCTIZATION_ENABLED", "false")
+    monkeypatch.setenv("SKILLPACK_DIRECT_ROUTE_MODE", "off")
+    monkeypatch.setenv("SKILLPACK_HUB_TRANSPORT_PROFILE", "native_skillpack_v1")
+    monkeypatch.delenv("SKILLPACK_HUB_DEPLOYMENT_SCOPE", raising=False)
+
+    for enabled in [True, False, True]:
+        config_module.update_symphony_in_config({"evolution": {"flow": {"enabled": enabled}}})
+        saved = config_module.get_config()
+        assert get_symphony_evolution_enabled(saved) is enabled
+        assert skillpack_productization_enabled() is enabled
+        assert direct_route_mode(saved) == ("confirm" if enabled else "off")
+        if enabled:
+            assert skillpack_publish_profile() == "legacy_skill_v1"
+        else:
+            with pytest.raises(ValueError):
+                skillpack_publish_profile()
+        assert symphony_config_module.load_symphony_config(saved).enabled is enabled
 
 
 def test_configured_read_image_multimodal_preserves_explicit_value() -> None:
@@ -230,6 +415,148 @@ def test_reset_external_cli_agents_does_not_write_when_config_is_absent(
     )
 
     reset_external_cli_agents_in_config()
+
+
+def _write_team_config(path: Path, external_cli_agents: list[dict[str, Any]]) -> None:
+    """Write a config carrying one team with the given external CLI entries."""
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "modes": {
+                    "team": {
+                        "jiuwen_team": {
+                            "external_cli_agents": external_cli_agents,
+                            "external_transport": {
+                                "type": "hybrid",
+                                "params": {"external_publish_url": "ws://127.0.0.1:19000/ws"},
+                            },
+                        }
+                    }
+                }
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_external_cli_switch_keeps_the_configured_builtin_model_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    """Toggling CLI agents must not drop a catalog the switch payload cannot carry."""
+    catalog = [
+        {"name": "sonnet", "description": "daily", "efforts": ["low", "high"], "default_effort": "high"},
+        {"name": "haiku"},
+    ]
+    _write_team_config(temp_config_file, [{"cli_agent": "claude", "builtin_models": catalog}])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+
+    update_external_cli_agents_in_config(["claude", "codex"], publish_url="ws://127.0.0.1:19000/ws")
+
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    agents = {item["cli_agent"]: item for item in saved["modes"]["team"]["jiuwen_team"]["external_cli_agents"]}
+    assert agents["claude"]["builtin_models"] == catalog
+    assert "builtin_models" not in agents["codex"]
+
+
+def test_external_cli_builtin_models_are_normalized_and_validated(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    _write_team_config(temp_config_file, [])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+
+    update_external_cli_agents_in_config(
+        [{"cli_agent": "claude", "builtin_models": [{"name": " sonnet ", "efforts": ["low", " high "]}]}],
+    )
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    entry = saved["modes"]["team"]["jiuwen_team"]["external_cli_agents"][0]
+    assert entry["builtin_models"] == [{"name": "sonnet", "efforts": ["low", "high"]}]
+
+    with pytest.raises(ValueError, match="default_effort"):
+        update_external_cli_agents_in_config(
+            [{"cli_agent": "claude", "builtin_models": [{"name": "haiku", "default_effort": "low"}]}],
+        )
+    with pytest.raises(ValueError, match="name must be a non-empty string"):
+        update_external_cli_agents_in_config([{"cli_agent": "claude", "builtin_models": [{"efforts": ["low"]}]}])
+
+
+def test_external_cli_path_histories_keep_the_latest_window(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    """The capacity window must keep the tail: recent paths beat old ones."""
+    full_history = [f"/history/codex-{index}" for index in range(10)]
+    _write_team_config(temp_config_file, [])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+
+    update_external_cli_path_histories_in_config({"codex": [*full_history, "/just-replaced/codex"]})
+
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    histories = saved["modes"]["team"]["jiuwen_team"]["external_cli_path_histories"]
+    # The replaced path joined at the tail and must survive the cap.
+    assert histories["codex"] == [*full_history[1:], "/just-replaced/codex"]
+
+
+def test_prune_external_cli_path_histories_removes_only_the_intersection(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    """The prune drops only entries present in both the request and the disk."""
+    _write_team_config(temp_config_file, [])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+    update_external_cli_path_histories_in_config(
+        {
+            "codex": ["/gone/codex", "/kept/codex"],
+            "claude": ["/gone/codex", "/kept/claude"],
+        }
+    )
+
+    surviving = prune_external_cli_path_histories_in_config("codex", ["/gone/codex", "/unknown/codex"])
+
+    assert surviving == ["/kept/codex"]
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    histories = saved["modes"]["team"]["jiuwen_team"]["external_cli_path_histories"]
+    assert histories["codex"] == ["/kept/codex"]
+    # Other kinds keep their entries untouched.
+    assert histories["claude"] == ["/gone/codex", "/kept/claude"]
+
+
+def test_prune_external_cli_path_histories_survives_entries_appended_after_the_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    """A stale frontend snapshot must not roll back a concurrent save's append."""
+    _write_team_config(temp_config_file, [])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+
+    # What the frontend snapshot saw when it was taken.
+    update_external_cli_path_histories_in_config({"codex": ["/stale/codex"]})
+    # A concurrent save (e.g. a replaced cli_path) appends before the prune lands.
+    update_external_cli_path_histories_in_config({"codex": ["/stale/codex", "/just-replaced/codex"]})
+
+    surviving = prune_external_cli_path_histories_in_config("codex", ["/stale/codex"])
+
+    assert surviving == ["/just-replaced/codex"]
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    histories = saved["modes"]["team"]["jiuwen_team"]["external_cli_path_histories"]
+    assert histories["codex"] == ["/just-replaced/codex"]
+
+
+def test_prune_external_cli_path_histories_leaves_the_file_untouched_without_a_match(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_config_file: Path,
+) -> None:
+    _write_team_config(temp_config_file, [])
+    monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", temp_config_file)
+
+    surviving = prune_external_cli_path_histories_in_config("codex", ["/gone/codex"])
+
+    assert surviving == []
+    saved = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+    assert "external_cli_path_histories" not in saved["modes"]["team"]["jiuwen_team"]
 
 
 def test_config_migration_preserves_explicit_image_policy(tmp_path: Path) -> None:
@@ -1004,6 +1331,8 @@ symphony:
     ):
         monkeypatch.delenv("EVOLUTION_AUTO_SCAN", raising=False)
         monkeypatch.delenv("EVOLUTION_AUTO_SAVE", raising=False)
+        monkeypatch.setattr("jiuwenswarm.common.version.get_runtime_version", lambda: "0.2.8b1")
+        monkeypatch.setattr("jiuwenswarm.common.version.get_runtime_build_date", lambda: "2026-10-26")
         template_path = tmp_path / "template.yaml"
         user_config_path = tmp_path / "config.yaml"
         template_path.write_text(
@@ -1028,7 +1357,7 @@ react:
         # The user's canonical evolution values are already complete, so the
         # merge itself is a no-op. Migration still returns True because
         # migrate_config_from_template writes back the program config_version
-        # stamp (added before the diff check) whenever the file lacks it.
+        # stamp, which counts as a change, whenever the file lacks it.
         assert migrate_config_from_template(template_path, user_config_path) is True
 
         migrated = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
@@ -1037,9 +1366,7 @@ react:
             "auto_save": True,
         }
         # config_version is always stamped on a write-back path.
-        from jiuwenswarm.common._build_config import VERSION
-
-        assert migrated.get("config_version") == VERSION
+        assert migrated.get("config_version") == "0.2.8b1 · 2026-10-26"
         # A second migration now that the version stamp is present is a true
         # no-op: no structural changes, no version to write -> returns False.
         assert migrate_config_from_template(template_path, user_config_path) is False
@@ -1144,6 +1471,140 @@ react:
         assert ensure_config_migrated_from_template(workspace_dir) is False
 
     @staticmethod
+    @pytest.mark.parametrize(
+        "lock_error",
+        [TimeoutError("config write lock timed out"), portalocker.exceptions.LockException("lock busy")],
+    )
+    def test_ensure_config_migrated_from_template_skips_lock_timeout(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        lock_error: Exception,
+    ):
+        from jiuwenswarm.common.utils import ensure_config_migrated_from_template
+
+        template_path = tmp_path / "template.yaml"
+        template_path.write_text("new_option: true\n", encoding="utf-8")
+        workspace_dir = tmp_path / "workspace"
+        config_path = workspace_dir / "config" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        original_config = "user_value: keep\n"
+        config_path.write_text(original_config, encoding="utf-8")
+        monkeypatch.setattr(
+            "jiuwenswarm.common.utils._find_config_template_path",
+            lambda: template_path,
+        )
+
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            "jiuwenswarm.common.utils.logger.warning",
+            lambda message, error: warnings.append(message % error),
+        )
+
+        def raise_lock_error(*_args: Path) -> bool:
+            raise lock_error
+
+        monkeypatch.setattr(config_module, "migrate_config_from_template", raise_lock_error)
+        assert ensure_config_migrated_from_template(workspace_dir) is False
+        assert config_path.read_text(encoding="utf-8") == original_config
+        assert len(warnings) == 1
+        assert "获取配置写锁失败" in warnings[0]
+        monkeypatch.setattr(config_module, "migrate_config_from_template", migrate_config_from_template)
+        assert ensure_config_migrated_from_template(workspace_dir) is True
+        migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert migrated["user_value"] == "keep"
+        assert migrated["new_option"] is True
+
+    @staticmethod
+    def test_ensure_config_migrated_from_template_checks_current_version(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from jiuwenswarm.common.utils import ensure_config_migrated_from_template
+
+        monkeypatch.setattr("jiuwenswarm.common.version.get_runtime_version", lambda: "0.2.8b1")
+        monkeypatch.setattr("jiuwenswarm.common.version.get_runtime_build_date", lambda: "2026-10-26")
+        template_path = tmp_path / "template.yaml"
+        template_path.write_text(
+            "react:\n  answer_chunk_size: 500\n  new_option: true\n",
+            encoding="utf-8",
+        )
+        workspace_dir = tmp_path / "workspace"
+        config_path = workspace_dir / "config" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            'config_version: "0.2.8b1 · 2026-10-26"\nreact:\n  answer_chunk_size: 300\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "jiuwenswarm.common.utils._find_config_template_path",
+            lambda: template_path,
+        )
+
+        assert ensure_config_migrated_from_template(workspace_dir) is True
+        migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert migrated["react"] == {"answer_chunk_size": 300, "new_option": True}
+        assert migrated["config_version"] == "0.2.8b1 · 2026-10-26"
+        assert ensure_config_migrated_from_template(workspace_dir) is False
+
+    @staticmethod
+    def test_migrate_config_preserves_existing_old_defaults(tmp_path: Path):
+        template_path = tmp_path / "template.yaml"
+        config_path = tmp_path / "config.yaml"
+        template_path.write_text(
+            "symphony:\n  skill_retrieval:\n    enabled: false\n"
+            "gateway:\n  agentos:\n    wait_running_timeout_seconds: 90\n"
+            "channels:\n  xiaoyi:\n    send_file_allowed: false\n"
+            "new_option: true\n",
+            encoding="utf-8",
+        )
+        config_path.write_text(
+            "symphony:\n  skill_retrieval:\n    enabled: true\n"
+            "gateway:\n  agentos:\n    wait_running_timeout_seconds: 60\n"
+            "channels:\n  xiaoyi:\n    send_file_allowed: true\n",
+            encoding="utf-8",
+        )
+
+        assert migrate_config_from_template(template_path, config_path) is True
+        migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert migrated["symphony"]["skill_retrieval"]["enabled"] is True
+        assert migrated["gateway"]["agentos"]["wait_running_timeout_seconds"] == 60
+        assert migrated["channels"]["xiaoyi"]["send_file_allowed"] is True
+        assert migrated["new_option"] is True
+        assert migrate_config_from_template(template_path, config_path) is False
+
+    @staticmethod
+    def test_migrate_config_serializes_with_config_updates(
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        template_path = tmp_path / "template.yaml"
+        config_path = tmp_path / "config.yaml"
+        template_path.write_text("new_option: true\n", encoding="utf-8")
+        config_path.write_text("user_value: old\n", encoding="utf-8")
+        template_loaded = Event()
+        original_load = config_module.load_yaml_round_trip
+
+        def signal_template_load(path: Path):
+            loaded = original_load(path)
+            if path == template_path:
+                template_loaded.set()
+            return loaded
+
+        monkeypatch.setattr(config_module, "load_yaml_round_trip", signal_template_load)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with config_module.config_write_lock(config_path=config_path):
+                result = executor.submit(
+                    migrate_config_from_template, template_path, config_path
+                )
+                assert template_loaded.wait(timeout=5)
+                assert not result.done()
+                config_path.write_text("user_value: updated\n", encoding="utf-8")
+            assert result.result(timeout=5) is True
+        migrated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert migrated["user_value"] == "updated"
+        assert migrated["new_option"] is True
+
+    @staticmethod
     def test_migrate_config_moves_kv_cache_switch_to_application_scope(tmp_path: Path):
         template_path = tmp_path / "template.yaml"
         user_config_path = tmp_path / "config.yaml"
@@ -1186,6 +1647,190 @@ react:
         updated = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
         assert updated["kv_cache_affinity_config"]["enable_kv_cache_affinity"] is False
         assert "kv_cache_affinity_config" not in updated["react"]
+
+    @staticmethod
+    def test_migrate_config_from_template_keeps_user_only_keys(tmp_path: Path):
+        """User keys absent from the template must survive the merge.
+
+        The template is a sample document, not a schema: it ships open-ended
+        maps that exist to be filled in by the operator. Treating "absent from
+        template" as "deprecated" deleted live operator configuration.
+        """
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+
+        template_path.write_text(
+            """
+foo:
+  bar: false
+permissions:
+  owner_scopes: {}
+new_template_key: 1
+""",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            """
+foo:
+  bar: true
+  baz:
+    qux: xyzzy
+permissions:
+  owner_scopes:
+    corge:
+      grault: garply
+operator_only_top_level:
+  nested: value
+""",
+            encoding="utf-8",
+        )
+
+        assert migrate_config_from_template(template_path, user_config_path) is True
+
+        merged = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+        # Template addition arrived.
+        assert merged["new_template_key"] == 1
+        # User value wins over the template default.
+        assert merged["foo"]["bar"] is True
+        # Operator-only subtree nested inside a section the template ships
+        # survives, together with everything under it.
+        assert merged["foo"]["baz"]["qux"] == "xyzzy"
+        # Operator content inside a template-shipped open-ended map survives.
+        # ``permissions.owner_scopes`` ships as an empty map for the operator to
+        # fill in, so its contents are user data by construction.
+        assert merged["permissions"]["owner_scopes"]["corge"]["grault"] == "garply"
+        # Operator-only top-level subtree survives whole.
+        assert merged["operator_only_top_level"]["nested"] == "value"
+
+    @staticmethod
+    def test_migrate_config_from_template_keeps_user_only_keys_at_any_depth(
+        tmp_path: Path,
+    ):
+        """Survival must not depend on how deeply a key happens to be nested."""
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+
+        template_path.write_text(
+            """
+a:
+  b:
+    c:
+      d:
+        e:
+          template_leaf: 1
+""",
+            encoding="utf-8",
+        )
+        user_config_path.write_text(
+            """
+a:
+  op1: x
+  b:
+    op2: x
+    c:
+      op3: x
+      d:
+        op4: x
+        e:
+          op5: x
+""",
+            encoding="utf-8",
+        )
+
+        assert migrate_config_from_template(template_path, user_config_path) is True
+
+        merged = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
+        assert merged["a"]["op1"] == "x"
+        assert merged["a"]["b"]["op2"] == "x"
+        assert merged["a"]["b"]["c"]["op3"] == "x"
+        assert merged["a"]["b"]["c"]["d"]["op4"] == "x"
+        assert merged["a"]["b"]["c"]["d"]["e"]["op5"] == "x"
+        # The deeply nested template addition must arrive as well; the previous
+        # recursion bound of 4 stopped both adding and removing below that depth.
+        assert merged["a"]["b"]["c"]["d"]["e"]["template_leaf"] == 1
+
+    @staticmethod
+    def test_migrate_config_from_template_preserves_comments(tmp_path: Path):
+        """A merge that writes must not strip the operator's comments."""
+        template_path = tmp_path / "template.yaml"
+        user_config_path = tmp_path / "config.yaml"
+
+        template_path.write_text("added_key: 1\n", encoding="utf-8")
+        user_config_path.write_text(
+            """# operator header comment
+existing:
+  value: 1  # operator inline comment
+""",
+            encoding="utf-8",
+        )
+
+        assert migrate_config_from_template(template_path, user_config_path) is True
+
+        written = user_config_path.read_text(encoding="utf-8")
+        assert "# operator header comment" in written
+        assert "# operator inline comment" in written
+        assert "added_key: 1" in written
+
+    @staticmethod
+    def test_deep_merge_prune_removes_and_logs_every_dropped_key():
+        """Opt-in pruning must name every key it removes, plus a count.
+
+        The log assertion attaches a handler to the module logger directly:
+        ``setup_logger()`` sets ``propagate = False`` on the ``jiuwenswarm``
+        logger, so records never reach the root logger that ``caplog``
+        installs its handler on.
+        """
+        import logging
+
+        from jiuwenswarm.common.config import _deep_merge
+
+        records: list[logging.LogRecord] = []
+
+        class _Collector(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collector(level=logging.WARNING)
+        config_logger = logging.getLogger("jiuwenswarm.common.config")
+        previous_level = config_logger.level
+        config_logger.addHandler(handler)
+        config_logger.setLevel(logging.WARNING)
+        try:
+            template = {"kept": {"inner": 1}}
+            user = {
+                "kept": {"inner": 2, "user_only_nested": 3},
+                "user_only_top": 4,
+            }
+            changes = _deep_merge(template, user, prune=True)
+        finally:
+            config_logger.removeHandler(handler)
+            config_logger.setLevel(previous_level)
+
+        assert changes == 2
+        assert user == {"kept": {"inner": 2}}
+
+        messages = [record.getMessage() for record in records]
+        assert all(record.levelno == logging.WARNING for record in records)
+        assert any("kept.user_only_nested" in message for message in messages)
+        assert any("user_only_top" in message for message in messages)
+        assert any("removed 2 user config key(s)" in message for message in messages)
+
+    @staticmethod
+    def test_deep_merge_default_does_not_prune():
+        """The default merge is additive; nothing is dropped and nothing logged."""
+        from jiuwenswarm.common.config import _deep_merge
+
+        template = {"kept": {"inner": 1}, "added": 5}
+        user = {"kept": {"inner": 2, "user_only_nested": 3}, "user_only_top": 4}
+
+        changes = _deep_merge(template, user)
+
+        assert changes == 1
+        assert user == {
+            "kept": {"inner": 2, "user_only_nested": 3},
+            "user_only_top": 4,
+            "added": 5,
+        }
 
     @staticmethod
     def test_update_skill_retrieval_preserves_existing_hidden_config(
@@ -1467,6 +2112,42 @@ modes:
         assert registry["agent_2"]["skills"] == ["coding"]
 
     @staticmethod
+    def test_replace_teams_in_config_keeps_the_builtin_model_catalog(
+        monkeypatch: pytest.MonkeyPatch,
+        temp_config_file: Path,
+    ):
+        """The team editor payload carries no catalog, so the saved one survives."""
+        temp_config_file.write_text(
+            yaml.safe_dump(
+                {
+                    "modes": {
+                        "team": {
+                            "alpha_team": {
+                                "external_cli_agents": [
+                                    {"cli_agent": "claude", "builtin_models": [{"name": "sonnet"}]},
+                                ]
+                            }
+                        }
+                    }
+                },
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("jiuwenswarm.common.config._CONFIG_YAML_PATH", temp_config_file)
+        monkeypatch.setattr("jiuwenswarm.common.config.CONFIG_YAML_PATH", temp_config_file)
+        payload = TestTeamModesConfig._front_payload(["alpha_team"])
+        payload["team"][0]["external_cli_agents"] = [{"cli_agent": "claude", "cli_path": "/usr/bin/claude"}]
+
+        replace_teams_in_config(payload)
+
+        raw = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+        entry = raw["modes"]["team"]["alpha_team"]["external_cli_agents"][0]
+        assert entry["cli_path"] == "/usr/bin/claude"
+        assert entry["builtin_models"] == [{"name": "sonnet"}]
+
+    @staticmethod
     def test_replace_teams_in_config_only_writes_teammate_when_explicitly_provided(
         monkeypatch: pytest.MonkeyPatch,
         temp_config_file: Path,
@@ -1542,6 +2223,27 @@ modes:
         saved = raw["modes"]["team"]["alpha_team"]
         assert saved["external_cli_agents"] == [{"cli_agent": "claude"}]
         assert "external_transport" not in saved
+
+    @staticmethod
+    def test_replace_teams_in_config_carries_over_path_histories(
+        monkeypatch: pytest.MonkeyPatch,
+        temp_config_file: Path,
+    ):
+        """The team-editor payload must not drop the default team's path histories."""
+        monkeypatch.setattr("jiuwenswarm.common.config.CONFIG_YAML_PATH", temp_config_file)
+        _write_team_config(temp_config_file, [{"cli_agent": "codex", "cli_path": "/opt/codex"}])
+        update_external_cli_path_histories_in_config({"codex": ["/old/codex", "/opt/codex"]})
+
+        payload = TestTeamModesConfig._front_payload(["jiuwen_team"])
+        payload["team"][0]["external_cli_agents"] = [{"cli_agent": "codex", "cli_path": "/opt/codex"}]
+        payload["team"][0]["external_cli_publish_url"] = "ws://127.0.0.1:19000/ws"
+        replace_teams_in_config(payload)
+
+        raw = yaml.safe_load(temp_config_file.read_text(encoding="utf-8"))
+        saved = raw["modes"]["team"]["jiuwen_team"]
+        assert saved["external_cli_agents"] == [{"cli_agent": "codex", "cli_path": "/opt/codex"}]
+        # The payload carries no histories key; the current value must survive.
+        assert saved["external_cli_path_histories"] == {"codex": ["/old/codex", "/opt/codex"]}
 
     @staticmethod
     def test_update_external_cli_agents_in_config_updates_default_team(

@@ -22,6 +22,11 @@ test('Skill Hub marketplace and installation rely on the server-configured Hub',
     'const fetchHubRecommendByType = useCallback',
     'const fetchOnlineSearch = useCallback',
   );
+  const homeSource = sourceBetween(
+    hubMarketplaceSource,
+    'const fetchHubHomeSkills = useCallback',
+    'const fetchHubMoreSkills = useCallback',
+  );
   const installationSource = sourceBetween(
     skillPanelSource,
     'const handleInstallHubSkill = useCallback',
@@ -35,10 +40,17 @@ test('Skill Hub marketplace and installation rely on the server-configured Hub',
   assert.match(marketplaceSource, /['"]swarmskill['"]/);
   assert.match(marketplaceSource, /['"]skill['"]/);
   assert.match(hubMarketplaceSource, /const HUB_HOME_TOP_K = 6/);
-  assert.match(hubMarketplaceSource, /const HUB_MORE_TOP_K = 500/);
+  assert.match(hubMarketplaceSource, /const HUB_MORE_TOP_K = 50/);
   assert.match(marketplaceSource, /category_id: category/);
   assert.match(hubMarketplaceSource, /hubHomeLoadedCategoryRef/);
   assert.match(hubMarketplaceSource, /const silent = hubHomeLoadedCategoryRef\.current === category/);
+  // 先 prefer_cache；cold miss 且无旧卡时立刻直连 Hub（不空等轮询）
+  assert.match(homeSource, /preferCache:\s*true/);
+  assert.match(homeSource, /preferCache:\s*false/);
+  assert.match(homeSource, /isCatalogMissRefreshing/);
+  assert.match(homeSource, /loadOne\('swarmskill'/);
+  assert.match(homeSource, /loadOne\('skill'/);
+  assert.doesNotMatch(homeSource, /loadOne\('skillpack'|fetchHubRecommendByType\(category,\s*'skillpack'/);
   assert.match(
     sourceBetween(hubMarketplaceSource, 'const pauseHubFetching = useCallback', 'return {'),
     /setHubSkills\(\[\]\)/,
@@ -50,4 +62,21 @@ test('Skill Hub marketplace and installation rely on the server-configured Hub',
   assert.match(installationSource, /['"]skills\.online_search\.install['"]/);
   assert.doesNotMatch(marketplaceSource, /\bmarket_url\b|https?:\/\/|\b\d{1,3}(?:\.\d{1,3}){3}\b/);
   assert.doesNotMatch(installationSource, /\bmarket_url\b|https?:\/\/|\b\d{1,3}(?:\.\d{1,3}){3}\b/);
+});
+
+test('TeamSkillsHubModal fallback matches the server-side default Hub', () => {
+  const modalSource = readFileSync(
+    new URL('../src/features/TeamSkillsHubModal/index.tsx', import.meta.url),
+    'utf8',
+  );
+  const hubClientSource = readFileSync(
+    new URL('../../../../server/runtime/marketplace/hub_client.py', import.meta.url),
+    'utf8',
+  );
+
+  const modalMatch = modalSource.match(/const DEFAULT_TEAMSKILLS_HUB_BASE_URL = "([^"]+)"/);
+  const serverMatch = hubClientSource.match(/DEFAULT_HUB_BASE_URL = "([^"]+)"/);
+  assert.ok(modalMatch, 'missing frontend fallback constant');
+  assert.ok(serverMatch, 'missing backend default Hub constant');
+  assert.equal(modalMatch[1], serverMatch[1]);
 });

@@ -1,6 +1,7 @@
 import { settingsNavigationIcons } from '../../../../assets/settings';
 import type { SettingsModuleDefinition } from '../../registry/types';
 import { AgentMediaSettings, AgentSearchSettings, VideoGenSettings, VisualGenSettings } from './AgentSettings';
+import { ExternalCliSettingsItem } from './ExternalCliAgentsSettings';
 
 export const agentModule: SettingsModuleDefinition = {
   id: 'agent',
@@ -13,21 +14,11 @@ export const agentModule: SettingsModuleDefinition = {
       titleKey: 'settingsPanel.agent.skills',
       items: [
         { id: 'skill-evolution', component: 'switch', key: 'skill_evolution' },
+        { id: 'ttse-enabled', component: 'switch', key: 'ttse_enabled' },
         {
           id: 'skill-retrieval',
           component: 'switch',
           key: 'skill_retrieval_enabled',
-          subItems: {
-            show: 'always',
-            disabled: 'when-parent-unchecked',
-            items: [
-              {
-                id: 'skill-retrieval-index',
-                component: 'switch',
-                key: 'skill_retrieval_index_enabled',
-              },
-            ],
-          },
         },
       ],
     },
@@ -47,6 +38,13 @@ export const agentModule: SettingsModuleDefinition = {
         { id: 'media-tools-settings', component: 'custom', render: AgentMediaSettings },
         { id: 'video-gen-settings', component: 'custom', render: VideoGenSettings },
         { id: 'visual-gen-settings', component: 'custom', render: VisualGenSettings },
+      ],
+    },
+    {
+      id: 'external-cli-agents',
+      titleKey: 'settingsPanel.agent.externalCliAgents',
+      items: [
+        { id: 'external-cli-agents', component: 'custom', render: ExternalCliSettingsItem },
       ],
     },
   ],

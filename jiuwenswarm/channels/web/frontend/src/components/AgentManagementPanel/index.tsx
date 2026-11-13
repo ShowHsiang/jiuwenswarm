@@ -1,6 +1,7 @@
+import { isEnterprise } from '../../edition';
 import { InstallationFilterSelect, matchesInstallation, type InstallationFilter } from '../marketplace/InstallationFilterSelect';
 import { CatalogCacheNotice } from '../marketplace/CatalogCacheNotice';
-import { scheduleCatalogRefresh, catalogScope, withCatalogCache, catalogCacheOf } from '../../features/catalogCache';
+import { catalogAwaitingItems, scheduleCatalogRefresh, catalogScope, withCatalogCache, catalogCacheOf } from '../../features/catalogCache';
 import { ChevronDown } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -10,16 +11,22 @@ import { DefinitionDetailPage } from './DefinitionDetailPage';
 import { AgentGroupEditor } from './AgentGroupEditor';
 import { AgentGroupDetailPage } from './AgentGroupDetailPage';
 import { DefinitionUploadDialog } from './AgentGroupUploadDialog';
-import { GroupCatalogPage, GROUP_PAGE_SIZE } from './GroupCatalogPage';
+import { GroupCatalogPage } from './GroupCatalogPage';
 import { PendingConnectorModals, usePendingConnectorFlow } from '../ConnectorMarket/usePendingConnectorFlow';
 import { useConnectorStore } from '../../stores/connectorStore';
 import { seedAgentCatalog } from '../../stores/agentCatalogStore';
+import { seedSelectedAgentGroup } from '../../stores/agentGroupCatalogSeed';
 import {
   AgentInstallPendingError,
   AgentManagementError,
+  advancePendingInstallQueue,
   createAgentGroupManagementClient,
-
+  deriveAgentGroupId,
+  deriveAgentId,
+  createPendingInstallQueue,
   createAgentManagementClient,
+  type AgentFileContent,
+  enqueuePendingInstall,
   type AgentCatalogItem,
   type AgentDetail,
   type AgentDraft,
@@ -30,10 +37,17 @@ import {
   type AgentManagementClient,
   type DefinitionFileEntry,
   type McpOption,
+  type PendingInstallJob,
+  type PendingInstallQueue,
+  type SkillOption,
+  type SkillListOptions,
   type RequestStatus,
+  type InstallOutcome,
+  isUncertainInstallError,
   agentManagementReducer,
   buildCatalogViewModel,
   buildGroupCatalogViewModel,
+  collectCategories,
   initialAgentManagementState,
   isPreviewableFile,
   mergeAgentDetailWithCatalog,
@@ -43,7 +57,8 @@ import { AGENT_TAG_OPTIONS } from '../../features/agentManagement/tagOptions';
 import { findDefaultDefinitionFile } from './DefinitionFilePreview';
 import './agentManagement.css';
 import { equipmentListFilter } from '../../features/equipmentMarketplace';
-import { CategoryTabs, PageHeader, PageToolbarSearch, Tabs } from '../ui';
+import { Button, CategoryTabs, CloseButton, Dialog, PageHeader, PageToolbarSearch, Tabs, toast } from '../ui';
+import { webRequest } from '../../services/webClient';
 
 type PanelView = 'catalog' | 'teams' | 'mine' | 'detail' | 'group-detail' | 'create' | 'group-create';
 
@@ -72,6 +87,8 @@ const EMPTY_DRAFT: AgentDraft = {
   skillRefs: [],
   mcpRefs: [],
   suggestedPrompts: [],
+  useExternalHarness: false,
+  externalHarnessProvider: 'claudecode',
 };
 
 const EMPTY_GROUP_DRAFT: AgentGroupDraft = {
@@ -90,10 +107,15 @@ const EMPTY_GROUP_DRAFT: AgentGroupDraft = {
 
 function detailToDraft(detail: AgentDetail): AgentDraft {
   const presetIds = new Set<string>(AGENT_TAG_OPTIONS.map((option) => option.id));
+  const harnessTagLabels = new Set(['三方Harness', 'External Harness']);
   const tagIds = detail.tags
     .map((tag) => tag.id)
     .filter((id): id is string => presetIds.has(id));
-  const customTags = detail.tags.filter((tag) => !presetIds.has(tag.id)).map((tag) => tag.label);
+  const customTags = detail.tags
+    .filter((tag) => !presetIds.has(tag.id) && !harnessTagLabels.has(tag.label) && !harnessTagLabels.has(tag.id))
+    .map((tag) => tag.label);
+  const provider = detail.runtime?.provider_name;
+  const useExternalHarness = provider === 'claudecode' || provider === 'codex';
   return {
     id: detail.id,
     name: detail.displayName,
@@ -102,8 +124,10 @@ function detailToDraft(detail: AgentDetail): AgentDraft {
     tagIds,
     customTags,
     skillRefs: detail.skills.map((skill) => skill.id),
-    mcpRefs: detail.mcps.map((mcp) => mcp.id),
+    mcpRefs: useExternalHarness ? [] : detail.mcps.map((mcp) => mcp.id),
     suggestedPrompts: detail.suggestedPrompts,
+    useExternalHarness,
+    externalHarnessProvider: provider === 'codex' ? 'codex' : 'claudecode',
   };
 }
 
@@ -132,6 +156,7 @@ function getFriendlyErrorMessage(
   const code =
     error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
   if (code === 'agent_detail_empty') return translate('agentManagement.states.detailError');
+  if (code === 'pod_start_timeout') return translate('experts.podStartTimeout');
   const normalizedMessage = message.trim();
   if (code === 'REQUEST_TIMEOUT') return translate('network.requestTimeout');
   if (code === 'WS_NOT_READY') return translate('network.connectionUnavailable');
@@ -157,11 +182,17 @@ function getFriendlyErrorMessage(
   if (/^agent_group package (?:missing\/corrupt manifest\.json|wrong package_type|conflict):/i.test(normalizedMessage)) {
     return translate('agentManagement.group.states.definitionUnavailable');
   }
+  if (/^(?:agent_group manifest|AgentGroup|AgentTemplate|agent directory not found:|shared skill |failed to extract archive|archive )/i.test(normalizedMessage)) {
+    return translate('agentManagement.group.states.packageValidationError', { reason: normalizedMessage });
+  }
   if (/^(?:missing or invalid leaderId|missing or invalid memberIds|invalid memberId|leaderId must not appear|duplicate memberId|memberId 'leader')/i.test(normalizedMessage)) {
     return translate('agentManagement.group.states.membersInvalid');
   }
   if (/^(?:leader|member) agent_template (?:not found|is invalid|is Team-compatible)/i.test(normalizedMessage)) {
     return translate('agentManagement.group.states.memberUnavailable');
+  }
+  if (/(?:agent_template|agent_group|plugin) skill dir must be package-relative/i.test(normalizedMessage)) {
+    return translate('agentManagement.states.uploadSkillPathNotRelative');
   }
   if (/^agent_template package not found:/i.test(normalizedMessage)) {
     return translate('agentManagement.states.agentUnavailable');
@@ -200,20 +231,6 @@ function getFriendlyErrorMessage(
   return fallback;
 }
 
-function deriveAgentId(name: string): string {
-  const slug = name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return slug.length >= 3 ? slug.slice(0, 50) : `agent-${Date.now().toString(36)}`;
-}
-
-function deriveAgentGroupId(name: string): string {
-  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return slug.length >= 3 ? slug.slice(0, 50) : `agent-group-${Date.now().toString(36)}`;
-}
-
 export function AgentManagementPanel({
   isActive = true,
   onUseAgent,
@@ -238,21 +255,23 @@ export function AgentManagementPanel({
   const [mineKind, setMineKind] = useState<'agent' | 'group'>('agent');
   const [detailTab, setDetailTab] = useState<'content' | 'files'>('content');
   const [query, setQuery] = useState('');
-  const [catalogPage, setCatalogPage] = useState(1);
-  const [minePage, setMinePage] = useState(1);
   const [mineQuery, setMineQuery] = useState('');
   const [category, setCategory] = useState('');
   const [groupCategory, setGroupCategory] = useState('');
   const [groupCatalogQuery, setGroupCatalogQuery] = useState('');
   const [groupMineQuery, setGroupMineQuery] = useState('');
-  const [groupCatalogPage, setGroupCatalogPage] = useState(1);
-  const [groupMinePage, setGroupMinePage] = useState(1);
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [catalogPodStarting, setCatalogPodStarting] = useState(false);
+  const [busySkillId, setBusySkillId] = useState<string | null>(null);
   const [detailOrigin, setDetailOrigin] = useState<'catalog' | 'mine'>('catalog');
   const [groupDetailOrigin, setGroupDetailOrigin] = useState<'teams' | 'mine'>('teams');
-  const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [actionNoticeError, setActionNoticeError] = useState(false);
+  const [groupRuntimeNotice, setGroupRuntimeNotice] = useState<string | null>(null);
   const [connectorFlowId, setConnectorFlowId] = useState<string | null>(null);
+  const [pendingInstallQueue, setPendingInstallQueue] = useState<PendingInstallQueue>(() =>
+    createPendingInstallQueue(),
+  );
   const [draft, setDraft] = useState<AgentDraft>(EMPTY_DRAFT);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -277,7 +296,7 @@ export function AgentManagementPanel({
   const [groupFilesStatus, setGroupFilesStatus] = useState<RequestStatus>('idle');
   const [groupFilesError, setGroupFilesError] = useState<string | null>(null);
   const [groupSelectedFilePath, setGroupSelectedFilePath] = useState<string | null>(null);
-  const [groupFileContent, setGroupFileContent] = useState<{ relativePath: string; content: string } | null>(null);
+  const [groupFileContent, setGroupFileContent] = useState<AgentFileContent | null>(null);
   const [groupFileStatus, setGroupFileStatus] = useState<RequestStatus>('idle');
   const [groupFileError, setGroupFileError] = useState<string | null>(null);
   const [groupDraft, setGroupDraft] = useState<AgentGroupDraft>(EMPTY_GROUP_DRAFT);
@@ -286,6 +305,7 @@ export function AgentManagementPanel({
   const [groupUploadDialogOpen, setGroupUploadDialogOpen] = useState(false);
   const [groupUploadError, setGroupUploadError] = useState<string | null>(null);
   const catalogRevisionRef = useRef(0);
+  const skillsRevisionRef = useRef(0);
   const panelMountedRef = useRef(false);
   const panelPrevActiveRef = useRef(false);
   const detailRevisionRef = useRef(0);
@@ -295,12 +315,14 @@ export function AgentManagementPanel({
   const groupMineRef = useRef<AgentGroupCatalogItem[]>([]);
   const groupCatalogRevisionRef = useRef(0);
   const groupMineRevisionRef = useRef(0);
+  const catalogSearchActiveRef = useRef(false);
+  const groupCatalogSearchActiveRef = useRef(false);
   const groupDetailRevisionRef = useRef(0);
   const groupFilesRevisionRef = useRef(0);
   const groupFileRevisionRef = useRef(0);
   const lastNavigationRequestIdRef = useRef<number | null>(null);
   const actionNoticeTimerRef = useRef<number | null>(null);
-  const installFlowTargetRef = useRef<string | null>(null);
+  const pendingInstallQueueRef = useRef(pendingInstallQueue);
   const reconnectFlowTargetRef = useRef<string | null>(null);
   const connectorError = useConnectorStore((state) => state.error);
   const clearConnectorError = useConnectorStore((state) => state.clearError);
@@ -309,105 +331,176 @@ export function AgentManagementPanel({
     if (!request || request.requestId === lastNavigationRequestIdRef.current) return;
     lastNavigationRequestIdRef.current = request.requestId;
     setCreateMenuOpen(false);
-    setActionError(null);
     setActionNotice(null);
     setView('mine');
     setMineKind(request.target);
     if (request.target === 'group') {
       setGroupMineQuery('');
-      setGroupMinePage(1);
     } else {
       setMineQuery('');
-      setMinePage(1);
     }
   }, [navigationRequest]);
   const formatActionError = useCallback(
     (error: unknown, fallback: string) => getFriendlyErrorMessage(error, fallback, t),
     [t],
   );
-  const showActionNotice = useCallback((notice: string) => {
+  const showActionNotice = useCallback((notice: string, isError = false) => {
     if (actionNoticeTimerRef.current !== null) {
       window.clearTimeout(actionNoticeTimerRef.current);
     }
     setActionNotice(notice);
+    setActionNoticeError(isError);
     actionNoticeTimerRef.current = window.setTimeout(() => {
       setActionNotice(current => (current === notice ? null : current));
       actionNoticeTimerRef.current = null;
     }, 3000);
   }, []);
+  const showActionError = useCallback((message: string, options: { inline?: boolean } = {}) => {
+    toast.open({ id: 'agent-management-action-error', content: message, variant: 'error' });
+    if (options.inline !== false) {
+      showActionNotice(message, true);
+    }
+  }, [showActionNotice]);
+  const markBusy = useCallback((id: string) => {
+    setBusyIds((current) => {
+      if (current.has(id)) return current;
+      const next = new Set(current);
+      next.add(id);
+      return next;
+    });
+  }, []);
+  const clearBusy = useCallback((id: string) => {
+    setBusyIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+  const updatePendingInstallQueue = useCallback(
+    (update: (queue: PendingInstallQueue) => PendingInstallQueue) => {
+      const next = update(pendingInstallQueueRef.current);
+      if (next === pendingInstallQueueRef.current) return next;
+      pendingInstallQueueRef.current = next;
+      setPendingInstallQueue(next);
+      return next;
+    },
+    [],
+  );
 
   const [installationFilter, setInstallationFilter] = useState<InstallationFilter>('all');
+  const [groupInstallationFilter, setGroupInstallationFilter] = useState<InstallationFilter>('all');
+  // 分类页签从广场可见目录（builtin+hub）动态统计（对齐插件广场）：后端 category 是
+  // manifest/Hub 自由字符串，写死枚举会导致大部分条目归不进任何页签（#5902）。
+  // 统计集合必须与列表可见集合一致——state.catalog 还含"我的"（local）条目，
+  // 否则本地专家的自定义分类会生成一个点进去为空的页签（#5902 回归）。
+  // 市场有几个分类就出几个页签，不截断、不自建 "Other" 聚合类型。
+  const plazaCatalog = useMemo(
+    () => state.catalog.filter((item) => item.source === 'builtin' || item.source === 'hub'),
+    [state.catalog],
+  );
+  const categories = useMemo(
+    () => collectCategories(plazaCatalog.map((item) => item.category)),
+    [plazaCatalog],
+  );
+  // 组目录侧 groupCatalog 已是 builtin+hub（buildGroupCatalogViewModel 在 catalog 作用域过滤），
+  // 直接统计全部分类，保持与市场一致。
+  const groupCategories = useMemo(
+    () => collectCategories(groupCatalog.map((item) => item.category)),
+    [groupCatalog],
+  );
   const catalogView = useMemo(
     () =>
-      buildCatalogViewModel(state.catalog.filter(item => matchesInstallation(item.installed, installationFilter)), {
-        scope: 'catalog',
-        category,
-        query,
-      }),
-    [state.catalog, category, query, installationFilter],
+      buildCatalogViewModel(
+        state.catalog.filter((item) => matchesInstallation(item.installed, installationFilter)),
+        {
+          scope: 'catalog',
+          category,
+          // Marketplace results are already filtered by Hub. Reapplying a
+          // client-side substring filter would discard name/tag matches.
+          query: '',
+        },
+      ),
+    [state.catalog, category, installationFilter],
 
   );
   const mineView = useMemo(
     () =>
-      buildCatalogViewModel(state.catalog.filter(item => matchesInstallation(item.installed, installationFilter)), {
+      buildCatalogViewModel(state.mineCatalog.filter(item => matchesInstallation(item.installed, installationFilter)), {
         scope: 'mine',
         category: '',
         query: mineQuery,
       }),
-    [state.catalog, mineQuery, installationFilter],
+    [state.mineCatalog, mineQuery, installationFilter],
   );
   const groupCatalogView = useMemo(
-    () => buildGroupCatalogViewModel(groupCatalog, {
-      scope: 'catalog',
-      category: groupCategory,
-      query: groupCatalogQuery,
-      page: groupCatalogPage,
-      pageSize: GROUP_PAGE_SIZE,
-    }),
-    [groupCatalog, groupCategory, groupCatalogQuery, groupCatalogPage],
+    () =>
+      buildGroupCatalogViewModel(groupCatalog, {
+        scope: 'catalog',
+        category: groupCategory,
+        query: '',
+        installation: groupInstallationFilter,
+      }),
+    [groupCatalog, groupCategory, groupInstallationFilter],
   );
   const groupMineView = useMemo(
     () => buildGroupCatalogViewModel(groupMine, {
       scope: 'mine',
       category: '',
       query: groupMineQuery,
-      page: groupMinePage,
-      pageSize: GROUP_PAGE_SIZE,
+      installation: groupInstallationFilter,
     }),
-    [groupMine, groupMineQuery, groupMinePage],
-
+    [groupMine, groupMineQuery, groupInstallationFilter],
   );
 
-  const loadCatalog = useCallback(async (options: { includeTeamCompatibility?: boolean } = {}) => {
+  const loadCatalog = useCallback(async (options: { includeTeamCompatibility?: boolean; query?: string } = {}) => {
     const revision = ++catalogRevisionRef.current;
     const requestScope = catalogScope();
+    if (options.includeTeamCompatibility) dispatch({ type: 'catalog.compatibility.loading' });
+    setCatalogPodStarting(false);
     dispatch({ type: 'catalog.loading' });
     try {
       const compatibilityOptions = options.includeTeamCompatibility
         ? { includeTeamCompatibility: true }
         : {};
+      const onPodStarting = () => {
+        if (revision === catalogRevisionRef.current) setCatalogPodStarting(true);
+      };
       const [marketplaceCatalog, mineCatalog] = await Promise.all([
-        client.listCatalog({ filter: equipmentListFilter('agent', 'catalog'), ...compatibilityOptions }),
-        client.listCatalog({ filter: equipmentListFilter('agent', 'mine'), ...compatibilityOptions }),
+        client.listCatalog({
+          filter: equipmentListFilter('agent', 'catalog'),
+          ...compatibilityOptions,
+          ...(options.query ? { query: options.query } : {}),
+          onPodStarting,
+        }),
+        client.listCatalog({
+          filter: equipmentListFilter('agent', 'mine'),
+          ...compatibilityOptions,
+          onPodStarting,
+        }),
       ]);
       if (requestScope !== catalogScope()) return;
-      scheduleCatalogRefresh('agent-catalog', marketplaceCatalog.cache, () => { void loadCatalog(); }, () => catalogRevisionRef.current === revision);
+      const cache = scheduleCatalogRefresh('agent-catalog', marketplaceCatalog.cache, () => { void loadCatalog(options); }, () => catalogRevisionRef.current === revision);
       const catalog = Array.from(
-        new Map([...mineCatalog, ...marketplaceCatalog].map((item) => [item.id, item])).values(),
+        new Map([...mineCatalog, ...marketplaceCatalog].map(item => [item.id, item])).values(),
       );
       if (revision !== catalogRevisionRef.current) return;
-      withCatalogCache(catalog, marketplaceCatalog.cache);
+      withCatalogCache(catalog, cache);
       catalogRef.current = catalog;
+      setCatalogPodStarting(false);
+      if (options.includeTeamCompatibility) dispatch({ type: 'catalog.compatibility.loaded' });
       // 回填共享目录缓存：聊天输入区的专家 tag 依赖它首帧解析 displayName/头像。
-      seedAgentCatalog(catalog);
-      dispatch({ type: 'catalog.loaded', catalog });
+      if (!options.query) seedAgentCatalog(catalog);
+      dispatch({ type: 'catalog.loaded', catalog, mineCatalog });
     } catch (error) {
       if (revision !== catalogRevisionRef.current) return;
-      dispatch({ type: 'catalog.error', message: formatActionError(error, t('agentManagement.states.loadError')) });
+      const message = formatActionError(error, t('agentManagement.states.loadError'));
+      if (options.includeTeamCompatibility) dispatch({ type: 'catalog.compatibility.error', message });
+      dispatch({ type: 'catalog.error', message });
     }
   }, [client, formatActionError, t]);
 
-  const loadGroups = useCallback(async (scope: 'catalog' | 'mine') => {
+  const loadGroups = useCallback(async (scope: 'catalog' | 'mine', query = '') => {
     const revisionRef = scope === 'catalog' ? groupCatalogRevisionRef : groupMineRevisionRef;
     const setStatus = scope === 'catalog' ? setGroupCatalogStatus : setGroupMineStatus;
     const setError = scope === 'catalog' ? setGroupCatalogError : setGroupMineError;
@@ -417,8 +510,16 @@ export function AgentManagementPanel({
     setStatus('loading');
     setError(null);
     try {
-      const groups = await groupClient.listGroups({ filter: scope === 'catalog' ? 'builtin' : 'local' });
+      const groups = await groupClient.listGroups({
+        filter: scope === 'catalog' ? 'builtin+hub' : 'local',
+        ...(scope === 'catalog' && !query ? { cache_mode: 'prefer_cache' } : {}),
+        ...(scope === 'catalog' && query ? { query } : {}),
+      });
       if (revision !== revisionRef.current) return;
+      if (scope === 'catalog') {
+        scheduleCatalogRefresh('agent-group-catalog', catalogCacheOf(groups),
+          () => { void loadGroups('catalog', query); }, () => groupCatalogRevisionRef.current === revision);
+      }
       listRef.current = groups;
       setItems(groups);
       setStatus('success');
@@ -429,12 +530,31 @@ export function AgentManagementPanel({
     }
   }, [formatActionError, groupClient, t]);
 
-  const loadSkills = useCallback(async () => {
+  const loadSkills = useCallback(async (options: SkillListOptions = {}) => {
+    const revision = ++skillsRevisionRef.current;
     dispatch({ type: 'skills.loading' });
     try {
-      const options = await client.listSkillOptions();
-      dispatch({ type: 'skills.loaded', options });
+      const skills = await client.listSkillOptions(
+        options.includeTeamMarketplace
+          ? {
+              ...options,
+              onTeamMarketplaceLoaded: (marketplaceSkills, cache) => {
+                if (revision !== skillsRevisionRef.current) return;
+                scheduleCatalogRefresh(
+                  'agent-team-skill-marketplace',
+                  cache,
+                  () => { void loadSkills(options); },
+                  () => skillsRevisionRef.current === revision,
+                );
+                dispatch({ type: 'skills.loaded', options: marketplaceSkills });
+              },
+            }
+          : options,
+      );
+      if (revision !== skillsRevisionRef.current) return;
+      dispatch({ type: 'skills.loaded', options: skills });
     } catch {
+      if (revision !== skillsRevisionRef.current) return;
       dispatch({ type: 'skills.error' });
     }
   }, [client]);
@@ -450,6 +570,22 @@ export function AgentManagementPanel({
     }
   }, [client]);
 
+  const handleInstallSkill = useCallback(
+    async (skill: SkillOption, onError: (message: string) => void) => {
+      setBusySkillId(skill.id);
+      try {
+        await client.installSkill(skill);
+        await loadSkills(view === 'group-create' ? { includeTeamMarketplace: true } : {});
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'skill_install_cancelled') return;
+        onError(formatActionError(error, t('agentManagement.states.actionError')));
+      } finally {
+        setBusySkillId(null);
+      }
+    },
+    [client, formatActionError, loadSkills, t, view],
+  );
+
   // 切换到专家页面时刷新目录（面板常驻挂载、切走仅隐藏，聊天里新建的专家
   // 不会主动通知前端），沿用 SkillPanel 的激活转换检测；首次挂载也走此入口，
   // 避免与旧的 mount-only 请求重复。
@@ -457,16 +593,54 @@ export function AgentManagementPanel({
     const prevIsActive = panelPrevActiveRef.current;
     const isInitialMount = !panelMountedRef.current;
     panelMountedRef.current = true;
+    if (!isActive && prevIsActive && (view === 'create' || view === 'group-create')) {
+      setView('mine');
+      setMineKind(view === 'group-create' ? 'group' : 'agent');
+    }
     if (isActive && (!prevIsActive || isInitialMount)) {
-      void loadCatalog();
+      void loadCatalog(view === 'group-create' ? { includeTeamCompatibility: true } : {});
     }
     panelPrevActiveRef.current = isActive;
-  }, [isActive, loadCatalog]);
+  }, [isActive, loadCatalog, view]);
 
   useEffect(() => {
     if (view === 'teams') void loadGroups('catalog');
     if (view === 'mine' && mineKind === 'group') void loadGroups('mine');
   }, [loadGroups, mineKind, view]);
+
+  useEffect(() => {
+    if (!isActive || view !== 'catalog') return;
+    const searchQuery = query.trim();
+    if (!searchQuery) {
+      if (catalogSearchActiveRef.current) {
+        catalogSearchActiveRef.current = false;
+        void loadCatalog();
+      }
+      return;
+    }
+    catalogSearchActiveRef.current = true;
+    const timer = window.setTimeout(() => {
+      void loadCatalog({ query: searchQuery });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [isActive, loadCatalog, query, view]);
+
+  useEffect(() => {
+    if (!isActive || view !== 'teams') return;
+    const searchQuery = groupCatalogQuery.trim();
+    if (!searchQuery) {
+      if (groupCatalogSearchActiveRef.current) {
+        groupCatalogSearchActiveRef.current = false;
+        void loadGroups('catalog');
+      }
+      return;
+    }
+    groupCatalogSearchActiveRef.current = true;
+    const timer = window.setTimeout(() => {
+      void loadGroups('catalog', searchQuery);
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [groupCatalogQuery, isActive, loadGroups, view]);
 
   useEffect(() => {
     return () => {
@@ -483,7 +657,6 @@ export function AgentManagementPanel({
       if (view !== 'detail') {
         setDetailOrigin(view === 'mine' ? 'mine' : 'catalog');
       }
-      setActionError(null);
       setActionNotice(null);
       setSelectedId(id);
       setDetailTab('content');
@@ -665,40 +838,70 @@ export function AgentManagementPanel({
   );
 
   const retryInstallAfterConnect = useCallback(
-    async (id: string) => {
-      setActionError(null);
+    async (job: PendingInstallJob) => {
       try {
-        await client.installDefinition(id);
-        await refreshAfterAction(id);
+        await client.installDefinition(job.id);
+        if (job.mode === 'group-picker') {
+          await loadCatalog({ includeTeamCompatibility: true });
+        } else {
+          await refreshAfterAction(job.id);
+        }
       } catch (error) {
-        setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+        showActionError(formatActionError(error, t('agentManagement.states.actionError')));
       } finally {
-        setBusyId(null);
+        clearBusy(job.id);
       }
     },
-    [client, refreshAfterAction, t],
+    [clearBusy, client, formatActionError, loadCatalog, refreshAfterAction, showActionError, t],
   );
 
   const refreshAfterReconnect = useCallback(
     async (id: string) => {
-      setActionError(null);
       try {
         await refreshAfterAction(id);
       } catch (error) {
-        setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+        showActionError(formatActionError(error, t('agentManagement.states.actionError')));
       } finally {
-        setBusyId(null);
+        clearBusy(id);
       }
     },
-    [refreshAfterAction, t],
+    [clearBusy, refreshAfterAction, showActionError, t],
   );
 
-  const installFlow = usePendingConnectorFlow(() => {
-    const id = installFlowTargetRef.current;
-    installFlowTargetRef.current = null;
-    setConnectorFlowId(null);
-    if (id) void retryInstallAfterConnect(id);
-  });
+  const settlePendingInstall = useCallback(
+    async (connected: boolean, reason?: 'failed' | 'cancelled') => {
+      const job = pendingInstallQueueRef.current.active;
+      if (!job) return;
+      if (connected) {
+        await retryInstallAfterConnect(job);
+      } else {
+        clearBusy(job.id);
+        if (reason === 'failed') {
+          const error = useConnectorStore.getState().error;
+          showActionError(formatActionError(error, t('agentManagement.states.actionError')));
+        }
+      }
+      updatePendingInstallQueue((queue) => advancePendingInstallQueue(queue).queue);
+    },
+    [clearBusy, formatActionError, retryInstallAfterConnect, showActionError, t, updatePendingInstallQueue],
+  );
+
+  const installFlow = usePendingConnectorFlow(
+    () => { void settlePendingInstall(true); },
+    (reason) => { void settlePendingInstall(false, reason); },
+  );
+  const installFlowStartRef = useRef(installFlow.start);
+  installFlowStartRef.current = installFlow.start;
+
+  useEffect(() => {
+    const job = pendingInstallQueue.active;
+    if (!job) {
+      if (!reconnectFlowTargetRef.current) setConnectorFlowId(null);
+      return;
+    }
+    setConnectorFlowId(job.id);
+    installFlowStartRef.current(job.pendingConnectors);
+  }, [pendingInstallQueue.active]);
 
   const reconnectFlow = usePendingConnectorFlow(() => {
     const id = reconnectFlowTargetRef.current;
@@ -709,60 +912,78 @@ export function AgentManagementPanel({
 
   useEffect(() => {
     if (!connectorFlowId) return;
+    if (pendingInstallQueueRef.current.active) return;
     const flowActive =
-      installFlow.active ||
-      reconnectFlow.active ||
-      Boolean(
-        installFlow.tokenTarget || installFlow.authTarget || reconnectFlow.tokenTarget || reconnectFlow.authTarget,
-      );
+      reconnectFlow.active || Boolean(reconnectFlow.tokenTarget || reconnectFlow.authTarget);
     if (flowActive) return;
 
-    const id = installFlowTargetRef.current || reconnectFlowTargetRef.current;
-    if (connectorError) setActionError(formatActionError(connectorError, t('agentManagement.states.actionError')));
-    installFlowTargetRef.current = null;
+    const id = reconnectFlowTargetRef.current;
+    if (connectorError) showActionError(formatActionError(connectorError, t('agentManagement.states.actionError')));
     reconnectFlowTargetRef.current = null;
     setConnectorFlowId(null);
-    setBusyId((current) => (current === id ? null : current));
+    if (id) clearBusy(id);
   }, [
     connectorError,
     connectorFlowId,
+    clearBusy,
     formatActionError,
-    installFlow.active,
-    installFlow.authTarget,
-    installFlow.tokenTarget,
     reconnectFlow.active,
     reconnectFlow.authTarget,
     reconnectFlow.tokenTarget,
+    showActionError,
     t,
   ]);
 
-  const handleInstall = async (id: string) => {
-    setBusyId(id);
-    setActionError(null);
+  const handleInstall = async (
+    id: string,
+    options: { includeTeamCompatibility?: boolean; suppressInlineError?: boolean; onError?: (message: string) => void } = {},
+  ): Promise<InstallOutcome> => {
+    markBusy(id);
     setActionNotice(null);
     clearConnectorError();
+    let queuedForConnect = false;
     try {
       const result = await client.installDefinition(id);
       if (result.kind === 'auth_required') {
-        throw new Error(t('agentManagement.states.authRequired'));
+        // The expert package is valid but needs authentication first. Keep
+        // the imported package: returning 'queued' avoids rollback and lets
+        // the user retry the install after authenticating.
+        return 'queued';
       }
-      await refreshAfterAction(id);
+      if (options.includeTeamCompatibility) {
+        await loadCatalog({ includeTeamCompatibility: true });
+      } else {
+        await refreshAfterAction(id);
+      }
+      return 'installed';
     } catch (error) {
       if (error instanceof AgentInstallPendingError) {
-        installFlowTargetRef.current = id;
-        setConnectorFlowId(id);
-        installFlow.start(error.pendingConnectors);
-        return;
+        queuedForConnect = true;
+        updatePendingInstallQueue((queue) =>
+          enqueuePendingInstall(queue, {
+            id,
+            mode: options.includeTeamCompatibility ? 'group-picker' : 'catalog',
+            pendingConnectors: error.pendingConnectors,
+          }),
+        );
+        return 'queued';
       }
-      setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+      // The upload flow owns the final presentation: it shows the raw
+      // backend error in the notice slot, so hand the message over before
+      // the generic fallback toast here (#5678 PR review).
+      const friendly = formatActionError(error, t('agentManagement.states.actionError'));
+      options.onError?.(error instanceof Error && error.message.trim() ? error.message : friendly);
+      showActionError(friendly, {
+        inline: !options.suppressInlineError,
+      });
+      return isUncertainInstallError(error) ? 'uncertain' : 'failed';
     } finally {
-      if (installFlowTargetRef.current !== id) setBusyId(null);
+      if (!queuedForConnect) clearBusy(id);
     }
   };
 
   const handleUninstall = async (id: string) => {
-    setBusyId(id);
-    setActionError(null);
+    markBusy(id);
     setActionNotice(null);
     try {
       const fromDetail = view === 'detail' && selectedId === id;
@@ -773,11 +994,11 @@ export function AgentManagementPanel({
       } else {
         await refreshAfterAction(id);
       }
-      if (result.notice) setActionNotice(result.notice);
+      if (result.notice) { setActionNoticeError(false); setActionNotice(result.notice); }
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+      showActionError(formatActionError(error, t('agentManagement.states.actionError')));
     } finally {
-      setBusyId(null);
+      clearBusy(id);
     }
   };
 
@@ -795,73 +1016,99 @@ export function AgentManagementPanel({
     [groupSelectedId, loadGroups, openGroupDetail, view],
   );
 
-  const handleUseGroup = (id: string) => {
+  const getSelectableGroup = async (id: string) => {
     const item = [...groupCatalogRef.current, ...groupMineRef.current].find(candidate => candidate.id === id);
-    if (!item?.installed || !item.capabilities.canUse) return;
-    onUseAgentGroup?.(id);
+    if (!item?.installed || !item.capabilities.canUse) return null;
+    try {
+      const result = await webRequest<{ group?: { disabledRuntimes?: string[] } }>(
+        'agent_groups.show', { id: item.id },
+      );
+      const disabled = result.group?.disabledRuntimes ?? [];
+      if (disabled.length > 0) {
+        setGroupRuntimeNotice(t('chat.agentGroupRuntimeDisabled', {
+          agents: disabled.map((name) => {
+            if (name === 'claude') return 'Claude';
+            if (name === 'codex') return 'Codex';
+            return name;
+          }).join(', '),
+        }));
+        return null;
+      }
+    } catch (error) {
+      setGroupRuntimeNotice(String(error));
+      return null;
+    }
+    return item;
   };
 
-  const handleUseGroupPrompt = (id: string, prompt: string) => {
-    const item = [...groupCatalogRef.current, ...groupMineRef.current].find(candidate => candidate.id === id);
-    if (!item?.installed || !item.capabilities.canUse) return;
-    onUseGroupPrompt?.(id, prompt);
+  const handleUseGroup = async (id: string) => {
+    const item = await getSelectableGroup(id);
+    if (!item) return;
+    seedSelectedAgentGroup(item);
+    onUseAgentGroup?.(item.name);
+  };
+
+  const handleUseGroupPrompt = async (id: string, prompt: string) => {
+    const item = await getSelectableGroup(id);
+    if (!item) return;
+    seedSelectedAgentGroup(item);
+    onUseGroupPrompt?.(item.name, prompt);
   };
 
   const handleInstallGroup = async (id: string) => {
-    setBusyId(id);
-    setActionError(null);
+    markBusy(id);
     setActionNotice(null);
     try {
       await groupClient.installGroup(id);
       await refreshAfterGroupAction(id);
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.group.states.actionError')));
+      showActionError(formatActionError(error, t('agentManagement.group.states.actionError')));
     } finally {
-      setBusyId(null);
+      clearBusy(id);
     }
   };
 
   const handleUninstallGroup = async (id: string) => {
-    setBusyId(id);
-    setActionError(null);
+    const before = groupDetail?.id === id ? groupDetail : [...groupCatalogRef.current, ...groupMineRef.current].find(item => item.id === id);
+    const confirmed = window.confirm(t('agentManagement.confirm.uninstallGroupMessage', { name: before?.displayName ?? id }));
+    if (!confirmed) return;
+    markBusy(id);
     setActionNotice(null);
     try {
       const fromDetail = view === 'group-detail' && groupSelectedId === id;
-      const before = groupDetail?.id === id ? groupDetail : [...groupCatalogRef.current, ...groupMineRef.current].find(item => item.id === id);
       const result = await groupClient.uninstallGroup(id);
       await Promise.all([loadGroups('catalog'), loadGroups('mine')]);
-      if (fromDetail && before?.source === 'local') {
-        setView('mine');
+      if (fromDetail) {
+        setView(groupDetailOrigin);
         setMineKind('group');
-      } else if (fromDetail) {
-        await openGroupDetail(id);
+        setGroupSelectedId(null);
+        setGroupDetail(null);
       }
-      if (result.notice) setActionNotice(result.notice);
+      if (result.notice) { setActionNoticeError(false); setActionNotice(result.notice); }
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.group.states.actionError')));
+      showActionError(formatActionError(error, t('agentManagement.group.states.actionError')));
     } finally {
-      setBusyId(null);
+      clearBusy(id);
     }
   };
 
   const handleReconnect = async (id: string) => {
-    setBusyId(id);
-    setActionError(null);
+    markBusy(id);
     setActionNotice(null);
     clearConnectorError();
     try {
       const detail = state.detail?.id === id ? state.detail : await client.getDefinition(id);
       if (detail.pendingConnectors.length === 0) {
-        setActionError(t('agentManagement.states.connectionUnavailable'));
+        showActionError(t('agentManagement.states.connectionUnavailable'));
         return;
       }
       reconnectFlowTargetRef.current = id;
       setConnectorFlowId(id);
       reconnectFlow.start(detail.pendingConnectors);
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+      showActionError(formatActionError(error, t('agentManagement.states.actionError')));
     } finally {
-      if (reconnectFlowTargetRef.current !== id) setBusyId(null);
+      if (reconnectFlowTargetRef.current !== id) clearBusy(id);
     }
   };
 
@@ -871,7 +1118,6 @@ export function AgentManagementPanel({
     setDraft(EMPTY_DRAFT);
     setEditingId(null);
     setCreateError(null);
-    setActionError(null);
     setActionNotice(null);
     setView('create');
     if (state.skillsStatus === 'idle') void loadSkills();
@@ -883,15 +1129,13 @@ export function AgentManagementPanel({
     setMineKind('group');
     setGroupDraft(EMPTY_GROUP_DRAFT);
     setGroupCreateError(null);
-    setActionError(null);
     setActionNotice(null);
     setView('group-create');
     void loadCatalog({ includeTeamCompatibility: true });
-    if (state.skillsStatus === 'idle') void loadSkills();
+    void loadSkills({ includeTeamMarketplace: true });
   };
 
   const handleEdit = async (id: string) => {
-    setActionError(null);
     setActionNotice(null);
     setCreateError(null);
     try {
@@ -902,25 +1146,31 @@ export function AgentManagementPanel({
       if (state.skillsStatus === 'idle') void loadSkills();
       void loadMcps();
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.states.detailError')));
+      showActionError(formatActionError(error, t('agentManagement.states.detailError')));
     }
   };
 
   const handleCreate = async () => {
     setSaving(true);
     setCreateError(null);
-    setActionError(null);
     setActionNotice(null);
     try {
       if (editingId) {
         await client.updateAgent({ ...draft, id: editingId });
       } else {
-        await client.createAgent({ ...draft, id: draft.id || deriveAgentId(draft.name) });
+        const existingAgents = await client.listCatalog({ filter: 'mine' });
+        const normalizedName = draft.name.trim().toLocaleLowerCase();
+        if (existingAgents.some(agent => agent.displayName.trim().toLocaleLowerCase() === normalizedName)) {
+          setCreateError(t('agentManagement.states.duplicateName'));
+          return;
+        }
+        const id = draft.id || deriveAgentId(draft.name);
+        await client.createAgent({ ...draft, id });
+        await handleInstall(id);
       }
       await loadCatalog();
       setEditingId(null);
       setMineQuery('');
-        setMinePage(1);
       setView('mine');
     } catch (error) {
       setCreateError(formatActionError(error, t('agentManagement.form.saveError')));
@@ -932,17 +1182,30 @@ export function AgentManagementPanel({
   const handleGroupCreate = async () => {
     setGroupSaving(true);
     setGroupCreateError(null);
-    setActionError(null);
-      setActionNotice(null);
-      try {
-        const result = await groupClient.createGroup({ ...groupDraft, id: groupDraft.id || deriveAgentGroupId(groupDraft.name) });
-        await groupClient.installGroup(result.id);
-        await loadGroups('mine');
+    setActionNotice(null);
+    try {
+      const existingGroups = await groupClient.listGroups({ filter: 'local' });
+      const normalizedName = groupDraft.name.trim().toLocaleLowerCase();
+      if (existingGroups.some(group => group.displayName.trim().toLocaleLowerCase() === normalizedName)) {
+        setGroupCreateError(t('agentManagement.group.states.duplicateName'));
+        return;
+      }
+      const displayName = groupDraft.name.trim();
+      const result = await groupClient.createGroup({
+        ...groupDraft,
+        id: groupDraft.id || deriveAgentGroupId(groupDraft.name),
+      });
+      await groupClient.installGroup(result.id);
+      await loadGroups('mine');
       setGroupMineQuery('');
-      setGroupMinePage(1);
       setMineKind('group');
       setView('mine');
-      showActionNotice(t('agentManagement.group.states.createSuccess', { id: result.id }));
+      // Toast must use the user-facing display name, not package id (#5470).
+      showActionNotice(
+        t('agentManagement.group.states.createSuccess', {
+          name: displayName || result.id,
+        }),
+      );
     } catch (error) {
       setGroupCreateError(formatActionError(error, t('agentManagement.group.form.saveError')));
     } finally {
@@ -953,23 +1216,21 @@ export function AgentManagementPanel({
   const handleDelete = async (id: string, name: string) => {
     const confirmed = window.confirm(t('agentManagement.confirm.deleteMessage', { name }));
     if (!confirmed) return;
-    setBusyId(id);
-    setActionError(null);
+    markBusy(id);
     setActionNotice(null);
     try {
       await client.deleteDefinition(id);
       await loadCatalog();
       setView('mine');
     } catch (error) {
-      setActionError(formatActionError(error, t('agentManagement.states.actionError')));
+      showActionError(formatActionError(error, t('agentManagement.states.actionError')));
     } finally {
-      setBusyId(null);
+      clearBusy(id);
     }
   };
 
   const openUpload = () => {
     setCreateMenuOpen(false);
-    setActionError(null);
     setActionNotice(null);
     setUploadError(null);
     setUploadDialogOpen(true);
@@ -977,7 +1238,6 @@ export function AgentManagementPanel({
 
   const openGroupUpload = () => {
     setCreateMenuOpen(false);
-    setActionError(null);
     setActionNotice(null);
     setGroupUploadError(null);
     setGroupUploadDialogOpen(true);
@@ -988,7 +1248,6 @@ export function AgentManagementPanel({
       window.clearTimeout(actionNoticeTimerRef.current);
       actionNoticeTimerRef.current = null;
     }
-    setActionError(null);
     setActionNotice(null);
     setUploadError(null);
     setGroupUploadError(null);
@@ -996,23 +1255,59 @@ export function AgentManagementPanel({
       const result = kind === 'group'
         ? await groupClient.importGroup(path)
         : await client.importAgentTemplate(path);
+      let installFailed = false;
+      let installOutcomeUnknown = false;
+      let installErrorMessage = '';
       if (kind === 'group') {
-        await groupClient.installGroup(result.id);
+        try {
+          await groupClient.installGroup(result.id);
+        } catch (installError) {
+          // The package is already imported at this point; keep the imported
+          // group visible and report "imported but install failed" instead of
+          // bubbling up as a misleading upload failure (#5431 PR review).
+          installFailed = true;
+          installErrorMessage = formatActionError(installError, t('agentManagement.states.actionError'));
+          showActionError(installErrorMessage, { inline: false });
+        }
         await loadGroups('mine');
         setMineKind('group');
         setGroupMineQuery('');
-        setGroupMinePage(1);
       } else {
+        const outcome = await handleInstall(result.id, {
+          suppressInlineError: true,
+          onError: (message) => { installErrorMessage = message; },
+        });
+        installFailed = outcome === 'failed';
+        installOutcomeUnknown = outcome === 'uncertain';
+        if (installFailed) {
+          // A definite install failure must fail the whole upload: roll back
+          // the just-imported package so no half-imported expert is left
+          // behind. An uncertain outcome (timeout/disconnect) keeps the
+          // import: the backend may still be installing, so deleting here
+          // could remove a working expert.
+          try {
+            await client.deleteDefinition(result.id);
+          } catch { /* best-effort rollback; keep the import for a manual retry */ }
+        }
         await loadCatalog();
         setMineKind('agent');
         setMineQuery('');
-        setMinePage(1);
       }
-      setUploadDialogOpen(false);
-      setUploadError(null);
-      setGroupUploadDialogOpen(false);
-      setView('mine');
-      showActionNotice(t(kind === 'group' ? 'agentManagement.group.states.uploadSuccess' : 'agentManagement.states.uploadSuccess', { id: result.id }));
+      if (installFailed) {
+        // Keep the dialog open and show the error inside it so the user can
+        // see what went wrong without losing the upload context (#5431).
+        if (kind === 'group') setGroupUploadError(installErrorMessage || t('agentManagement.states.actionError'));
+        else setUploadError(installErrorMessage || t('agentManagement.states.actionError'));
+      } else if (installOutcomeUnknown) {
+        if (kind === 'group') setGroupUploadError(t('agentManagement.states.installOutcomeUnknown'));
+        else setUploadError(t('agentManagement.states.installOutcomeUnknown'));
+      } else {
+        setUploadDialogOpen(false);
+        setUploadError(null);
+        setGroupUploadDialogOpen(false);
+        setView('mine');
+        showActionNotice(t(kind === 'group' ? 'agentManagement.group.states.uploadSuccess' : 'agentManagement.states.uploadSuccess', { id: result.id }));
+      }
     } catch (error) {
       const message = formatActionError(error, t(kind === 'group' ? 'agentManagement.group.states.uploadError' : 'agentManagement.states.uploadError'));
       if (kind === 'group') setGroupUploadError(message);
@@ -1021,13 +1316,11 @@ export function AgentManagementPanel({
   };
 
   const goBackToCatalog = () => {
-    setActionError(null);
     setActionNotice(null);
     setView(detailOrigin);
   };
 
   const goBackToGroupCatalog = () => {
-    setActionError(null);
     setActionNotice(null);
     setView(groupDetailOrigin);
   };
@@ -1095,11 +1388,10 @@ export function AgentManagementPanel({
               ariaLabel={t('agentManagement.tabsLabel')}
               wrapperTestId="agent-management-primary-tabs"
               itemTestId="agent-management-primary-tab"
-              className="h-[34px] text-base"
+              className="page-tabs"
               value={isMine ? 'mine' : view}
               onChange={(nextView) => {
                 setCreateMenuOpen(false);
-                setActionError(null);
                 setActionNotice(null);
                 if (nextView === 'teams') setGroupCategory('');
                 setView(nextView as 'catalog' | 'teams' | 'mine');
@@ -1125,12 +1417,13 @@ export function AgentManagementPanel({
               />
             ) : null}
             <div className="agent-management-primary-actions" data-testid="agent-management-primary-actions">
-              {!isGroupView && <InstallationFilterSelect value={installationFilter} onChange={value => { setInstallationFilter(value); setCatalogPage(1); setMinePage(1); }} />}
+              {!isGroupView && <InstallationFilterSelect value={installationFilter} onChange={value => setInstallationFilter(value)} />}
+              {isGroupView && <InstallationFilterSelect value={groupInstallationFilter} onChange={value => setGroupInstallationFilter(value)} />}
               <PageToolbarSearch
                 wrapperTestId="agent-management-search"
                 inputTestId="agent-management-search-input"
                 name="agent-management-search"
-                aria-label={t(view === 'teams' ? 'agentManagement.searchTeams' : isGroupView ? 'agentManagement.searchMineGroup' : isMine ? 'agentManagement.searchMine' : 'agentManagement.searchCatalog')}
+                aria-label={t(view === 'teams' ? 'agentManagement.searchTeams' : isGroupView || isMine ? 'common.searchName' : 'agentManagement.searchCatalog')}
                 autoComplete="off"
                 disabled={connectorFlowId !== null}
                 value={view === 'teams' ? groupCatalogQuery : isGroupView ? groupMineQuery : isMine ? mineQuery : query}
@@ -1138,36 +1431,28 @@ export function AgentManagementPanel({
                   const nextValue = e.target.value;
                   if (view === 'teams') {
                     setGroupCatalogQuery(nextValue);
-                    setGroupCatalogPage(1);
                   } else if (isGroupView) {
                     setGroupMineQuery(nextValue);
-                    setGroupMinePage(1);
                   } else if (isMine) {
                     setMineQuery(nextValue);
-                    setMinePage(1);
                   } else {
                     setQuery(nextValue);
-                    setCatalogPage(1);
                   }
                 }}
                 onClear={() => {
                   if (view === 'teams') {
                     setGroupCatalogQuery('');
-                    setGroupCatalogPage(1);
                   } else if (isGroupView) {
                     setGroupMineQuery('');
-                    setGroupMinePage(1);
                   } else if (isMine) {
                     setMineQuery('');
-                    setMinePage(1);
                   } else {
                     setQuery('');
-                    setCatalogPage(1);
                   }
                 }}
-                placeholder={t(view === 'teams' ? 'agentManagement.searchTeams' : isGroupView ? 'agentManagement.searchMineGroup' : isMine ? 'agentManagement.searchMine' : 'agentManagement.searchCatalog')}
+                placeholder={t(view === 'teams' ? 'agentManagement.searchTeams' : isGroupView || isMine ? 'common.searchName' : 'agentManagement.searchCatalog')}
               />
-              {isMine ? (
+              {isMine && !isEnterprise() ? (
                 <div className="agent-management-create-menu" data-testid="agent-management-create-menu">
                   <button
                     type="button"
@@ -1214,33 +1499,35 @@ export function AgentManagementPanel({
               ) : null}
             </div>
           </div>
-          {actionError ? (
-            <div className="agent-management-inline-error" role="alert" data-testid="agent-management-inline-error">
-              {actionError}
-            </div>
-          ) : null}
           {actionNotice ? (
-            <div className="agent-management-inline-notice" role="status" data-testid="agent-management-inline-notice">
+            <div
+              className={`agent-management-inline-notice${actionNoticeError ? ' agent-management-inline-notice--error' : ''}`}
+              role="status"
+              data-testid="agent-management-inline-notice"
+            >
               {actionNotice}
             </div>
           ) : null}
           </div>
-          {!isGroupView && <CatalogCacheNotice cache={catalogCacheOf(state.catalog)} />}
+          <CatalogCacheNotice cache={isGroupView ? catalogCacheOf(groupCatalog) : catalogCacheOf(state.catalog)} />
           {isGroupView ? (
             <GroupCatalogPage
               scope={view === 'teams' ? 'catalog' : 'mine'}
               items={view === 'teams' ? groupCatalogView.items : groupMineView.items}
-              totalItems={view === 'teams' ? groupCatalogView.totalItems : groupMineView.totalItems}
-              page={view === 'teams' ? groupCatalogView.page : groupMineView.page}
-              totalPages={view === 'teams' ? groupCatalogView.totalPages : groupMineView.totalPages}
               query={view === 'teams' ? groupCatalogQuery : groupMineQuery}
               category={view === 'teams' ? groupCategory : ''}
+              categories={view === 'teams' ? groupCategories : []}
+              installation={groupInstallationFilter}
               status={view === 'teams' ? groupCatalogStatus : groupMineStatus}
               error={view === 'teams' ? groupCatalogError : groupMineError}
-              busyId={busyId}
-              onCategoryChange={value => { setGroupCategory(value); setGroupCatalogPage(1); }}
-              onPageChange={value => view === 'teams' ? setGroupCatalogPage(value) : setGroupMinePage(value)}
-              onRetry={() => void loadGroups(view === 'teams' ? 'catalog' : 'mine')}
+              busyIds={busyIds}
+              onCategoryChange={setGroupCategory}
+              onRetry={() =>
+                void loadGroups(
+                  view === 'teams' ? 'catalog' : 'mine',
+                  view === 'teams' ? groupCatalogQuery.trim() : '',
+                )
+              }
               onOpen={openGroupDetail}
               onUse={handleUseGroup}
               onInstall={handleInstallGroup}
@@ -1249,17 +1536,26 @@ export function AgentManagementPanel({
           ) : (
             <CatalogPage
               scope={isMine ? 'mine' : 'catalog'}
-              page={isMine ? minePage : catalogPage}
-              onPageChange={isMine ? setMinePage : setCatalogPage}
               items={isMine ? mineView.items : catalogView.items}
               totalItems={isMine ? mineView.totalItems : catalogView.totalItems}
               query={isMine ? mineQuery : query}
               category={category}
-              status={state.catalogStatus}
+              categories={isMine ? [] : categories}
+              installation={installationFilter}
+              status={
+                !isMine &&
+                !state.catalogError &&
+                catalogAwaitingItems(catalogView.totalItems, catalogCacheOf(state.catalog))
+                  ? 'loading'
+                  : state.catalogStatus
+              }
               error={state.catalogError}
-              busyId={busyId}
-              onCategoryChange={value => { setCategory(value); setCatalogPage(1); }}
-              onRetry={loadCatalog}
+              loadingText={catalogPodStarting ? t('experts.podStarting') : undefined}
+              busyIds={busyIds}
+              onCategoryChange={setCategory}
+              onRetry={() => void loadCatalog(
+                !isMine && query.trim() ? { query: query.trim() } : {},
+              )}
               onOpen={openDetail}
               onUse={handleUse}
               onReconnect={handleReconnect}
@@ -1282,9 +1578,9 @@ export function AgentManagementPanel({
           fileContent={state.fileContent}
           fileStatus={state.fileStatus}
           fileError={state.fileError}
-          actionError={actionError}
           actionNotice={actionNotice}
-          busy={busyId === selectedId}
+          actionNoticeError={actionNoticeError}
+          busy={Boolean(selectedId && busyIds.has(selectedId))}
           onBack={goBackToCatalog}
           onRetry={() => selectedId && void openDetail(selectedId)}
           onTabChange={handleTabChange}
@@ -1320,11 +1616,12 @@ export function AgentManagementPanel({
           onChange={setDraft}
           onReloadSkills={loadSkills}
           onReloadMcps={loadMcps}
+          onInstallSkill={(skill) => handleInstallSkill(skill, showActionError)}
+          installingSkillId={busySkillId}
           onCreateGroup={openGroupCreate}
           onCancel={() => {
             setEditingId(null);
             setDraft(EMPTY_DRAFT);
-            setActionError(null);
             setActionNotice(null);
             setView('mine');
           }}
@@ -1334,6 +1631,9 @@ export function AgentManagementPanel({
       {view === 'group-detail' && (
         <AgentGroupDetailPage
           detail={groupDetail}
+          loadingSummary={
+            [...groupCatalogRef.current, ...groupMineRef.current].find(item => item.id === groupSelectedId) ?? null
+          }
           detailStatus={groupDetailStatus}
           detailError={groupDetailError}
           detailTab={groupDetailTab}
@@ -1344,9 +1644,9 @@ export function AgentManagementPanel({
           fileContent={groupFileContent}
           fileStatus={groupFileStatus}
           fileError={groupFileError}
-          actionError={actionError}
           actionNotice={actionNotice}
-          busy={busyId === groupSelectedId}
+          actionNoticeError={actionNoticeError}
+          busy={Boolean(groupSelectedId && busyIds.has(groupSelectedId))}
           onBack={goBackToGroupCatalog}
           onRetry={() => groupSelectedId && void openGroupDetail(groupSelectedId)}
           onTabChange={handleGroupTabChange}
@@ -1362,19 +1662,50 @@ export function AgentManagementPanel({
         <AgentGroupEditor
           draft={groupDraft}
           agentOptions={catalogRef.current}
-          agentsStatus={state.catalogStatus}
+          agentsStatus={state.catalogCompatibilityStatus}
+          agentsError={state.catalogCompatibilityError}
           skillOptions={state.skillOptions}
           skillsStatus={state.skillsStatus}
           saving={groupSaving}
           error={groupCreateError}
           onChange={setGroupDraft}
           onReloadAgents={() => { void loadCatalog({ includeTeamCompatibility: true }); }}
-          onReloadSkills={loadSkills}
+          onReloadSkills={() => { void loadSkills({ includeTeamMarketplace: true }); }}
+          onInstallSkill={(skill) => handleInstallSkill(skill, showActionError)}
+          installingSkillId={busySkillId}
+          onInstallAgent={(id) => { void handleInstall(id, { includeTeamCompatibility: true }); }}
+          installingAgentIds={busyIds}
           onCreateAgent={openCreate}
-          onCancel={() => { setActionError(null); setActionNotice(null); setView('mine'); setMineKind('group'); }}
+          onCancel={() => { setActionNotice(null); setView('mine'); setMineKind('group'); }}
           onSave={handleGroupCreate}
         />
       )}
+      <Dialog
+        open={groupRuntimeNotice !== null}
+        titleId="agent-management-group-runtime-notice-title"
+        className="agent-management-group-runtime-dialog"
+        onCancel={() => setGroupRuntimeNotice(null)}
+        onBackdropClick={() => setGroupRuntimeNotice(null)}
+      >
+        <header data-testid="agent-management-group-runtime-notice-header">
+          <h2 id="agent-management-group-runtime-notice-title"
+            data-testid="agent-management-group-runtime-notice-title">
+            {t('chat.agentGroupRuntimeDisabledTitle')}
+          </h2>
+          <CloseButton
+            testId="agent-management-group-runtime-notice-close"
+            ariaLabel={t('common.close')}
+            onClick={() => setGroupRuntimeNotice(null)}
+          />
+        </header>
+        <p data-testid="agent-management-group-runtime-notice">{groupRuntimeNotice}</p>
+        <footer data-testid="agent-management-group-runtime-notice-actions">
+          <Button variant="primary" data-testid="agent-management-group-runtime-notice-confirm"
+            onClick={() => setGroupRuntimeNotice(null)}>
+            {t('chat.agentGroupRuntimeDisabledConfirm')}
+          </Button>
+        </footer>
+      </Dialog>
       {pendingConnectorModals}
       {uploadDialog}
       {groupUploadDialog}

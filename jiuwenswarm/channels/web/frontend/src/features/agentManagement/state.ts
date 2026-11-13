@@ -9,8 +9,11 @@ import type {
 
 export type AgentManagementState = {
   catalog: AgentCatalogItem[];
+  mineCatalog: AgentCatalogItem[];
   catalogStatus: RequestStatus;
   catalogError: string | null;
+  catalogCompatibilityStatus: RequestStatus;
+  catalogCompatibilityError: string | null;
   detail: AgentDetail | null;
   detailStatus: RequestStatus;
   detailError: string | null;
@@ -28,8 +31,11 @@ export type AgentManagementState = {
 export function createInitialAgentManagementState(): AgentManagementState {
   return {
     catalog: [],
+    mineCatalog: [],
     catalogStatus: 'idle',
     catalogError: null,
+    catalogCompatibilityStatus: 'idle',
+    catalogCompatibilityError: null,
     detail: null,
     detailStatus: 'idle',
     detailError: null,
@@ -49,8 +55,11 @@ export const initialAgentManagementState = createInitialAgentManagementState();
 
 export type AgentManagementAction =
   | { type: 'catalog.loading' }
-  | { type: 'catalog.loaded'; catalog: AgentCatalogItem[] }
+  | { type: 'catalog.loaded'; catalog: AgentCatalogItem[]; mineCatalog: AgentCatalogItem[] }
   | { type: 'catalog.error'; message: string }
+  | { type: 'catalog.compatibility.loading' }
+  | { type: 'catalog.compatibility.loaded' }
+  | { type: 'catalog.compatibility.error'; message: string }
   | { type: 'detail.loading' }
   | { type: 'detail.loaded'; detail: AgentDetail }
   | { type: 'detail.error'; message: string }
@@ -73,9 +82,21 @@ export function agentManagementReducer(
     case 'catalog.loading':
       return { ...state, catalogStatus: 'loading', catalogError: null };
     case 'catalog.loaded':
-      return { ...state, catalog: action.catalog, catalogStatus: 'success', catalogError: null };
+      return {
+        ...state,
+        catalog: action.catalog,
+        mineCatalog: action.mineCatalog,
+        catalogStatus: 'success',
+        catalogError: null,
+      };
     case 'catalog.error':
       return { ...state, catalogStatus: state.catalog.length ? 'success' : 'error', catalogError: action.message };
+    case 'catalog.compatibility.loading':
+      return { ...state, catalogCompatibilityStatus: 'loading', catalogCompatibilityError: null };
+    case 'catalog.compatibility.loaded':
+      return { ...state, catalogCompatibilityStatus: 'success', catalogCompatibilityError: null };
+    case 'catalog.compatibility.error':
+      return { ...state, catalogCompatibilityStatus: 'error', catalogCompatibilityError: action.message };
     case 'detail.loading':
       return {
         ...state,

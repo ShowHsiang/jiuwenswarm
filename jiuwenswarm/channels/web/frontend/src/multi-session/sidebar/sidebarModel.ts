@@ -1,19 +1,5 @@
 export type SessionIndicator = 'waiting' | 'processing' | 'unread' | 'error' | 'time';
 
-export type SidebarMenuAction =
-  | 'archive-sessions'
-  | 'pin'
-  | 'rename'
-  | 'archive'
-  | 'delete';
-
-export type SidebarMenuItem = {
-  action: SidebarMenuAction;
-  label: string;
-  danger?: boolean;
-  pinned?: boolean;
-};
-
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
 type RuntimeLike = {
@@ -35,11 +21,15 @@ type SessionLike = {
 
 function normalizeActivityTime(value: number | string | undefined): number | null {
   if (typeof value === 'number') {
-    return value < 1e11 ? value * 1000 : value;
+    // 0 / 负数 / NaN 都表示"没有有效时间"，不能当作合法时刻参与排序与展示。
+    // 早先用 `?? Date.now()` 兜底，会让这类会话被伪装成"刚刚"并顶到列表最前。
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const milliseconds = value < 1e11 ? value * 1000 : value;
+    return Number.isFinite(milliseconds) && milliseconds > 0 ? milliseconds : null;
   }
   if (typeof value === 'string') {
     const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? null : parsed;
+    return Number.isNaN(parsed) || parsed <= 0 ? null : parsed;
   }
   return null;
 }
@@ -49,7 +39,36 @@ export function getSessionActivityAt(session: Pick<SessionLike, 'last_user_messa
     ?? normalizeActivityTime(session.last_message_at)
     ?? normalizeActivityTime(session.updated_at)
     ?? normalizeActivityTime(session.created_at)
-    ?? Date.now();
+    // 与 stores/workspaceStore.ts 的同名函数保持一致：无法确定时间时返回 0，
+    // 由排序与展示两侧各自处理"未知时间"，避免同一会话在两处排序结果相反。
+    ?? 0;
+}
+
+/**
+ * 侧栏会话时间文案。
+ *
+ * - 未来时间戳（时钟漂移）按"刚刚"处理；
+ * - 7 天内用相对时间；
+ * - 7 天以上显示月日，跨年时补上年份，避免「1月5日」无法区分年份；
+ * - 完全无法确定时间时返回空串，不臆造"刚刚"。
+ */
+export function formatSessionTime(
+  activityAt: number,
+  now: number,
+  language: string,
+  translate: Translate,
+): string {
+  if (!Number.isFinite(activityAt) || activityAt <= 0) return '';
+  const elapsed = Math.max(0, now - activityAt);
+  if (elapsed < 60_000) return translate('time.justNow');
+  if (elapsed < 3_600_000) return translate('time.minutesAgo', { count: Math.floor(elapsed / 60_000) });
+  if (elapsed < 86_400_000) return translate('time.hoursAgo', { count: Math.floor(elapsed / 3_600_000) });
+  if (elapsed < 604_800_000) return translate('time.daysAgo', { count: Math.floor(elapsed / 86_400_000) });
+  const activityDate = new Date(activityAt);
+  const sameYear = activityDate.getFullYear() === new Date(now).getFullYear();
+  return activityDate.toLocaleDateString(language, sameYear
+    ? { month: 'short', day: 'numeric' }
+    : { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 export function getSessionIndicator(
@@ -65,6 +84,14 @@ export function getSessionIndicator(
   return 'time';
 }
 
+export function getViewedSessionId(
+  designCanvasOpen: boolean,
+  activeSessionId: string | null,
+  activeDesignSessionId: string | undefined,
+): string | null {
+  return designCanvasOpen ? activeDesignSessionId || null : activeSessionId;
+}
+
 export function getTaskStatusLabel(indicator: SessionIndicator, translate: Translate): string {
   if (indicator === 'waiting') return translate('multiSession.status.waiting');
   if (indicator === 'processing') return translate('multiSession.status.processing');
@@ -75,62 +102,6 @@ export function getTaskStatusLabel(indicator: SessionIndicator, translate: Trans
 
 export function getProjectNewLabel(projectName: string, translate: Translate): string {
   return translate('multiSession.project.startConversation', { projectName });
-}
-
-const PIN_LABEL_PAIRS = {
-  project: ['multiSession.project.pinProject', 'multiSession.project.unpinProject'],
-  projectSession: ['multiSession.project.pinConversation', 'multiSession.project.unpinConversation'],
-  conversation: ['multiSession.project.pin', 'multiSession.project.unpin'],
-} as const;
-
-function buildSidebarMenuItems(
-  isPinned: boolean,
-  pinLabels: readonly [string, string],
-  translate: Translate,
-  options: { archiveLabel: string },
-): SidebarMenuItem[] {
-  return [
-    { action: 'pin', label: translate(isPinned ? pinLabels[1] : pinLabels[0]), pinned: isPinned },
-    { action: 'rename', label: translate('multiSession.project.rename') },
-    { action: 'archive', label: options.archiveLabel },
-  ];
-}
-
-export function getProjectMenuItems(isPinned: boolean, translate: Translate, isDefault = false): SidebarMenuItem[] {
-  // “删除已归档会话”属于归档管理页的项目分组操作，项目菜单只保留批量归档。
-  const batchItems: SidebarMenuItem[] = [
-    { action: 'archive-sessions', label: translate('multiSession.project.archiveSessions') },
-  ];
-  if (isDefault) return batchItems;
-  // 项目不再有整体归档；菜单 = 置顶/重命名/删除 + 项目级批量会话操作。
-  return [
-    { action: 'pin', label: translate(isPinned ? PIN_LABEL_PAIRS.project[1] : PIN_LABEL_PAIRS.project[0]), pinned: isPinned },
-    { action: 'rename', label: translate('multiSession.project.rename') },
-    { action: 'delete', label: translate('multiSession.delete'), danger: true },
-    ...batchItems,
-  ];
-}
-
-export function getProjectSessionMenuItems(isPinned: boolean, translate: Translate): SidebarMenuItem[] {
-  return buildSidebarMenuItems(isPinned, PIN_LABEL_PAIRS.projectSession, translate, {
-    archiveLabel: translate('multiSession.project.archiveConversation'),
-  });
-}
-
-export function getConversationMenuItems(
-  isPinned: boolean,
-  translate: Translate,
-  options: { archivable?: boolean; deletable?: boolean } = {},
-): SidebarMenuItem[] {
-  const items = buildSidebarMenuItems(isPinned, PIN_LABEL_PAIRS.conversation, translate, {
-    archiveLabel: translate('multiSession.project.archiveConversation'),
-  });
-  // cron/heartbeat 触发会话被后端禁止单独归档，不提供必然失败的菜单项。
-  const visible = options.archivable === false
-    ? items.filter((item) => item.action !== 'archive')
-    : items;
-  if (options.deletable) visible.push({ action: 'delete', label: translate('multiSession.delete'), danger: true });
-  return visible;
 }
 
 export function sortSessionsForSidebar<T extends SessionLike>(sessions: T[]): T[] {

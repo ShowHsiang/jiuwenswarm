@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -15,17 +16,19 @@ from copy import deepcopy
 from typing import Any, Callable, NamedTuple, TYPE_CHECKING
 from weakref import WeakValueDictionary
 
-from jiuwenswarm.common.e2a.acp.protocol import build_acp_initialize_result
-from jiuwenswarm.agents.harness.team import get_team_manager
-from jiuwenswarm.common.config import get_available_models, get_config
-from jiuwenswarm.common.mode_matrix import (
+from agent_gateway.common.mode_matrix import (
     NEW_AGENT_WORK_NORMAL,
     NEW_AGENT_WORK_PLAN,
     canonicalize_mode_text,
     compose_web_mode,
     deprecate_mode,
     normalize_work_mode,
+    resolve_new_canonical_mode,
 )
+
+from jiuwenswarm.common.e2a.acp.protocol import build_acp_initialize_result
+from jiuwenswarm.common.config import get_available_models, get_config
+from jiuwenswarm.common.version import get_runtime_version
 from jiuwenswarm.agents.harness.common.rails.permissions.auto_config import (
     is_auto_permission_enabled,
     resolve_declared_auto_workspace,
@@ -46,7 +49,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-ACP_DEFAULT_CAPABILITIES: dict[str, Any] = build_acp_initialize_result()
+def get_team_manager(channel_id: str | None = None) -> Any:
+    """Keep Team-mode imports outside ordinary single-agent startup."""
+    from jiuwenswarm.agents.harness.team import get_team_manager as resolve
+
+    return resolve(channel_id)
+
+
+ACP_DEFAULT_CAPABILITIES: dict[str, Any] = build_acp_initialize_result(agent_version=get_runtime_version())
 
 
 def _normalize_channel_id(channel_id: str | None) -> str:
@@ -86,7 +96,7 @@ def _auto_permission_request_workspace(request: Any) -> str | None:
     metadata = getattr(request, "metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
     declared = resolve_declared_auto_workspace(params, metadata)
-    return os.path.normcase(str(declared)) if declared is not None else ""
+    return str(declared) if declared is not None else ""
 
 
 def _resolve_request_owner_mode(
@@ -100,12 +110,20 @@ def _resolve_request_owner_mode(
     if mode is not None:
         return mode, sub_mode
     mode_text = canonicalize_mode_text(params.get("mode", "agent"))
+    canonical = resolve_new_canonical_mode(mode_text)
+    if canonical is not None:
+        return canonical[0], canonical[1]
     work_mode = normalize_work_mode(params.get("work_mode"))
     if work_mode is not None:
         composed = compose_web_mode(mode_text, work_mode)
         if composed is not None:
             manager_mode, manager_sub_mode, _canonical_mode = composed
             return manager_mode, manager_sub_mode
+    if mode_text in {"agent", "code", "team"}:
+        return mode_text, sub_mode
+    canonical = resolve_new_canonical_mode(deprecate_mode(mode_text))
+    if canonical is not None:
+        return canonical[0], canonical[1]
     return mode_text.split(".", 1)[0], sub_mode
 
 
@@ -142,6 +160,16 @@ def _make_agent_cache_key(mode: str | None, sub_mode: str | None, project_dir: s
     sub_mode_key = collapse_plan_sub_mode(mode_key, sub_mode)
     project_key = _normalize_project_dir(project_dir)
     return f"{mode_key}:{sub_mode_key}:{project_key}"
+
+
+def _matches_single_agent_owner(cache_key: str, mode: str | None) -> bool:
+    if mode is None:
+        return True
+    parts = str(cache_key).split(":", 2)
+    if len(parts) < 2 or parts[0] != _normalize_mode(mode):
+        return False
+    allowed = {"", "normal", "plan", "fast"} if parts[0] == "agent" else {"", "normal", "plan"}
+    return parts[0] in {"agent", "code"} and parts[1] in allowed
 
 
 def _make_defined_agent_cache_key(
@@ -640,7 +668,10 @@ class AgentManager:
         Returns:
             JiuWenSwarm 实例
         """
-        from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
+        facade = await asyncio.to_thread(
+            importlib.import_module, "jiuwenswarm.server.runtime.agent_adapter.interface",
+        )
+        agent_class = facade.JiuWenSwarm
 
         for env_key, env_value in self._latest_env_overrides.items():
             key = str(env_key)
@@ -650,12 +681,24 @@ class AgentManager:
                 os.environ[key] = str(env_value)
         channel_key = _normalize_channel_id(agent_key)
         mode_key = _normalize_mode(mode)
+        from jiuwenswarm.server.runtime.agent_adapter.agent_adapters import resolve_sdk_choice
+
+        if resolve_sdk_choice() == "harness":
+            # Import only the backend selected by this request. The adapter
+            # factory and all loop-owned objects are still constructed below
+            # on the Runtime loop after these synchronous imports complete.
+            await asyncio.to_thread(
+                importlib.import_module,
+                "jiuwenswarm.server.runtime.agent_adapter.interface_code" if mode_key == "code"
+                else "jiuwenswarm.server.runtime.agent_adapter.interface_deep",
+            )
         # 用并轨后的子模式装配实例，和缓存键保持同一套语义。
         sub_mode_key = collapse_plan_sub_mode(mode_key, sub_mode)
-        project_dir = _normalize_project_dir((config or {}).get("project_dir"))
+        raw_project_dir = str((config or {}).get("project_dir") or "").strip()
+        project_dir = _normalize_project_dir(raw_project_dir)
         if project_dir:
             config = dict(config or {})
-            config["project_dir"] = project_dir
+            config["project_dir"] = os.path.abspath(os.path.expanduser(raw_project_dir))
         agent_cache_key = cache_key or _make_agent_cache_key(mode_key, sub_mode_key, project_dir)
         logger.info(
             "[AgentManager] Creating %s agent (mode=%s, sub_mode=%s, project_dir=%s)",
@@ -664,7 +707,7 @@ class AgentManager:
             sub_mode_key or None,
             project_dir or None,
         )
-        agent = JiuWenSwarm()
+        agent = agent_class()
         agent.set_heartbeat_service(self._heartbeat_service)
         setter = getattr(agent, "set_personal_context_runtime_enabled", None)
         if callable(setter):
@@ -915,6 +958,93 @@ class AgentManager:
             )
         return cleaned
 
+    async def cancel_session_tasks(
+        self, *, channel_id: str = "", session_id: str
+    ) -> None:
+        """Cancel and join session request tasks before lifecycle cleanup."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        channel_key = _normalize_channel_id(channel_id)
+        for agent in list(self.agents.get(channel_key, {}).values()):
+            cancel = getattr(agent, "cancel_session_tasks", None)
+            if callable(cancel):
+                await cancel(sid)
+
+    def session_has_live_subagents(
+        self,
+        *,
+        channel_id: str | None,
+        session_id: str,
+    ) -> bool:
+        """Whether the session-scoped adapter still holds live subagents.
+
+        Reads the registry the adapter already keeps, without creating either
+        the Agent or a subagent control, so asking never hydrates work.  Pairs
+        with :meth:`release_subagent_runtime_for_session`: a Session that is
+        busy only because subagents are still tearing down must not be
+        reported as one the user has to stop.
+        """
+        agent = self._resolve_session_agent(channel_id, session_id)
+        adapter = self._resolve_runtime_adapter(agent)
+        probe = getattr(adapter, "_session_has_live_subagents", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(session_id))
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[AgentManager] live subagent probe failed: session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+
+    def session_has_pending_interrupt(self, session_id: str) -> bool:
+        """Read-only: whether any cached Agent's Core waits for an answer in ``session_id``.
+
+        A full-duplex voice task shares the chat's Core session, whichever
+        channel started the waiting turn, so every channel's Agents are asked.
+        Asking never creates an Agent, a session adapter or an interrupt.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        for channel_agents in list(self.agents.values()):
+            if not isinstance(channel_agents, dict):
+                continue
+            for agent in list(channel_agents.values()):
+                adapter = self._resolve_runtime_adapter(agent)
+                probe = getattr(adapter, "session_has_pending_interrupt", None)
+                if callable(probe) and probe(sid):
+                    return True
+        return False
+
+    def _resolve_session_agent(
+        self,
+        channel_id: str | None,
+        session_id: str,
+    ) -> "JiuWenSwarm | None":
+        """Return the cached channel Agent that actually owns ``session_id``.
+
+        Subagent controls and session adapters are held per Agent, so both the
+        release and the live probe have to land on the owning Agent: a channel
+        caches one Agent per project and mode, and the first match is another
+        project's or mode's Agent whenever the channel holds more than one.
+        Releasing against that Agent cancels nothing and leaves the resident
+        subagents running, which is what made the Session look busy.
+
+        Falls back to the channel's Agent when no Agent claims the Session's
+        runtime — already torn down, or never bound — so a release that used to
+        run still gets a chance to run.
+        """
+        owner = self.get_agent_for_session_nowait(
+            channel_id=channel_id or "", session_id=session_id
+        )
+        if owner is not None:
+            return owner
+        return self.get_agent_nowait(channel_id=channel_id or "")
+
     async def release_subagent_runtime_for_session(
         self,
         *,
@@ -922,14 +1052,14 @@ class AgentManager:
         session_id: str,
         reason: str = "session_deleted",
     ) -> bool:
-        """Release subagent control owned by the channel's existing Agent.
+        """Release subagent control owned by the Agent running ``session_id``.
 
-        Product Session deletion historically performed this lookup in
-        AgentServer.  Keeping it here preserves the same first-Agent lookup and
-        adapter selection while hiding Agent/Adapter internals behind the
-        Runtime-owned manager boundary.
+        Product Session deletion historically performed a first-Agent lookup in
+        AgentServer.  Resolving the owning Agent here instead keeps the adapter
+        selection while hiding Agent/Adapter internals behind the Runtime-owned
+        manager boundary.
         """
-        agent = self.get_agent_nowait(channel_id=channel_id or "")
+        agent = self._resolve_session_agent(channel_id, session_id)
         adapter = self._resolve_runtime_adapter(agent)
         release_runtime = getattr(
             adapter,
@@ -1159,6 +1289,7 @@ class AgentManager:
         is_swarm: bool,
         persist_session: bool = False,
         prewarm_eligible: bool = True,
+        moa_enabled: bool = False,
         create_token: str | None = None,
     ):
         token = str(create_token or "").strip()
@@ -1172,7 +1303,7 @@ class AgentManager:
         # persist_session 不属于 WarmKey：同一预热 Agent 可服务开启或关闭的
         # Session，避免为布尔开关复制预热槽。但它属于 session.create 的幂等
         # 身份，同一 create_token 不允许用不同值重试。
-        create_signature = (key, bool(prewarm_eligible), bool(persist_session))
+        create_signature = (key, bool(prewarm_eligible), bool(persist_session), bool(moa_enabled))
         token_key = (key.channel_id, token)
         async with self._session_create_token_lock:
             if token:
@@ -1226,6 +1357,8 @@ class AgentManager:
             *,
             agent_definition: dict[str, Any] | None = None,
             agent_definition_fingerprint: str | None = None,
+            run_permissions_enabled: bool = False,
+            request: Any | None = None,
     ) -> "JiuWenSwarm | None":
         """获取 Agent 实例（自动创建）.
 
@@ -1260,6 +1393,8 @@ class AgentManager:
             if agent_definition is not None
             else _make_agent_cache_key(mode_key, sub_mode_key, project_key)
         )
+        if run_permissions_enabled:
+            cache_key += ":run-permissions"
         channel_agents = self.agents.get(channel_key, {})
         if cache_key in channel_agents:
             return self._borrow_agent(channel_agents[cache_key])
@@ -1272,17 +1407,25 @@ class AgentManager:
 
             config = {}
             if project_key:
-                config["project_dir"] = project_key
+                config["project_dir"] = project_dir
             # Surface the channel id to the adapter so session-scoped children
             # can branch their MCP load strategy (TUI = global config.yaml ∪
             # state.json enabled; web = session-level via chat.send's mcp field,
             # init loads nothing).
             config["channel_id"] = channel_key
+            if run_permissions_enabled:
+                config["run_permissions_enabled"] = True
             if channel_key == "acp":
                 config = {
                     **config,
                     **_build_acp_agent_config()
                 }
+            # 企业版：创建时带上本次请求，create_instance 才能按 bot 读模型模板。
+            if request is not None:
+                from jiuwenswarm.enterprise import is_enterprise
+
+                if is_enterprise():
+                    config = {**config, "request": request}
             create_kwargs: dict[str, Any] = {"cache_key": cache_key}
             if agent_definition is not None:
                 create_kwargs["agent_definition"] = agent_definition
@@ -1298,10 +1441,21 @@ class AgentManager:
             )
             return self._borrow_agent(agent)
 
+    def has_active_goal(self, channel_id: str, session_id: str) -> bool:
+        """Inspect cached Goal owners without borrowing or creating an Agent."""
+        channel_agents = self.agents.get(_normalize_channel_id(channel_id), {})
+        for agent in channel_agents.values():
+            checker = getattr(agent, "has_active_goal", None)
+            if callable(checker) and checker(session_id):
+                return True
+        return False
+
     def get_agent_for_session_nowait(
         self,
         channel_id: str,
         session_id: str,
+        *,
+        mode: str | None = None,
     ) -> "JiuWenSwarm | None":
         """Return the cached channel agent that owns ``session_id`` runtime."""
         sid = str(session_id or "").strip()
@@ -1314,6 +1468,8 @@ class AgentManager:
             return None
 
         for cache_key, agent in channel_agents.items():
+            if not _matches_single_agent_owner(cache_key, mode):
+                continue
             has_runtime = getattr(agent, "has_session_runtime", None)
             if not callable(has_runtime):
                 continue
@@ -1330,10 +1486,18 @@ class AgentManager:
                 )
         return None
 
+    def borrow_agent_nowait(self, agent: "JiuWenSwarm") -> "JiuWenSwarm | None":
+        """Borrow ``agent`` while it is still cached; None once it was retired or recreated."""
+        if any(agent is cached for channel_agents in self.agents.values() for cached in channel_agents.values()):
+            return self._borrow_agent(agent)
+        return None
+
     def get_auto_permission_agent_for_session_nowait(
         self,
         channel_id: str,
         session_id: str,
+        *,
+        mode: str | None = None,
     ) -> "JiuWenSwarm | None":
         """Return the exact cached channel agent owning this Auto session."""
 
@@ -1343,7 +1507,9 @@ class AgentManager:
         channel_agents = self.agents.get(_normalize_channel_id(channel_id), {})
         if not isinstance(channel_agents, dict):
             return None
-        for agent in channel_agents.values():
+        for cache_key, agent in channel_agents.items():
+            if not _matches_single_agent_owner(cache_key, mode):
+                continue
             checker = getattr(agent, "has_auto_permission_session", None)
             try:
                 if callable(checker) and checker(sid):
@@ -1914,8 +2080,9 @@ class AgentManager:
         agent_definition_fingerprint: str | None = None,
     ) -> "JiuWenSwarm | None":
         """Admit one request and pin Auto sessions to their first owner/root."""
+        from jiuwenswarm.runtime.request import resolve_request_owner_channel
 
-        channel_id = getattr(request, "channel_id", "")
+        channel_id = resolve_request_owner_channel(request)
         params = getattr(request, "params", {})
         params = params if isinstance(params, dict) else {}
         mode_full = params.get("mode", "agent")
@@ -1929,7 +2096,7 @@ class AgentManager:
         auto_workspace = _auto_permission_request_workspace(request)
         session_id = getattr(request, "session_id", "")
         owner = self.get_auto_permission_agent_for_session_nowait(
-            channel_id, session_id
+            channel_id, session_id, mode=selected_mode
         )
         owner_auto = getattr(owner, "has_auto_permission_session", None)
         needs_auto_owner = supports_phase_auto_root(params) and (
@@ -1956,7 +2123,7 @@ class AgentManager:
                 )
                 permission_resume = is_interrupt_resume_payload(params)
                 owner = self.get_auto_permission_agent_for_session_nowait(
-                    channel_id, session_id
+                    channel_id, session_id, mode=selected_mode
                 )
                 owner_auto = getattr(owner, "has_auto_permission_session", None)
                 has_auto_owner = bool(
@@ -1967,7 +2134,9 @@ class AgentManager:
                 if permission_resume and not has_auto_owner:
                     # A pending manual call still belongs to its installed owner
                     # after Smart is selected. Never prepare a new owner for an answer.
-                    owner = self.get_agent_for_session_nowait(channel_id, session_id)
+                    owner = self.get_agent_for_session_nowait(
+                        channel_id, session_id, mode=selected_mode,
+                    )
                     if owner is None:
                         raise RootPermissionQueueError("permission_resume_owner_missing")
                 new_task_without_owner = not has_auto_owner and not permission_resume
@@ -2044,6 +2213,7 @@ class AgentManager:
                         )
                     agent = await self.get_agent(
                         **get_kwargs,
+                        request=request,
                     )
                     prepare = getattr(agent, "prepare_session", None)
                     if not callable(prepare):
@@ -2064,12 +2234,14 @@ class AgentManager:
             "project_dir": project_dir,
             "sub_mode": selected_sub_mode,
         }
+        if channel_id == "process_cli" and isinstance(params.get("run_permissions"), dict):
+            get_kwargs["run_permissions_enabled"] = True
         if agent_definition is not None:
             get_kwargs["agent_definition"] = agent_definition
             get_kwargs["agent_definition_fingerprint"] = (
                 agent_definition_fingerprint
             )
-        return await self.get_agent(**get_kwargs)
+        return await self.get_agent(**get_kwargs, request=request)
 
     async def process_message(self, request: Any) -> Any:
         """处理非流式请求.

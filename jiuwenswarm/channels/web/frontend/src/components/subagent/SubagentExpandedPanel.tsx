@@ -1,7 +1,7 @@
 import { AlertCircle, CircleEllipsis, Lightbulb, ListTodo, Search, SquareTerminal, Wrench } from 'lucide-react';
 import { memo, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import ProcessingIcon from '../../assets/subagent/processing.svg?react';
+import { LoadingSpinner } from '../ui/LoadingSpinner/LoadingSpinner';
 import BackIcon from '../../assets/back.svg?react';
 import { getSubagentStatusLabelKey } from '../../features/subagent/subagentStatusPresentation';
 import {
@@ -185,9 +185,9 @@ function ActivityRow({
             {timestamp}
           </span>
         ) : null}
-        <span className="shrink-0 text-muted">
+        <span className="shrink-0 text-text-meta">
           {isRunning ? (
-            <ProcessingIcon className="h-4 w-4 shrink-0 animate-spin" aria-label={t('subagent.running')} role="img" />
+            <LoadingSpinner />
           ) : (
             <Chevron expanded={expanded} />
           )}
@@ -659,11 +659,16 @@ export function SubagentExpandedPanel({
                   <span
                     className="block truncate text-sm font-semibold text-text"
                     data-testid="subagent-expanded-row-name"
+                    title={subagent.display_name}
                   >
                     {subagent.display_name}
                   </span>
                   {subagent.role || subagent.task_description ? (
-                    <span className="block truncate text-xs text-text-muted" data-testid="subagent-expanded-row-role">
+                    <span
+                      className="block truncate text-xs text-text-muted"
+                      data-testid="subagent-expanded-row-role"
+                      title={subagent.role || subagent.task_description}
+                    >
                       {subagent.role || subagent.task_description}
                     </span>
                   ) : null}

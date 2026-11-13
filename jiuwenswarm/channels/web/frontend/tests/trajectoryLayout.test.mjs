@@ -10,6 +10,8 @@ import {
   rawInspectorHeightBounds,
   rawInspectorKeyboardHeight,
   shouldInsetTrajectoryForFloatingTasks,
+  trajectoryComposerClearance,
+  trajectoryComposerPolicy,
 } from '../node_modules/.cache/trajectory-layout/trajectoryLayout.js';
 
 test('raw inspector height is clamped to its fixed minimum and container-relative maximum', () => {
@@ -48,6 +50,10 @@ test('Agent and Team trajectories reserve space for a visible collapsed floating
     false,
   );
   assert.equal(
+    shouldInsetTrajectoryForFloatingTasks('agent', 'diagnosis', true, false, false),
+    true,
+  );
+  assert.equal(
     shouldInsetTrajectoryForFloatingTasks('team', 'trajectory', true, false, false),
     true,
   );
@@ -55,4 +61,26 @@ test('Agent and Team trajectories reserve space for a visible collapsed floating
     shouldInsetTrajectoryForFloatingTasks('auto_harness', 'trajectory', true, false, false),
     false,
   );
+});
+
+test('docked composer reserves exactly what it covers, and nothing once collapsed', () => {
+  assert.equal(trajectoryComposerClearance(true, false, 148), 148);
+  assert.equal(trajectoryComposerClearance(true, false, 147.2), 148);
+  // Collapsed to watch-only, or left behind on the chat view, it covers nothing.
+  assert.equal(trajectoryComposerClearance(true, true, 148), 0);
+  assert.equal(trajectoryComposerClearance(false, false, 148), 0);
+});
+
+test('diagnosis selection and the diagnosis page keep the composer closed', () => {
+  assert.equal(trajectoryComposerPolicy('trajectory', false), 'available');
+  assert.equal(trajectoryComposerPolicy('trajectory', true), 'locked');
+  assert.equal(trajectoryComposerPolicy('diagnosis', false), 'hidden');
+  assert.equal(trajectoryComposerPolicy('diagnosis', true), 'hidden');
+});
+
+test('composer clearance refuses heights a layout pass cannot have produced', () => {
+  assert.equal(trajectoryComposerClearance(true, false, 0), 0);
+  assert.equal(trajectoryComposerClearance(true, false, -20), 0);
+  assert.equal(trajectoryComposerClearance(true, false, Number.NaN), 0);
+  assert.equal(trajectoryComposerClearance(true, false, Number.POSITIVE_INFINITY), 0);
 });

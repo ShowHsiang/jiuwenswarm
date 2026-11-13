@@ -1,5 +1,3 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-
 /** Same-origin HTTP client for the JiuwenSwarm trajectory read API. */
 
 import { getApiBase } from '../../utils/env';
@@ -121,12 +119,18 @@ export class TrajectoryApiError extends Error {
   }
 }
 
+/**
+ * Download one session's archive: a zip holding its `trajectory.jsonl`.
+ *
+ * The bytes are handed back as they are. Nothing here parses them, so saving
+ * a large session costs one copy of the compressed file and no more.
+ */
 export async function getTrajectoryArchive(
   sessionId: string,
   options: { signal?: AbortSignal } = {},
-): Promise<string> {
+): Promise<Blob> {
   const response = await fetch(trajectoryUrl(
-    `/api/trajectory/sessions/${encodeURIComponent(sessionId)}/archive?format=addressed`,
+    `/api/trajectory/sessions/${encodeURIComponent(sessionId)}/archive`,
   ), {
     cache: 'no-store',
     signal: options.signal,
@@ -134,18 +138,18 @@ export async function getTrajectoryArchive(
   if (!response.ok) {
     await readResponse(response);
   }
-  return response.text();
+  return response.blob();
 }
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function trajectoryUrl(path: string): string {
+export function trajectoryUrl(path: string): string {
   return `${getApiBase()}${path}`;
 }
 
-async function readResponse(response: Response): Promise<unknown> {
+export async function readResponse(response: Response): Promise<unknown> {
   let payload: unknown;
   try {
     payload = await response.json();
@@ -198,7 +202,8 @@ function validUsage(value: unknown): value is TrajectoryUsage {
   });
 }
 
-function validSessionUsageItem(value: unknown): value is TrajectorySessionUsageItem {
+/** Whether a value is one well-formed session usage item, from the API or an archive. */
+export function isTrajectorySessionUsageItem(value: unknown): value is TrajectorySessionUsageItem {
   if (!object(value)) return false;
   return typeof value.trace_id === 'string'
     && /^[0-9a-f]{32}$/.test(value.trace_id)
@@ -229,7 +234,7 @@ export async function getTrajectorySessionUsage(
     || !validStoreEpoch(payload.store_epoch)
     || payload.scope !== 'session'
     || !Array.isArray(payload.items)
-    || !payload.items.every(validSessionUsageItem)) {
+    || !payload.items.every(isTrajectorySessionUsageItem)) {
     throw new TrajectoryApiError(
       'Trajectory session usage response is invalid',
       502,
@@ -490,6 +495,49 @@ export async function getTrajectoryStreamFrames(
 }
 
 /** Most hashes one request may name; the server rejects more. */
+export interface TrajectoryCheckpointsResponse {
+  schema_version: 1;
+  session_id: string;
+  store_epoch: string;
+  /** One checkpoint per execution subject, as the store states it. */
+  checkpoints: Record<string, unknown>[];
+  /** Element hashes of every chain the checkpoints refer to, in order. */
+  sequences: Record<string, string[]>;
+  /** Content of every element those chains hold. */
+  blobs: Record<string, string>;
+}
+
+/**
+ * Read what retention left for one session's removed turns.
+ *
+ * A view seeds itself from these before it loads a record, so the turns that
+ * remain render as they did. Every chain they refer to comes with the answer,
+ * whatever this reader already holds.
+ */
+export async function getTrajectoryCheckpoints(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<TrajectoryCheckpointsResponse> {
+  const response = await fetch(trajectoryUrl(
+    `/api/trajectory/sessions/${encodeURIComponent(sessionId)}/checkpoints`,
+  ), {
+    cache: 'no-store',
+    signal: options.signal,
+  });
+  const payload = await readResponse(response);
+  if (!object(payload)
+    || payload.schema_version !== 1
+    || payload.session_id !== sessionId
+    || !validStoreEpoch(payload.store_epoch)
+    || !Array.isArray(payload.checkpoints)
+    || !payload.checkpoints.every(object)
+    || !object(payload.sequences)
+    || !object(payload.blobs)) {
+    throw new TrajectoryApiError('Trajectory checkpoint response is invalid', 502, 'INVALID_RESPONSE');
+  }
+  return payload as unknown as TrajectoryCheckpointsResponse;
+}
+
 export const MAX_SEQUENCE_REQUEST = 200;
 
 /**

@@ -11,10 +11,14 @@
  * - Esc / 点击遮罩关闭
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MarkdownRenderer } from '../MarkdownRenderer';
-import type { WorkflowAgent } from './workflowTypes';
+import { useSessionStore } from '../../stores/sessionStore';
+import type { WorkflowAgent, WorkflowAgentActivity, WorkflowRun } from './workflowTypes';
+import { findWorkflowAgent, parseVerifyOutcome, verifyVoteText } from './workflowTypes';
+import { buildProcessItems, Chevron } from './shared';
+import { ProcessListCard } from './ProcessListCard';
 
 // ── 字数格式化 ────────────────────────────────────────────
 
@@ -26,7 +30,7 @@ export function formatCharCount(s: string): string {
 
 // ── 详情 Section 类型 ─────────────────────────────────────
 
-export type DetailSectionKey = 'prompt' | 'human_prompt' | 'human_reply' | 'outcome' | 'error' | 'result';
+export type DetailSectionKey = 'prompt' | 'human_prompt' | 'human_reply' | 'outcome' | 'error' | 'result' | 'activity';
 export type DetailAccent = 'blue' | 'amber' | 'emerald' | 'red';
 export interface DetailSection {
   key: DetailSectionKey;
@@ -34,6 +38,8 @@ export interface DetailSection {
   icon: string;
   content: string;
   accent: DetailAccent;
+  /** Tool-activity rows; present only on the activity section (no text content). */
+  activity?: WorkflowAgentActivity[];
 }
 
 export interface AgentModalState {
@@ -63,13 +69,27 @@ export const accentTabActiveClass: Record<DetailAccent, string> = {
 };
 
 /** 根据 agent 字段汇总可用的详情 section，标签与弹窗共用同一数据源。 */
-export function buildDetailSections(agent: WorkflowAgent): DetailSection[] {
+export function buildDetailSections(
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  agent: WorkflowAgent,
+): DetailSection[] {
   const secs: DetailSection[] = [];
-  if (agent.prompt) secs.push({ key: 'prompt', label: '输入', icon: '▶', content: agent.prompt, accent: 'blue' });
-  if (agent.human_prompt) secs.push({ key: 'human_prompt', label: '人工提问', icon: '☺', content: agent.human_prompt, accent: 'amber' });
-  if (agent.human_reply) secs.push({ key: 'human_reply', label: '人工回复', icon: '✓', content: agent.human_reply, accent: 'emerald' });
-  if (agent.outcome) secs.push({ key: 'outcome', label: '输出', icon: '◀', content: agent.outcome, accent: 'emerald' });
-  if (agent.error) secs.push({ key: 'error', label: '错误', icon: '✕', content: agent.error, accent: 'red' });
+  if (agent.prompt) secs.push({ key: 'prompt', label: t('swarmflow.sectionInput'), icon: '▶', content: agent.prompt, accent: 'blue' });
+  if (agent.human_prompt) secs.push({ key: 'human_prompt', label: t('swarmflow.sectionHumanPrompt'), icon: '☺', content: agent.human_prompt, accent: 'amber' });
+  if (agent.human_reply) secs.push({ key: 'human_reply', label: t('swarmflow.sectionHumanReply'), icon: '✓', content: agent.human_reply, accent: 'emerald' });
+  if (agent.outcome) secs.push({ key: 'outcome', label: t('swarmflow.sectionOutput'), icon: '◀', content: agent.outcome, accent: 'emerald' });
+  if (agent.error) secs.push({ key: 'error', label: t('swarmflow.sectionError'), icon: '✕', content: agent.error, accent: 'red' });
+  // 工具活动对：人类节点不产 activity，空列表不加 section。
+  if (agent.activity && agent.activity.length > 0) {
+    secs.push({
+      key: 'activity',
+      label: t('swarmflow.sectionCallRecords'),
+      icon: '⚙',
+      content: '',
+      accent: 'blue',
+      activity: agent.activity,
+    });
+  }
   return secs;
 }
 
@@ -87,9 +107,52 @@ function tryParseJson(content: string): unknown | null {
   }
 }
 
+// 块级 Markdown 标记（标题 / 列表 / 引用 / 表格 / 围栏代码块）。
+const MARKDOWN_HINT_RE = /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|\|)|```/;
+
+/**
+ * 保守判定"值得按 Markdown 渲染"：多行且带块级标记。
+ * 多行纯散文不走这里（避免 Markdown 段落合并丢换行，仍按 pre-wrap 展示）；
+ * 单行短文本维持 JSON 字符串原样。
+ */
+function looksLikeMarkdown(text: string): boolean {
+  if (!text.includes('\n')) return false;
+  return MARKDOWN_HINT_RE.test(text);
+}
+
+/** Engine prefixes a completed workflow's structured result with this fixed banner. */
+const WORKFLOW_RESULT_PREFIX = 'Workflow completed, result: ';
+
+/** Parse a workflow result section, stripping the engine banner prefix when present. */
+function tryParseWorkflowResult(content: string): unknown | null {
+  const direct = tryParseJson(content);
+  if (direct !== null) return direct;
+  const idx = content.indexOf(WORKFLOW_RESULT_PREFIX);
+  if (idx === -1) return null;
+  return tryParseJson(content.slice(idx + WORKFLOW_RESULT_PREFIX.length));
+}
+
 function JsonValue({ value }: { value: unknown }) {
   if (value === null) return <span className="text-text">null</span>;
-  if (typeof value === 'string') return <span className="text-text">&quot;{value}&quot;</span>;
+  if (typeof value === 'string') {
+    // JSON 字段值里嵌的 Markdown（schema 结构化输出的 report / feedback 等）：
+    // 多行且带块级标记 → Markdown 卡片渲染；多行纯文本 → pre-wrap 保换行；
+    // 单行短文本 → 维持 "value" 引号原样。
+    if (looksLikeMarkdown(value)) {
+      return (
+        <div
+          className="my-1 w-full rounded-md border border-border/40 bg-secondary/30 px-2 py-1.5"
+          data-testid="team-area-swarmflow-detail-modal-json-markdown"
+        >
+          <MarkdownRenderer content={value} className="text-xs text-text max-w-none" />
+        </div>
+      );
+    }
+    if (value.includes('\n')) {
+      return <span className="text-text whitespace-pre-wrap break-words">&quot;{value}&quot;</span>;
+    }
+    return <span className="text-text">&quot;{value}&quot;</span>;
+  }
   if (typeof value === 'number') return <span className="text-text">{value}</span>;
   if (typeof value === 'boolean') return <span className="text-text">{String(value)}</span>;
   return <span className="text-text">{String(value)}</span>;
@@ -162,18 +225,121 @@ function JsonTreeView({ data }: { data: unknown }) {
   );
 }
 
+// ── 调用记录（懒挂载成员调用列表同款卡片） ─────────────────
+
+export interface CallRecordsSource {
+  sessionId: string;
+  /** 镜像 worker 的成员 id（`run_id:agent_id`），与成员调用列表同源过滤执行事件。 */
+  memberId: string;
+}
+
+/**
+ * 与成员调用列表同一数据源：store 的 `teamMemberExecutionEvents` 按
+ * `member_id` 过滤，再复用 `buildProcessItems` + `ProcessListCard` 渲染路径，
+ * 保证数据与卡片呈现完全一致。默认折叠，展开才构造 `ProcessItem`
+ * （懒挂载——折叠时零卡片渲染，不与成员面板的调用列表永久重复）。
+ */
+function CallRecordsSection({ source }: { source: CallRecordsSource }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const executionEvents = useSessionStore(
+    (s) => s.runtimes[source.sessionId]?.teamMemberExecutionEvents ?? [],
+  );
+
+  const memberEvents = useMemo(
+    () => executionEvents.filter((e) => e.member_id === source.memberId),
+    [executionEvents, source.memberId],
+  );
+  // 徽章计数：调用记录 = 该成员的 tool_call 条数（折叠时也显示）。
+  const callCount = useMemo(
+    () => memberEvents.filter((e) => e.kind === 'tool_call').length,
+    [memberEvents],
+  );
+  // 懒挂载：仅展开时构造卡片数据（任务/消息源传空，只留执行项）。
+  const items = useMemo(
+    () =>
+      expanded ? buildProcessItems(source.memberId, [], [], [], memberEvents, t) : [],
+    [expanded, source.memberId, memberEvents, t],
+  );
+
+  const toggleItem = (itemId: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 rounded-md border border-border/40 bg-secondary/20 px-2 py-1.5 text-left hover:bg-secondary/40"
+        data-testid="team-area-swarmflow-detail-modal-call-records-header"
+      >
+        <Chevron expanded={expanded} />
+        {/* 区段标签保持通用的“活动”（chip/Tab 同键），折叠区头点名当前适配的
+            类型“工具调用”——后续扩展非工具活动时这里换成分组标题即可。 */}
+        <span className="text-xs font-medium text-text">{t('swarmflow.sectionToolCalls')}</span>
+        <span
+          className="ml-auto shrink-0 rounded bg-black/10 dark:bg-white/10 px-1 text-[10px] tabular-nums text-text-muted"
+          data-testid="team-area-swarmflow-detail-modal-call-records-count"
+        >
+          {callCount}
+        </span>
+      </button>
+      {expanded && (
+        <ProcessListCard
+          items={items}
+          expandedIds={expandedIds}
+          onToggle={toggleItem}
+          emptyText={t('team.noProcessData')}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── 弹窗组件 ──────────────────────────────────────────────
+
+const EMPTY_WORKFLOW_RUNS: WorkflowRun[] = [];
 
 export interface AgentDetailModalProps {
   state: AgentModalState | null;
   agentName: string;
   onClose: () => void;
   onTabChange: (key: DetailSectionKey) => void;
+  /** swarmflow 节点身份（run + agent）：调用记录按 `member_id=run_id:agent_id` 过滤 store 执行事件。 */
+  callRecordsSource?: CallRecordsSource | null;
 }
 
-export function AgentDetailModal({ state, agentName, onClose, onTabChange }: AgentDetailModalProps) {
+export function AgentDetailModal({ state, agentName, onClose, onTabChange, callRecordsSource }: AgentDetailModalProps) {
   const { t } = useTranslation();
   const [rawMode, setRawMode] = useState(false);
+
+  // 弹窗开着时数据仍在流（运行中节点）：sections 若冻结在打开瞬间，Tab 上的
+  // 活动计数、后到的 outcome/error 都会陈旧。有 callRecordsSource（run:agent
+  // 身份）时按 store 里的活 agent 重建；合成 sections（verify 面板整体输入/
+  // 输出）无对应节点，退回打开时的快照。
+  const liveSessionId = callRecordsSource?.sessionId ?? '';
+  const liveMemberId = callRecordsSource?.memberId ?? '';
+  const liveRuns = useSessionStore((s) =>
+    liveSessionId ? s.runtimes[liveSessionId]?.workflowRuns ?? EMPTY_WORKFLOW_RUNS : EMPTY_WORKFLOW_RUNS,
+  );
+  const liveAgent = useMemo(() => {
+    if (!liveSessionId || !liveMemberId) return null;
+    const sep = liveMemberId.indexOf(':');
+    if (sep <= 0) return null;
+    const found = findWorkflowAgent(liveRuns, liveMemberId.slice(0, sep), liveMemberId.slice(sep + 1));
+    return found?.agent ?? null;
+  }, [liveRuns, liveSessionId, liveMemberId]);
+  const sections = useMemo(
+    () => (liveAgent ? buildDetailSections(t, liveAgent) : state?.sections ?? []),
+    [liveAgent, state?.sections, t],
+  );
 
   useEffect(() => {
     if (!state) return;
@@ -191,13 +357,18 @@ export function AgentDetailModal({ state, agentName, onClose, onTabChange }: Age
 
   if (!state) return null;
 
-  const activeSection = state.sections.find((s) => s.key === state.activeKey);
+  const activeSection = sections.find((s) => s.key === state.activeKey);
   const content = activeSection?.content ?? '';
   // 仅对输入/输出尝试 JSON 渲染
   const isJsonSection = activeSection?.key === 'prompt' || activeSection?.key === 'outcome';
-  // 错误/结果为纯文本（traceback / 摘要），不套 Markdown
-  const isPlainTextSection = activeSection?.key === 'error' || activeSection?.key === 'result';
-  const jsonData = isJsonSection ? tryParseJson(content) : null;
+  const isResultSection = activeSection?.key === 'result';
+  // 错误为纯文本（traceback），不套 Markdown
+  const isPlainTextSection = activeSection?.key === 'error';
+  const jsonData = isJsonSection
+    ? tryParseJson(content)
+    : isResultSection
+      ? tryParseWorkflowResult(content)
+      : null;
 
   return (
     <div
@@ -210,14 +381,30 @@ export function AgentDetailModal({ state, agentName, onClose, onTabChange }: Age
         type="button"
         className="absolute inset-0 bg-black/60"
         onClick={onClose}
-        aria-label="关闭"
+        aria-label={t('common.close')}
         data-testid="team-area-swarmflow-detail-modal-backdrop"
       />
       <div className="relative w-full max-w-4xl max-h-[85vh] overflow-hidden rounded-xl border border-border bg-card shadow-2xl animate-rise flex flex-col">
         {/* 标题：Agent 名 · 当前 section label */}
         <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-border bg-panel shrink-0">
           <div className="min-w-0 flex-1">
-            <h3 className="text-base font-semibold text-text truncate" data-testid="team-area-swarmflow-detail-modal-title">{agentName}</h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-base font-semibold text-text truncate" data-testid="team-area-swarmflow-detail-modal-title">{agentName}</h3>
+              {activeSection?.key === 'outcome' && (() => {
+                const verdict = parseVerifyOutcome(content);
+                if (!verdict) return null;
+                const badgeClass = verdict.type === 'pass' 
+                  ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                  : verdict.type === 'fail'
+                  ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800'
+                  : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800';
+                return (
+                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border ${badgeClass}`}>
+                    {verifyVoteText(t, verdict)}
+                  </span>
+                );
+              })()}
+            </div>
             <p className="text-xs text-text-muted mt-0.5" data-testid="team-area-swarmflow-detail-modal-section-label" data-variant={activeSection?.key}>{activeSection?.label}</p>
           </div>
           <button
@@ -231,9 +418,9 @@ export function AgentDetailModal({ state, agentName, onClose, onTabChange }: Age
         </div>
 
         {/* Tab 栏：可在输入/提问/回复/输出/错误间切换，无需反复开关 */}
-        {state.sections.length > 1 && (
+        {sections.length > 1 && (
           <div className="flex items-center gap-1 px-3 py-2 border-b border-border/60 bg-secondary/20 shrink-0 overflow-x-auto" data-testid="team-area-swarmflow-detail-modal-tabs">
-            {state.sections.map((sec) => {
+            {sections.map((sec) => {
               const active = sec.key === state.activeKey;
               return (
                 <button
@@ -250,7 +437,9 @@ export function AgentDetailModal({ state, agentName, onClose, onTabChange }: Age
                 >
                   <span>{sec.icon}</span>
                   <span>{sec.label}</span>
-                  <span className="text-[9px] tabular-nums opacity-70">{formatCharCount(sec.content)}</span>
+                  <span className="text-[9px] tabular-nums opacity-70">
+                    {sec.activity ? sec.activity.length : formatCharCount(sec.content)}
+                  </span>
                 </button>
               );
             })}
@@ -289,11 +478,18 @@ export function AgentDetailModal({ state, agentName, onClose, onTabChange }: Age
               </button>
             </div>
           )}
-          {rawMode ? (
+          {activeSection?.activity && callRecordsSource ? (
+            <CallRecordsSection source={callRecordsSource} />
+          ) : activeSection?.activity ? (
+            <p className="text-sm text-text-muted">{t('team.noProcessData')}</p>
+          ) : rawMode ? (
             <pre className="text-xs text-text whitespace-pre-wrap break-words font-mono">{content}</pre>
           ) : jsonData !== null ? (
             <JsonTreeView data={jsonData} />
-          ) : isJsonSection || isPlainTextSection ? (
+          ) : isPlainTextSection ? (
+            <pre className="text-xs text-text whitespace-pre-wrap break-words font-mono">{content}</pre>
+          ) : isJsonSection && !looksLikeMarkdown(content) ? (
+            /* 解析失败的坏 JSON（以 {/[ 开头）或无块级标记的纯文本：等宽原文保真 */
             <pre className="text-xs text-text whitespace-pre-wrap break-words font-mono">{content}</pre>
           ) : (
             <MarkdownRenderer

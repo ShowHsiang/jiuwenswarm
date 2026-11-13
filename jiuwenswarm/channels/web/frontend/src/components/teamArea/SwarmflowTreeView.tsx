@@ -11,7 +11,7 @@
  * - 点击 waiting_for_human agent 重新打开 ask-user 对话框
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState, type ReactElement } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -25,6 +25,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  GitBranch,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -32,6 +33,7 @@ import {
   type WorkflowPhase,
   type WorkflowAgent,
   type WorkflowStatus,
+  type WorkflowVerifyGroup,
   formatBudgetK,
   groupWorkflowAgentsByName,
   childPhasesOf,
@@ -44,6 +46,19 @@ import {
   computeLoopStatus,
   computeSessionStatus,
   findActiveIterationIndex,
+  isWorkflowRunEnded,
+  orderRunsForTreeView,
+  workflowAgentIdentity,
+  workflowAgentAvatarName,
+  isForkSessionNode,
+  forkParentDisplay,
+  parseVerifyOutcome,
+  verifyVoteText,
+  verifyRoundText,
+  summarizeVerifyVotes,
+  partitionAgentsByVerifyGroups,
+  compactTokenLabel,
+  sessionMembersAcrossPhases,
 } from './workflowTypes';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -55,8 +70,11 @@ import {
   formatCharCount,
   accentChipClass,
   type AgentModalState,
+  type DetailSection,
 } from './AgentDetailModal';
+import { TeamMemberAvatar } from '../TeamMemberAvatar';
 import { Toast } from '../ConnectorMarket/Toast';
+import './SwarmflowTreeView.css';
 
 // ── 状态图标映射 ──────────────────────────────────────────
 
@@ -116,7 +134,7 @@ function ProgressBar({ completed, total }: { completed: number; total: number })
   const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
   return (
     <div className="flex items-center gap-2 shrink-0">
-      <div className="w-16 h-1.5 rounded-full bg-secondary overflow-hidden">
+      <div className="swarmflow-run-progress-track w-16 h-1.5 rounded-full bg-secondary overflow-hidden">
         <div
           className="h-full rounded-full bg-blue-500 transition-all"
           style={{ width: `${pct}%` }}
@@ -214,7 +232,7 @@ function AgentLoopNode({
           <ChevronRight className="w-4 h-4 text-text-muted shrink-0" />
         )}
         <RefreshCw className={`w-4 h-4 shrink-0 text-purple-500 ${loopStatus === 'running' ? 'animate-spin' : ''}`} />
-        <span className="text-sm font-medium text-text break-words">{name}</span>
+        <span className="text-sm font-medium text-text break-words" title={name}>{name}</span>
         <span className="text-xs text-text-muted shrink-0">×{members.length}轮</span>
         <span className="text-xs text-text-muted shrink-0">
           {completedCount}/{members.length}
@@ -256,9 +274,9 @@ function AgentLoopNode({
                 <span className="text-xs text-text-muted">
                   第{i + 1}轮
                 </span>
-                {member.outcome && (
+                {(member.outcome ?? member.outcome_preview) && (
                   <span className="text-xs text-text-muted/70 truncate flex-1">
-                    {member.outcome}
+                    {member.outcome ?? member.outcome_preview}
                   </span>
                 )}
               </div>
@@ -309,7 +327,7 @@ function PhaseLoopNode({
           <ChevronRight className="w-4 h-4 text-text-muted shrink-0" />
         )}
         <RefreshCw className={`w-4 h-4 shrink-0 text-purple-500 ${loopStatus === 'running' ? 'animate-spin' : ''}`} />
-        <span className="text-sm font-medium text-text break-words">{baseName}</span>
+        <span className="text-sm font-medium text-text break-words" title={baseName}>{baseName}</span>
         <span className="text-xs text-text-muted shrink-0">×{members.length}轮</span>
         <span className="text-xs text-text-muted shrink-0">
           {completedCount}/{members.length}
@@ -371,56 +389,195 @@ function PhaseLoopNode({
 
 // ── Agent 节点 ────────────────────────────────────────────
 
+// Detail chip badge: prompt/outcome counts are tokens and carry the `tok`
+// unit; the remaining sections fall back to character counts, which stay
+// bare (an unmarked count means characters).
+function detailChipBadge(
+  agent: WorkflowAgent,
+  sec: DetailSection,
+): { value: string; unit: string; cache: string | null } {
+  if (sec.key === 'prompt') {
+    const n = agent.input_token_count;
+    const cache = agent.cache_token_count;
+    const cacheRate =
+      n != null && n > 0 && cache != null && cache > 0
+        ? `${Math.round((cache / n) * 100)}%`
+        : null;
+    return { value: n != null && n > 0 ? compactTokenLabel(n) : '', unit: 'tok', cache: cacheRate };
+  }
+  if (sec.key === 'outcome') {
+    const n = agent.output_token_count;
+    return { value: n != null && n > 0 ? compactTokenLabel(n) : '', unit: 'tok', cache: null };
+  }
+  if (sec.key === 'activity') {
+    // 工具活动对没有文本内容——徽章显示条目数。
+    return { value: String(sec.activity?.length ?? 0), unit: '', cache: null };
+  }
+  return { value: formatCharCount(sec.content), unit: '', cache: null };
+}
+
+// Reviewer 行的 role 弱化标注配色：跟随行首状态图标同色系（与图标成组）。
+function roleTagCls(status: WorkflowStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'text-emerald-600 dark:text-emerald-300';
+    case 'failed':
+      return 'text-red-600 dark:text-red-300';
+    case 'running':
+      return 'text-blue-600 dark:text-blue-300';
+    case 'paused':
+      return 'text-violet-600 dark:text-violet-300';
+    case 'waiting_for_human':
+      return 'text-amber-600 dark:text-amber-300';
+    default:
+      return 'text-text-muted';
+  }
+}
+
 function AgentNode({
   agent,
   phaseAgents,
   depth,
   runId,
   sessionId,
+  roleTag,
+  voteBadge,
+  workflow,
+  avatarName,
 }: {
   agent: WorkflowAgent;
   phaseAgents: WorkflowAgent[];
   depth: number;
   runId: string;
   sessionId: string;
+  /** 评审员行展示的业务角色（verifier/inspector/challenger），纯展示。 */
+  roleTag?: string | null;
+  /** 评审员行票徽章（verify 面板传入；普通 agent 行自行解析 outcome）。 */
+  voteBadge?: ReturnType<typeof parseVerifyOutcome>;
+  /** 整个 run（跨 phase）：session 节点的跨轮聚合按 member_name 在全 run 收集，
+   *  否则 analyst 分属基线/综合/裁决三个 phase 时每张卡只聚到本 phase 的轮次。 */
+  workflow?: WorkflowRun;
+  /** 头像键：展示名可被调用方裁剪（verify 面板剥前缀），但头像哈希必须用
+   *  原名才能与成员列表同源，缺省即 workflowAgentAvatarName(agent)。 */
+  avatarName?: string;
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(agent.status === 'running');
   const [showDetail, setShowDetail] = useState(false);
   const [modalState, setModalState] = useState<AgentModalState | null>(null);
+  // 弹窗当前展示的 agent（行 agent 或某个轮次 member）：决定弹窗标题与调用记录的
+  // 过滤身份（member_id = run_id:agent_id）。null = 行 agent（详情 chip 入口）。
+  const [modalTarget, setModalTarget] = useState<{ id: string; label: string } | null>(null);
 
   // 汇总当前 agent 可用的详情 section（标签与弹窗共用同一数据源）
-  const detailSections = useMemo(() => buildDetailSections(agent), [agent]);
+  const detailSections = useMemo(() => buildDetailSections(t, agent), [t, agent]);
 
-  const isSession = agent.node_type === 'agent_session' || agent.node_type === 'human_session';
-  const sessionMembers = useMemo(
-    () =>
-      isSession
-        ? groupWorkflowAgentsByName(phaseAgents).sessions.find(
-            (s) => s.label === agent.name,
-          )?.members ?? []
-        : [],
-    [isSession, agent.name, phaseAgents],
-  );
+  // 行内工具提示：运行中的节点显示最近一条工具活动名；无活动的运行中节点保持原样。
+  const latestToolName = useMemo(() => {
+    if (agent.status !== 'running') return null;
+    const acts = agent.activity ?? [];
+    for (let i = acts.length - 1; i >= 0; i--) {
+      if (acts[i].tool_name) return acts[i].tool_name;
+    }
+    return null;
+  }, [agent.status, agent.activity]);
+
+  const isSession = agent.node_type === 'agent_session'
+    || agent.node_type === 'agent_session_fork'
+    || agent.node_type === 'human_session';
+  const isFork = isForkSessionNode(agent);
+  // 票徽章：verify 面板传入（votes join，刷新后仍可见）；普通行解析自身 outcome。
+  const verdict = voteBadge ?? parseVerifyOutcome(agent.outcome);
+  // 收集该 session 的所有轮次（跨 phase，用于展开箭头判定与按 phase 过滤的种子）；
+  // token Σ 与 turn 明细都只取本 phase 内的轮次（phaseSessionMembers）。
+  // 优先用 member_name（跨 phase 唯一），旧 run 缺失时退回本 phase 的 label 分组。
+  const sessionMembers = useMemo(() => {
+    if (!isSession) return [];
+    if (!workflow || !agent.member_name) {
+      return groupWorkflowAgentsByName(phaseAgents).sessions.find(
+        (s) => s.label === agent.name,
+      )?.members ?? [];
+    }
+    return sessionMembersAcrossPhases(
+      workflow,
+      agent.member_name,
+      agent.name,
+      agent.node_type,
+    );
+  }, [isSession, workflow, agent.member_name, agent.name, agent.node_type, phaseAgents]);
+  // 当前 phase 内的轮次（明细展示用，不跨 phase）。
+  const phaseSessionMembers = useMemo(() => {
+    const phaseIds = new Set(phaseAgents.map((a) => a.id));
+    return sessionMembers.filter((m) => phaseIds.has(m.id));
+  }, [sessionMembers, phaseAgents]);
+
+
   const hasSessionTree = isSession && sessionMembers.length >= 1;
+  const hasPhaseSessionTree = isSession && phaseSessionMembers.length >= 1;
+
+  // Session 节点的 representative 是 Turn 0 的条目（状态已按 members 聚合），
+  // token 计费字段只累计本 phase 内的轮次：analyst 会跨 phase 复用（基线/综合/裁决
+  // 各一轮），跨 phase 求和会让多个 phase 的同名节点显示同一总额，失去区分度；
+  // turn 明细也按 phase 展示，chips 口径与之一致。任一轮都没报过值时保持 null（隐藏）。
+  const displayAgent = useMemo(() => {
+    if (!hasPhaseSessionTree) return agent;
+    const sum = (pick: (m: WorkflowAgent) => number | null | undefined): number | null => {
+      let total = 0;
+      let seen = false;
+      for (const m of phaseSessionMembers) {
+        const v = pick(m);
+        if (v != null) {
+          total += v;
+          seen = true;
+        }
+      }
+      return seen ? total : null;
+    };
+    return {
+      ...agent,
+      token_count: sum((m) => m.token_count),
+      input_token_count: sum((m) => m.input_token_count),
+      output_token_count: sum((m) => m.output_token_count),
+      cache_token_count: sum((m) => m.cache_token_count),
+    };
+  }, [hasPhaseSessionTree, agent, phaseSessionMembers]);
 
   // detail_pending=true 表示该 agent 仅含摘要（get_phase 下发），prompt/outcome 等
   // 大文本字段尚未拉取——展开详情或弹窗时按需调 get_agent 补全完整体（通用，不限 human）。
-  const agentDetailPending = agent.detail_pending === true;
-  const ensureAgentDetail = useCallback(async () => {
-    if (!agentDetailPending) return;
+  // 按 agentId 参数化：行 agent 与 session 节点的各轮 member 共用同一条懒拉路径。
+  const ensureAgentDetailFor = useCallback(async (agentId: string) => {
     const store = useSessionStore.getState();
     const lookup = findWorkflowAgent(
       store.runtimes[sessionId]?.workflowRuns ?? [],
       runId,
-      agent.id,
+      agentId,
     );
-    if (lookup) {
-      await store
-        .loadAgentDetail(sessionId, runId, lookup.phase.id, agent.id)
-        .catch(() => undefined);
-    }
-  }, [agentDetailPending, agent.id, runId, sessionId]);
+    if (!lookup || lookup.agent.detail_pending !== true) return;
+    await store
+      .loadAgentDetail(sessionId, runId, lookup.phase.id, agentId)
+      .catch(() => undefined);
+  }, [runId, sessionId]);
+  const agentDetailPending = agent.detail_pending === true;
+  const ensureAgentDetail = useCallback(
+    () => ensureAgentDetailFor(agent.id),
+    [ensureAgentDetailFor, agent.id],
+  );
+
+  // 点开某一轮（agent_session / human_session / fork 的 Turn 行）：懒拉该轮完整体，
+  // 弹窗身份切到该轮 member——弹窗的 liveAgent 按 run_id:agent_id 从 store 实时重建
+  // sections，输入/输出/调用记录都按该轮过滤。
+  const openTurnDetail = useCallback(
+    (member: WorkflowAgent, turn: number | null) => {
+      void ensureAgentDetailFor(member.id);
+      setModalTarget({
+        id: member.id,
+        label: turn === null ? agent.name : `${agent.name} · Turn ${turn}`,
+      });
+      const sections = buildDetailSections(t, member);
+      setModalState({ sections, activeKey: sections[0]?.key ?? 'prompt' });
+    },
+    [agent.name, ensureAgentDetailFor, t],
+  );
 
   // 详情展开时懒拉完整 agent 主体（get_agent）。
   useEffect(() => {
@@ -443,6 +600,12 @@ function AgentNode({
         question = refreshed?.agent.human_prompt?.trim();
       }
       const corr = agent.correlation_id ?? agent.id;
+      // Look up attribution and run name from the store (same pattern as
+      // ensureAgentDetail): only the session-aggregation call site passes the
+      // workflow prop down to AgentNode, relying on it would miss the others.
+      const run = useSessionStore
+        .getState()
+        .runtimes[sessionId]?.workflowRuns.find((item) => item.id === runId);
       const payload: AskUserQuestionPayload = {
         request_id: `swarmflow:${runId}:${corr}`,
         source: 'swarmflow_human',
@@ -459,6 +622,10 @@ function AgentNode({
           correlation_id: corr,
           agent_id: agent.id,
           agent_name: agent.name,
+          // The attribution prefix is composed from meta at render time in
+          // InteractionPrompt (i18n); pass the data through, keep the header plain.
+          executor: run?.executor ?? null,
+          workflow_name: run?.name ?? null,
         },
       };
       useChatStore.getState().enqueuePendingQuestion(sessionId, payload);
@@ -500,10 +667,84 @@ function AgentNode({
           </button>
         )}
         {!hasSessionTree && <div className="w-[18px] shrink-0" />}
-        <StatusIcon status={agent.status} />
-        <span className="text-sm text-text break-words flex-1" data-testid="team-area-swarmflow-agent-name" data-variant={agent.id}>{agent.name}</span>
+        {isFork ? (
+          <>
+            <GitBranch className="w-4 h-4 shrink-0 text-purple-500" />
+            {/* fork 徽章紧跟分叉图标之后、label 之前，与图标同紫色成组 */}
+            <span
+              className="text-[10px] text-purple-500 shrink-0 bg-purple-500/10 px-1 rounded"
+              title={agent.parent_session_id ? t('swarmflow.forkFromSession', { name: forkParentDisplay(agent.parent_session_id) }) : t('swarmflow.forkChildSession')}
+            >
+              fork{agent.parent_session_id ? `(${forkParentDisplay(agent.parent_session_id)})` : ''}
+            </span>
+            <TeamMemberAvatar
+              member={avatarName ?? workflowAgentAvatarName(agent)}
+              identity={workflowAgentIdentity(agent)}
+              className="w-5 h-5 shrink-0 rounded-full"
+              imageClassName="rounded-full"
+              alt={avatarName ?? workflowAgentAvatarName(agent)}
+            />
+          </>
+        ) : (
+          <>
+            <StatusIcon status={agent.status} />
+            {/* 评审员行 role 弱化标注：图标后、label 前，与图标同色系 */}
+            {roleTag && (
+              <span
+                className={`shrink-0 text-[10px] font-medium ${roleTagCls(agent.status)}`}
+                data-testid="team-area-swarmflow-agent-role"
+                data-variant={agent.id}
+              >
+                {roleTag}
+              </span>
+            )}
+            <TeamMemberAvatar
+              member={avatarName ?? workflowAgentAvatarName(agent)}
+              identity={workflowAgentIdentity(agent)}
+              className="w-5 h-5 shrink-0 rounded-full"
+              imageClassName="rounded-full"
+              alt={avatarName ?? workflowAgentAvatarName(agent)}
+            />
+          </>
+        )}
+        {/* 主文字永远是脚本给节点的 label（同一专家被多次调用时唯一可区分）；
+            专家身份靠头像 ★ 与悬浮提示"专家：展示名（成员名）"，不占行内空间。 */}
+        <span
+          className="text-sm text-text break-words flex-1 inline-flex items-baseline gap-1.5 min-w-0"
+          data-testid="team-area-swarmflow-agent-name"
+          data-variant={agent.id}
+          title={agent.agent_template
+            ? `${agent.name}\n${t('swarmflow.expertIdentity', {
+                name: agent.display_name ?? agent.agent_template,
+                template: agent.agent_template,
+              })}`
+            : agent.name}
+        >
+          {agent.name}
+        </span>
+        {verdict && (
+          <span className={`shrink-0 text-[11px] font-medium px-1.5 py-0.5 rounded-full ${
+            verdict.type === 'pass'
+              ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300'
+              : verdict.type === 'fail'
+              ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
+              : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+          }`}>
+            {verifyVoteText(t, verdict)}
+          </span>
+        )}
         {agent.model && (
           <span className="text-xs text-text-muted shrink-0">{agent.model}</span>
+        )}
+        {latestToolName && (
+          <span
+            className="text-[10px] text-text-muted/60 shrink-0 max-w-[14ch] truncate"
+            title={latestToolName}
+            data-testid="team-area-swarmflow-agent-tool-hint"
+            data-variant={agent.id}
+          >
+            {latestToolName}
+          </span>
         )}
         {/* 展开 input/output 详情：完整体已就绪（有 prompt/outcome/error）或仅为摘要待拉取时均显示 */}
         {(agent.prompt || agent.outcome || agent.error || agentDetailPending) && (
@@ -540,43 +781,58 @@ function AgentNode({
           data-variant={agent.id}
         >
           {/* Meta 信息 */}
-          {(agent.model || agent.token_count != null || agent.duration_ms != null || agent.started_at) && (
+          {(agent.model || displayAgent.token_count != null || agent.duration_ms != null || agent.started_at) && (
             <div className="flex items-center gap-2 text-[10px] text-text-muted/70 mr-auto pr-2">
               {agent.model && <span className="font-mono">{agent.model}</span>}
-              {agent.token_count != null && <span>{agent.token_count} tok</span>}
+              {displayAgent.token_count != null && <span>{displayAgent.token_count} tok</span>}
               {agent.duration_ms != null && <span>{(agent.duration_ms / 1000).toFixed(1)}s</span>}
               {agent.started_at && <span>{new Date(agent.started_at).toLocaleTimeString()}</span>}
             </div>
           )}
 
-          {detailSections.map((sec) => (
-            <button
-              key={sec.key}
-              type="button"
-              aria-label={`${sec.label} (${formatCharCount(sec.content)} 字符)`}
-              data-testid="team-area-swarmflow-agent-detail-chip"
-              data-variant={sec.key}
-              onClick={(e) => {
-                e.stopPropagation();
-                setModalState({ sections: detailSections, activeKey: sec.key });
-              }}
-              className={`shrink-0 inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${accentChipClass[sec.accent]}`}
-            >
-              <span>{sec.icon} {sec.label}</span>
-              <span className="ml-0.5 px-1 rounded bg-black/10 dark:bg-white/10 text-[9px] tabular-nums opacity-80">
-                {formatCharCount(sec.content)}
-              </span>
-            </button>
-          ))}
+          {detailSections.map((sec) => {
+            const badge = detailChipBadge(displayAgent, sec);
+            return (
+              <button
+                key={sec.key}
+                type="button"
+                aria-label={badge.value ? `${sec.label} (${badge.value} ${badge.unit || t('swarmflow.charUnit')})` : sec.label}
+                data-testid="team-area-swarmflow-agent-detail-chip"
+                data-variant={sec.key}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setModalTarget(null);
+                  setModalState({ sections: detailSections, activeKey: sec.key });
+                }}
+                className={`shrink-0 inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors ${accentChipClass[sec.accent]}`}
+              >
+                <span>{sec.icon} {sec.label}</span>
+                {badge.value && (
+                  <span className="ml-0.5 px-1 rounded bg-black/10 dark:bg-white/10 text-[9px] tabular-nums opacity-80">
+                    {badge.unit ? `${badge.value} ${badge.unit}` : badge.value}
+                  </span>
+                )}
+                {badge.cache && (
+                  <span className="ml-0.5 px-1 rounded-full bg-cyan-500/10 text-cyan-600 dark:text-cyan-300 text-[9px] tabular-nums">
+                    cache {badge.cache}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
       )}
 
       {/* 内容弹窗：标题含 Agent 名 + Tab 切换不同 section（共享组件） */}
       <AgentDetailModal
         state={modalState}
-        agentName={agent.name}
-        onClose={() => setModalState(null)}
+        agentName={modalTarget?.label ?? agent.name}
+        onClose={() => {
+          setModalState(null);
+          setModalTarget(null);
+        }}
         onTabChange={(key) => setModalState((prev) => (prev ? { ...prev, activeKey: key } : prev))}
+        callRecordsSource={{ sessionId, memberId: `${runId}:${modalTarget?.id ?? agent.id}` }}
       />
 
       {/* Outcome 副文本（详情展开时隐藏） */}
@@ -603,29 +859,36 @@ function AgentNode({
       )}
 
       {/* Session turns */}
-      {hasSessionTree && expanded && (
+      {hasPhaseSessionTree && expanded && (
         <div
           className="border-l border-border/30 ml-4"
           style={{ marginLeft: `${depth * 20 + 16}px` }}
           data-testid="team-area-swarmflow-agent-turns"
           data-variant={agent.id}
         >
-          {sessionMembers.map((member) => {
+          {phaseSessionMembers.map((member) => {
             const turn = parseTurnFromCorrelationId(member.correlation_id);
             return (
               <div key={member.id} className="relative pl-4">
                 <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
-                <div className="flex items-center gap-2 px-2 py-1 rounded-md hover:bg-secondary/50" data-testid="team-area-swarmflow-agent-turn" data-variant={member.id}>
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 px-2 py-1 rounded-md hover:bg-secondary/50 text-left"
+                  title={t('swarmflow.turnDetailHint')}
+                  data-testid="team-area-swarmflow-agent-turn"
+                  data-variant={member.id}
+                  onClick={() => openTurnDetail(member, turn)}
+                >
                   <StatusIcon status={member.status} className="w-3.5 h-3.5" />
                   <span className="text-xs text-text-muted">
                     Turn {turn ?? '?'}
                   </span>
-                  {member.outcome && (
+                  {(member.outcome ?? member.outcome_preview) && (
                     <span className="text-xs text-text-muted/60 truncate flex-1">
-                      {member.outcome}
+                      {member.outcome ?? member.outcome_preview}
                     </span>
                   )}
-                </div>
+                </button>
               </div>
             );
           })}
@@ -636,6 +899,309 @@ function AgentNode({
 }
 
 // ── Phase 节点 ────────────────────────────────────────────
+
+// ── verify 单层面板（一个 verify() = 一个面板；同 label 多轮靠圆点切换，无汇总层） ──
+
+function verifyRoundDotCls(group: WorkflowVerifyGroup): string {
+  if (group.status !== 'settled') return 'bg-blue-500 animate-pulse';
+  if (group.verdict === 'pass') return 'bg-emerald-500';
+  if (group.verdict === 'fail') return 'bg-red-500';
+  return 'bg-amber-500';
+}
+
+// 评审员行 role：优先 votes[].role（按 name 精确 join）；旧 run 无 votes 时回退
+// reviewer_roles 名册（与 reviewer_labels 对仗）。纯展示，不参与判定。
+function reviewerRole(group: WorkflowVerifyGroup, agentName: string): string | null {
+  const fromVotes = (group.votes ?? []).find((v) => v.name === agentName)?.role;
+  if (fromVotes) return fromVotes;
+  const idx = (group.reviewer_labels ?? []).indexOf(agentName);
+  return idx >= 0 ? (group.reviewer_roles?.[idx] ?? null) : null;
+}
+
+// 评审员行票徽章：运行中直接解析 agent.outcome（结构化票 JSON）；刷新后 summary
+// 不带 outcome（重文本走 get_agent 懒拉），回退 group.votes 按 name join——两条
+// 路径同一文案/配色，行上始终可见，不用展开详情。
+function voteBadgeFor(
+  group: WorkflowVerifyGroup,
+  agent: WorkflowAgent,
+): ReturnType<typeof parseVerifyOutcome> {
+  const fromOutcome = parseVerifyOutcome(agent.outcome, group.threshold ?? 0.85);
+  if (fromOutcome) return fromOutcome;
+  const vote = (group.votes ?? []).find((v) => v.name === agent.name);
+  if (!vote) return null;
+  if (vote.kind === 'verdict') {
+    if (vote.decision === 'pass') return { type: 'pass' };
+    if (vote.decision === 'fail') return { type: 'fail' };
+    return { type: 'undecided' };
+  }
+  if (typeof vote.score === 'number') {
+    return { type: 'score', score: vote.score };
+  }
+  return { type: 'undecided' };
+}
+
+// 面板整体输入/输出 token：verify 自身不跑模型，= 各 reviewer 之和（未落部分按 0，
+// 数字随 settled 事件增量刷新）。cache 是 input 的子集，rate 分母仍为 input。
+function verifyPanelTokens(reviewers: WorkflowAgent[]): {
+  input: number;
+  output: number;
+  cacheRate: number | null;
+} {
+  let input = 0;
+  let output = 0;
+  let cache = 0;
+  for (const r of reviewers) {
+    input += r.input_token_count ?? 0;
+    output += r.output_token_count ?? 0;
+    cache += r.cache_token_count ?? 0;
+  }
+  const cacheRate = input > 0 && cache > 0 ? Math.round((cache / input) * 100) : null;
+  return { input, output, cacheRate };
+}
+
+function VerifyPanel({
+  rounds,
+  phaseAgents,
+  runId,
+  sessionId,
+  phaseId,
+}: {
+  rounds: Array<{ group: WorkflowVerifyGroup; reviewers: WorkflowAgent[] }>;
+  phaseAgents: WorkflowAgent[];
+  runId: string;
+  sessionId: string;
+  phaseId: string;
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(true);
+  // 默认选中最新未结算轮，全结算后停在最后一轮（同 AgentLoopNode 语义）
+  const [selectedIdx, setSelectedIdx] = useState(() => {
+    for (let i = rounds.length - 1; i >= 0; i--) {
+      if (rounds[i].group.status !== 'settled') return i;
+    }
+    return rounds.length - 1;
+  });
+  const [modalState, setModalState] = useState<AgentModalState | null>(null);
+  const current = rounds[selectedIdx] ?? rounds[rounds.length - 1];
+  if (!current) return null;
+  const { group, reviewers } = current;
+  const settled = group.status === 'settled';
+  const verdict = group.verdict;
+  const { undecided } = summarizeVerifyVotes(group);
+  const { input, output, cacheRate } = verifyPanelTokens(reviewers);
+  // 整体输入 = 本轮交付物（reviewer 共同 prompt 源）；整体输出 = 引擎下发的
+  // group.outcome（JSON 字符串，与 agent.outcome 同渲染通道），旧 run 无 outcome
+  // 时回退本地按 _aggregate_feedback 同口径聚合 votes[].feedback
+  const wholeInputText = reviewers.find((r) => r.prompt)?.prompt ?? '';
+  const wholeOutputText =
+    group.outcome && group.outcome.trim().length > 0
+      ? group.outcome
+      : (group.votes ?? [])
+          .map((v) => ({ name: v.name || v.kind, fb: (v.feedback ?? '').trim() }))
+          .filter((v) => v.fb.length > 0)
+          .map((v) => `- ${v.name}: ${v.fb}`)
+          .join('\n');
+  // Border color encodes the round state; the panel body stays transparent
+  // (no state tint) so only the outline distinguishes verify groups.
+  const borderCls = !settled
+    ? 'border-cyan-500/40'
+    : verdict === 'fail'
+      ? 'border-red-500/50'
+      : verdict === 'pass'
+        ? 'border-violet-500/40'
+        : 'border-amber-500/50';
+  const openWhole = (key: 'prompt' | 'outcome') => {
+    const text = key === 'prompt' ? wholeInputText : wholeOutputText;
+    if (text) {
+      setModalState({
+        sections: [
+          key === 'prompt'
+            ? { key: 'prompt', label: t('swarmflow.sectionInput'), icon: '▶', content: text, accent: 'blue' }
+            : { key: 'outcome', label: t('swarmflow.sectionOutput'), icon: '◀', content: text, accent: 'emerald' },
+        ],
+        activeKey: key,
+      });
+      return;
+    }
+    // 刷新后 summary 不带 reviewer 完整文本（重文本走 get_agent 懒拉）：点击时拉
+    // 第一个 detail_pending reviewer 的完整体，并入 store 后按 key 开弹窗。
+    const pending = reviewers.find((r) => r.detail_pending === true);
+    if (!pending) return;
+    void useSessionStore
+      .getState()
+      .loadAgentDetail(sessionId, runId, phaseId, pending.id)
+      .then(() => {
+        const fresh = findWorkflowAgent(
+          useSessionStore.getState().runtimes[sessionId]?.workflowRuns ?? [],
+          runId,
+          pending.id,
+        );
+        const content = (key === 'prompt' ? fresh?.agent.prompt : fresh?.agent.outcome) ?? '';
+        if (!content) return;
+        setModalState({
+          sections:
+            key === 'prompt'
+              ? [{ key: 'prompt', label: t('swarmflow.sectionInput'), icon: '▶', content, accent: 'blue' }]
+              : [{ key: 'outcome', label: t('swarmflow.sectionOutput'), icon: '◀', content, accent: 'emerald' }],
+          activeKey: key,
+        });
+      })
+      .catch(() => undefined);
+  };
+
+  return (
+    <div
+      className={`rounded-lg border ${borderCls} overflow-hidden`}
+      data-testid="team-area-swarmflow-verify-panel"
+      data-variant={group.id}
+      title={
+        settled && verdict == null
+          ? t('swarmflow.verifyUndecidedHint')
+          : undefined
+      }
+    >
+      <div
+        className="flex flex-wrap items-center gap-2 px-2 py-1 cursor-pointer select-none"
+        onClick={() => setExpanded((v) => !v)}
+        data-testid="team-area-swarmflow-verify-panel-header"
+        data-variant={group.id}
+      >
+        {expanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-text-muted shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-text-muted shrink-0" />
+        )}
+        <span className="text-sm text-cyan-600 dark:text-cyan-300 shrink-0">▦</span>
+        <span className="text-sm font-medium text-text" title={group.label}>{group.label}</span>
+        {group.threshold != null && (
+          <span className="text-xs text-text-muted shrink-0">{t('swarmflow.verifyThreshold', { count: group.threshold })}</span>
+        )}
+        {!settled ? (
+          <span className="text-xs text-text-muted shrink-0">{t('swarmflow.verifyReviewing')}</span>
+        ) : verdict === 'pass' ? (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 shrink-0" data-testid="team-area-swarmflow-verify-panel-verdict">
+            {t('swarmflow.verifyPass')}
+          </span>
+        ) : verdict === 'fail' ? (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/15 text-red-600 dark:text-red-300 shrink-0" data-testid="team-area-swarmflow-verify-panel-verdict">
+            {t('swarmflow.verifyFail')}
+          </span>
+        ) : (
+          <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-300 shrink-0" data-testid="team-area-swarmflow-verify-panel-verdict">
+            {t('swarmflow.verifyUndecided')}
+          </span>
+        )}
+        {settled && verdict == null && undecided > 0 && (
+          <span className="text-xs text-amber-500 shrink-0">
+            {t('swarmflow.verifyVotesMissing', { count: undecided })}
+          </span>
+        )}
+        {/* 多轮（同 label 并行 verify）圆点切换器：点击切换头部与身体的整体 */}
+        {rounds.length > 1 && (
+          <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+            {rounds.map((r, i) => (
+              <button
+                key={r.group.id}
+                type="button"
+                className={`w-2.5 h-2.5 rounded-full transition-all hover:scale-125 ${verifyRoundDotCls(r.group)} ${
+                  i === selectedIdx ? 'ring-2 ring-cyan-400 ring-offset-1 ring-offset-card' : ''
+                }`}
+                title={t('swarmflow.verifyRound', { count: i + 1, verdict: verifyRoundText(t, r.group) })}
+                data-testid="team-area-swarmflow-verify-panel-dot"
+                data-variant={i}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSelectedIdx(i);
+                }}
+              />
+            ))}
+          </div>
+        )}
+        {/* 整体输入/输出徽章（各 reviewer 聚合；cache 挂输入侧） */}
+        <div className="flex items-center gap-1.5 shrink-0 ml-auto" onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            className="shrink-0 inline-flex items-center gap-1 rounded-md border border-blue-500/40 bg-blue-500/10 px-2 py-0.5 text-[11px] font-medium text-blue-600 dark:text-blue-300 hover:bg-blue-500/20 transition-colors"
+            data-testid="team-area-swarmflow-verify-panel-input"
+            onClick={() => openWhole('prompt')}
+          >
+            <span>▶ {t('swarmflow.sectionInput')}</span>
+            {input > 0 && (
+              <span className="px-1 rounded bg-black/10 dark:bg-white/10 text-[9px] tabular-nums opacity-80">
+                {compactTokenLabel(input)} tok
+              </span>
+            )}
+            {cacheRate != null && (
+              <span className="ml-0.5 px-1 rounded-full bg-cyan-500/10 text-cyan-600 dark:text-cyan-300 text-[9px] tabular-nums">
+                cache {cacheRate}%
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className="shrink-0 inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-300 hover:bg-emerald-500/20 transition-colors"
+            data-testid="team-area-swarmflow-verify-panel-output"
+            onClick={() => openWhole('outcome')}
+          >
+            <span>◀ {t('swarmflow.sectionOutput')}</span>
+            {output > 0 && (
+              <span className="px-1 rounded bg-black/10 dark:bg-white/10 text-[9px] tabular-nums opacity-80">
+                {compactTokenLabel(output)} tok
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+      {expanded && (
+        <div className="border-t border-border/30 py-0.5">
+          {reviewers.length > 0 ? (
+            reviewers.map((agent) => {
+              // 面板内显示名剥掉 verify 前缀（唯一 label 太长）：
+              // `verify:V4-combo-2inspector-verdict-3` → `verdict-3`；非本组
+              // 前缀（旧 run 数据）保持全名。纯展示裁剪，数据不变。
+              const prefix = `${group.label}-`;
+              const shortName =
+                agent.name.startsWith(prefix) ? agent.name.slice(prefix.length) : agent.name;
+              return (
+                <AgentNode
+                  key={agent.id}
+                  agent={shortName === agent.name ? agent : { ...agent, name: shortName }}
+                  avatarName={workflowAgentAvatarName(agent)}
+                  phaseAgents={phaseAgents}
+                  depth={0}
+                  runId={runId}
+                  sessionId={sessionId}
+                  roleTag={reviewerRole(group, agent.name)}
+                  voteBadge={voteBadgeFor(group, agent)}
+                />
+              );
+            })
+          ) : (
+            // 名册已到但 reviewer 节点未落（运行中）——占位行
+            <div
+              className="flex items-center gap-2 px-3 py-1 text-xs text-text-muted"
+              data-testid="team-area-swarmflow-verify-panel-pending"
+              data-variant={group.id}
+            >
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />
+              <span>
+                {t('swarmflow.verifyReviewersPending', {
+                  names: (group.reviewer_labels ?? []).join('、') || `${group.reviewers ?? '?'}`,
+                })}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+      <AgentDetailModal
+        state={modalState}
+        agentName={group.label}
+        onClose={() => setModalState(null)}
+        onTabChange={(key) => setModalState((prev) => (prev ? { ...prev, activeKey: key } : prev))}
+      />
+    </div>
+  );
+}
 
 function PhaseNode({
   phase,
@@ -656,15 +1222,119 @@ function PhaseNode({
     () => groupWorkflowAgentsByName(phase.agents ?? []),
     [phase.agents],
   );
+  const verifyGroups = phase.verify_groups ?? [];
+  // verify 容器归属：reviewer one-shot 收进容器（精确 label join），其余为 orphan
+  const { containers, orphans } = useMemo(
+    () => partitionAgentsByVerifyGroups(oneShots, verifyGroups),
+    [oneShots, verifyGroups],
+  );
   // 检测同名 agent 循环（场景 A）
   const { loops: agentLoops, unique: uniqueAgents } = useMemo(
-    () => detectAgentLoops(oneShots),
-    [oneShots],
+    () => detectAgentLoops(orphans),
+    [orphans],
   );
   const childPhases = useMemo(
     () => childPhasesOf(workflow, phase),
     [workflow, phase],
   );
+  // 时间线排序：orphan agent / 循环 / session / verify 容器按 started_at 升序
+  // 交错渲染（后端给的时间戳，纯展示排序——verify 之后发生的 re-check session
+  // 不再跑到容器前面）。child phases 保持在末尾（独立子树，非时间线对等物）。
+  const timeline = useMemo(() => {
+    const items: Array<{ ts: string; el: ReactElement }> = [];
+    for (const agent of uniqueAgents) {
+      items.push({
+        ts: agent.started_at ?? '',
+        el: (
+          <div key={agent.id} className="relative pl-4">
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
+            <AgentNode
+              agent={agent}
+              phaseAgents={phase.agents ?? []}
+              depth={0}
+              runId={runId}
+              sessionId={sessionId}
+            />
+          </div>
+        ),
+      });
+    }
+    for (const loop of agentLoops) {
+      const ts = loop.members.reduce(
+        (min, m) => ((m.started_at ?? '') < min ? (m.started_at ?? '') : min),
+        loop.members[0]?.started_at ?? '',
+      );
+      items.push({
+        ts,
+        el: (
+          <div key={`loop-${loop.name}`} className="relative pl-4">
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
+            <AgentLoopNode
+              name={loop.name}
+              members={loop.members}
+              depth={0}
+              runId={runId}
+              sessionId={sessionId}
+            />
+          </div>
+        ),
+      });
+    }
+    for (const session of sessions) {
+      const representative = session.members[0];
+      if (!representative) continue;
+      // 代表节点状态按 members 聚合：Turn0 完成不代表整张卡完成。
+      const status = computeSessionStatus(session.members);
+      const node =
+        status === representative.status ? representative : { ...representative, status };
+      items.push({
+        ts: representative.started_at ?? '',
+        el: (
+          <div key={representative.id} className="relative pl-4">
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
+            <AgentNode
+              agent={node}
+              phaseAgents={phase.agents ?? []}
+              depth={0}
+              runId={runId}
+              sessionId={sessionId}
+              workflow={workflow}
+            />
+          </div>
+        ),
+      });
+    }
+    // 同 label 多轮 verify 折成一个单层 VerifyPanel（圆点切换）；不同 label 各自一个面板
+    const roundsByLabel = new Map<string, Array<{ group: WorkflowVerifyGroup; reviewers: WorkflowAgent[] }>>();
+    for (const c of containers) {
+      const arr = roundsByLabel.get(c.group.label) ?? [];
+      arr.push(c);
+      roundsByLabel.set(c.group.label, arr);
+    }
+    for (const rounds of roundsByLabel.values()) {
+      const firstTs = rounds.reduce(
+        (min, r) => ((r.group.started_at ?? '') < min ? (r.group.started_at ?? '') : min),
+        rounds[0]?.group.started_at ?? '',
+      );
+      items.push({
+        ts: firstTs,
+        el: (
+          <div key={`vpanel-${rounds[0].group.label}`} className="relative pl-4 py-0.5">
+            <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-cyan-500/30" />
+            <VerifyPanel
+              rounds={rounds}
+              phaseAgents={phase.agents ?? []}
+              runId={runId}
+              sessionId={sessionId}
+              phaseId={phase.id}
+            />
+          </div>
+        ),
+      });
+    }
+    items.sort((a, b) => a.ts.localeCompare(b.ts));
+    return items.map((item) => item.el);
+  }, [uniqueAgents, agentLoops, sessions, containers, phase.agents, runId, sessionId, workflow]);
   // Prefer backend aggregate counters: a parent phase's agent_count already
   // includes its child phases' agents (same behavior as the TUI); fall back
   // to counting direct agents when the fields are absent.
@@ -675,7 +1345,7 @@ function PhaseNode({
     ).length;
   const totalCount = phase.agent_count ?? phase.agents?.length ?? 0;
   const hasChildren =
-    sessions.length > 0 || uniqueAgents.length > 0 || agentLoops.length > 0 || childPhases.length > 0;
+    sessions.length > 0 || uniqueAgents.length > 0 || agentLoops.length > 0 || childPhases.length > 0 || verifyGroups.length > 0;
 
   // 历史恢复后 get_workflow 只给 phase 骨架（无 agents）——展开时按需拉完整 agents。
   const needsAgents = phase.agents === undefined && (phase.agent_count ?? 0) > 0;
@@ -706,7 +1376,7 @@ function PhaseNode({
           <div className="w-4 shrink-0" />
         )}
         <StatusIcon status={phase.status} />
-        <span className="text-sm font-medium text-text break-words flex-1" data-testid="team-area-swarmflow-phase-name" data-variant={phase.id}>
+        <span className="text-sm font-medium text-text break-words flex-1" title={phase.name} data-testid="team-area-swarmflow-phase-name" data-variant={phase.id}>
           {phase.name}
         </span>
         {phase.phase_type === 'child' && (
@@ -722,53 +1392,8 @@ function PhaseNode({
           className="border-l border-border/30 ml-4"
           style={{ marginLeft: `${depth * 20 + 16}px` }}
         >
-          {/* 唯一 agent（非循环） */}
-          {uniqueAgents.map((agent) => (
-            <div key={agent.id} className="relative pl-4">
-              <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
-              <AgentNode
-                agent={agent}
-                phaseAgents={phase.agents ?? []}
-                depth={0}
-                runId={runId}
-                sessionId={sessionId}
-              />
-            </div>
-          ))}
-          {/* 同名 agent 循环（场景 A） */}
-          {agentLoops.map((loop) => (
-            <div key={`loop-${loop.name}`} className="relative pl-4">
-              <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
-              <AgentLoopNode
-                name={loop.name}
-                members={loop.members}
-                depth={0}
-                runId={runId}
-                sessionId={sessionId}
-              />
-            </div>
-          ))}
-          {/* Session groups — render one representative node that expands to show turns */}
-          {sessions.map((session) => {
-            const representative = session.members[0];
-            if (!representative) return null;
-            // 代表节点状态按 members 聚合：Turn0 完成不代表整张卡完成。
-            const status = computeSessionStatus(session.members);
-            const node =
-              status === representative.status ? representative : { ...representative, status };
-            return (
-              <div key={representative.id} className="relative pl-4">
-                <div className="absolute left-0 top-1/2 -translate-y-1/2 w-3 border-t border-border/30" />
-                <AgentNode
-                  agent={node}
-                  phaseAgents={phase.agents ?? []}
-                  depth={0}
-                  runId={runId}
-                  sessionId={sessionId}
-                />
-              </div>
-            );
-          })}
+          {/* 时间线：orphan agent / 循环 / session / verify 容器按 started_at 交错 */}
+          {timeline}
           {/* Child phases (sub-workflows) */}
           {childPhases.map((child) => (
             <div key={child.id} className="relative pl-4">
@@ -798,8 +1423,22 @@ function RunNode({
   sessionId: string;
 }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(true);
+  const [expanded, setExpanded] = useState(!isWorkflowRunEnded(run.status));
   const [runDetail, setRunDetail] = useState<AgentModalState | null>(null);
+  // Terminal runs default to folded; live ones default to expanded. The card
+  // also folds the moment a watched run finishes, and a script relaunch
+  // (same run_id, back to running) re-opens it. Layout effect so the fold
+  // lands in the same paint as the status flip — no full-card flash at the
+  // card's new position below the divider. The dependency is the terminality
+  // boolean only, so ordinary progress merges never re-run it and manual
+  // expand/collapse in between is preserved.
+  const ended = isWorkflowRunEnded(run.status);
+  useLayoutEffect(() => {
+    setExpanded(!ended);
+  }, [ended]);
+  // Folded terminal runs compress to a single header row: the summary and the
+  // result / error detail rows stay hidden until the card is expanded again.
+  const compressed = ended && !expanded;
   // Control request in-flight flag: clicking pause/resume/stop immediately
   // spins and disables all three buttons until run.status flips to the target
   // state (progress event arrives). Backend abort can take seconds; a blocked
@@ -897,10 +1536,14 @@ function RunNode({
       : run.budget?.total != null && run.budget?.exhausted
         ? 'session'
         : null);
-  // 机械按钮只在 team 活着（方块亮）时可用：灰飞机 = 无 leader harness 可宿主 run；
-  // recovered = 冷启动后 controller 无票据。两种情况恢复都只能由 Leader 经 ask_user 裁决。
-  const teamRunning = useChatStore((s) => s.runtimes[sessionId]?.isProcessing ?? false);
-  const controlsDisabled = !teamRunning || run.recovered === true;
+  // 机械按钮只在整队被暂停（输入框暂停按钮 → chat.interrupt intent=pause，
+  // 前端唯一置 isPaused=true 的路径）或冷启动恢复（recovered = controller
+  // 无票据）时不可用。不能用 !isProcessing 判：看板暂停单个 run 后后端会
+  // 释放 held idle 把 isProcessing 置 false（小飞机变灰 = idle，团队在 pool
+  // 里仍是 RUNNING、resume 闸门放行），拿它当判据会让看板暂停后按钮自我
+  // 锁死，唯一的恢复入口就没了。
+  const teamPaused = useChatStore((s) => s.runtimes[sessionId]?.isPaused ?? false);
+  const controlsDisabled = teamPaused || run.recovered === true;
   // Two reasons to disable: team asleep / cold start (grey, not-allowed) or a
   // control request in flight (spinner, wait cursor). The in-flight look wins
   // while a request is pending.
@@ -910,91 +1553,130 @@ function RunNode({
     }`;
 
   return (
-    <div className="border border-border rounded-lg overflow-hidden bg-card/50" data-testid="team-area-swarmflow-run" data-variant={run.id}>
+    <div className="team-area-swarmflow-run border border-border rounded-lg overflow-hidden bg-card/50" data-testid="team-area-swarmflow-run" data-variant={run.id}>
       <div
-        className="flex items-center gap-2 px-3 py-2.5 bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors"
+        className={`team-area-swarmflow-run-header px-3 ${compressed ? 'py-1' : 'py-2.5'} bg-secondary/30 cursor-pointer hover:bg-secondary/50 transition-colors`}
         onClick={() => setExpanded((v) => !v)}
         data-testid="team-area-swarmflow-run-header"
         data-variant={run.id}
       >
         {expanded ? (
-          <ChevronDown className="w-4 h-4 text-text-muted shrink-0" />
+          <ChevronDown className="swarmflow-run-header__chev w-4 h-4 text-text-muted shrink-0" />
         ) : (
-          <ChevronRight className="w-4 h-4 text-text-muted shrink-0" />
+          <ChevronRight className="swarmflow-run-header__chev w-4 h-4 text-text-muted shrink-0" />
         )}
-        <StatusIcon status={run.status} className="w-4 h-4 shrink-0" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-text-strong truncate" data-testid="team-area-swarmflow-run-name" data-variant={run.id}>
+        <StatusIcon status={run.status} className="swarmflow-run-header__status w-4 h-4 shrink-0" />
+        {/* 名称轨：换行由 SwarmflowTreeView.css 的 grid 模板决定；overflow 裁切是
+            止血——让 shrink-0 的状态文案与执行者徽章无法向右溢出绘制到指标簇之上。 */}
+        <div className="swarmflow-run-nametrack">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="min-w-[5rem] flex-1 truncate text-sm font-semibold text-text-strong" title={run.name} data-testid="team-area-swarmflow-run-name" data-variant={run.id}>
               {run.name}
             </span>
-            <span className="text-xs text-text-muted shrink-0" data-testid="team-area-swarmflow-run-status" data-variant={run.id}>
+            <span className="team-area-swarmflow-run-status-text text-xs text-text-muted shrink-0" data-testid="team-area-swarmflow-run-status" data-variant={run.id}>
               {statusText(run.status, t)}
             </span>
+            {run.executor && (
+              <span
+                className="flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] text-text-muted"
+                title={t('swarmflow.executorTooltip', { name: run.executor })}
+                data-testid="team-area-swarmflow-run-executor"
+                data-variant={run.id}
+              >
+                <TeamMemberAvatar
+                  member={run.executor}
+                  className="h-3.5 w-3.5 rounded-full"
+                  imageClassName="rounded-full"
+                  alt={run.executor}
+                />
+                <span className="swarmflow-run-executor-name max-w-24 truncate">{run.executor}</span>
+              </span>
+            )}
           </div>
-          {run.summary && (
+          {!compressed && run.summary && (
             <p className="text-xs text-text-muted truncate mt-0.5" data-testid="team-area-swarmflow-run-summary" data-variant={run.id}>{run.summary}</p>
           )}
         </div>
-        {waitingCount > 0 && (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-500 shrink-0 animate-pulse" data-testid="team-area-swarmflow-run-waiting-badge" data-variant={run.id}>
-            {t('swarmflow.waitingForHuman', { count: waitingCount })}
-          </span>
-        )}
-        <ProgressBar completed={completedCount} total={totalCount} />
-        {run.budget && (
-          <span
-            className={`text-xs shrink-0 tabular-nums px-1.5 py-0.5 rounded-full ${
-              run.budget.exhausted
-                ? 'bg-red-500/10 text-red-500'
-                : 'bg-blue-500/10 text-blue-500'
-            }`}
-            title={t('swarmflow.sessionBudget')}
-            data-testid="team-area-swarmflow-run-budget"
-            data-variant="session"
-          >
-            {t('swarmflow.sessionBudgetShort')} {formatBudgetK(run.budget)}
-            {run.budget.total == null && ` · ${t('swarmflow.budgetUnlimited')}`}
-          </span>
-        )}
-        {run.workflow_budget && (
-          <span
-            className={`text-xs shrink-0 tabular-nums px-1.5 py-0.5 rounded-full ${
-              run.workflow_budget.exhausted
-                ? 'bg-red-500/10 text-red-500'
-                : 'bg-green-500/10 text-green-500'
-            }`}
-            title={t('swarmflow.runBudget')}
-          >
-            {t('swarmflow.runBudgetShort')} {formatBudgetK(run.workflow_budget)}
-            {run.workflow_budget.total == null && ` · ${t('swarmflow.budgetUnlimited')}`}
-          </span>
-        )}
-        {budgetExhaustedScope && (
-          <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/10 text-red-500 shrink-0">
-            {t(
-              budgetExhaustedScope === 'session'
-                ? 'swarmflow.budgetExhaustedSession'
-                : 'swarmflow.budgetExhaustedWorkflow',
+        {/* 指标簇 + 控制按钮。整簇作为一个 grid item：宽档与名称同排贴右，窄档由
+            grid 模板换到第二行、左沿对齐名称轨。 */}
+        <div className="swarmflow-run-metrics flex min-w-0 items-center gap-x-2 gap-y-1">
+          {waitingCount > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-500 shrink-0 animate-pulse" data-testid="team-area-swarmflow-run-waiting-badge" data-variant={run.id}>
+              {t('swarmflow.waitingForHuman', { count: waitingCount })}
+            </span>
+          )}
+          <ProgressBar completed={completedCount} total={totalCount} />
+          {/* 两个预算徽章成组，避免被拆到两行 */}
+          <div className="swarmflow-run-budgets">
+            {run.budget && (
+              <span
+                className={`text-xs shrink-0 tabular-nums px-1.5 py-0.5 rounded-full ${
+                  run.budget.exhausted
+                    ? 'bg-red-500/10 text-red-500'
+                    : 'bg-blue-500/10 text-blue-500'
+                }`}
+                title={t('swarmflow.sessionBudget')}
+                data-testid="team-area-swarmflow-run-budget"
+                data-variant="session"
+              >
+                {t('swarmflow.sessionBudgetShort')} {formatBudgetK(run.budget)}
+                {run.budget.total == null && (
+                  <span className="swarmflow-run-unbounded"> · {t('swarmflow.budgetUnlimited')}</span>
+                )}
+              </span>
             )}
-          </span>
-        )}
-        {(run.status === 'running' || run.status === 'paused') && (
-          <div
-            className="flex items-center gap-1 shrink-0"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <button
-              type="button"
-              title={t(controlsDisabled ? 'swarmflow.controlsDisabledHint' : 'swarmflow.pauseResumeHint')}
-              className={`${controlBtnClass} hover:text-amber-500`}
-              disabled={controlsDisabled || pendingControl !== null}
-              data-testid="team-area-swarmflow-run-pause-btn"
-              data-variant={run.status === 'running' ? 'pause' : 'resume'}
-              onClick={() => {
-                if (run.status !== 'running') {
-                  setPendingControl('resume');
-                  void webRequest('swarmflow.resume', {
+            {run.workflow_budget && (
+              <span
+                className={`text-xs shrink-0 tabular-nums px-1.5 py-0.5 rounded-full ${
+                  run.workflow_budget.exhausted
+                    ? 'bg-red-500/10 text-red-500'
+                    : 'bg-green-500/10 text-green-500'
+                }`}
+                title={t('swarmflow.runBudget')}
+              >
+                {t('swarmflow.runBudgetShort')} {formatBudgetK(run.workflow_budget)}
+                {run.workflow_budget.total == null && (
+                  <span className="swarmflow-run-unbounded"> · {t('swarmflow.budgetUnlimited')}</span>
+                )}
+              </span>
+            )}
+          </div>
+          {budgetExhaustedScope && (
+            <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/10 text-red-500 shrink-0">
+              {t(
+                budgetExhaustedScope === 'session'
+                  ? 'swarmflow.budgetExhaustedSession'
+                  : 'swarmflow.budgetExhaustedWorkflow',
+              )}
+            </span>
+          )}
+          {(run.status === 'running' || run.status === 'paused') && (
+            <div
+              className="flex items-center gap-1 shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                title={t(controlsDisabled ? 'swarmflow.controlsDisabledHint' : 'swarmflow.pauseResumeHint')}
+                className={`${controlBtnClass} hover:text-amber-500`}
+                disabled={controlsDisabled || pendingControl !== null}
+                data-testid="team-area-swarmflow-run-pause-btn"
+                data-variant={run.status === 'running' ? 'pause' : 'resume'}
+                onClick={() => {
+                  if (run.status !== 'running') {
+                    setPendingControl('resume');
+                    void webRequest('swarmflow.resume', {
+                      session_id: sessionId,
+                      run_id: run.id,
+                    }).catch((err) => {
+                      if (applyControlFailure(err)) {
+                        setPendingControl(null);
+                      }
+                    });
+                    return;
+                  }
+                  setPendingControl('pause');
+                  void webRequest('swarmflow.pause', {
                     session_id: sessionId,
                     run_id: run.id,
                   }).catch((err) => {
@@ -1002,58 +1684,48 @@ function RunNode({
                       setPendingControl(null);
                     }
                   });
-                  return;
-                }
-                setPendingControl('pause');
-                void webRequest('swarmflow.pause', {
-                  session_id: sessionId,
-                  run_id: run.id,
-                }).catch((err) => {
-                  if (applyControlFailure(err)) {
-                    setPendingControl(null);
-                  }
-                });
-              }}
-            >
-              {pendingControl === 'pause' || pendingControl === 'resume' ? (
-                <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
-              ) : run.status === 'running' ? (
-                <Pause className="w-4 h-4" />
-              ) : (
-                <Play className="w-4 h-4" />
-              )}
-            </button>
-            <button
-              type="button"
-              title={t(controlsDisabled ? 'swarmflow.controlsDisabledHint' : 'swarmflow.stopHint')}
-              className={`${controlBtnClass} hover:text-red-500`}
-              disabled={controlsDisabled || pendingControl !== null}
-              data-testid="team-area-swarmflow-run-stop-btn"
-              onClick={() => {
-                setPendingControl('stop');
-                void webRequest('swarmflow.stop', { session_id: sessionId, run_id: run.id }).catch(
-                  (err) => {
-                    if (applyControlFailure(err)) {
-                      setPendingControl(null);
-                    }
-                  },
-                );
-              }}
-            >
-              {pendingControl === 'stop' ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-red-500" />
-              ) : (
-                <Square className="w-3.5 h-3.5" />
-              )}
-            </button>
-          </div>
-        )}
+                }}
+              >
+                {pendingControl === 'pause' || pendingControl === 'resume' ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
+                ) : run.status === 'running' ? (
+                  <Pause className="w-4 h-4" />
+                ) : (
+                  <Play className="w-4 h-4" />
+                )}
+              </button>
+              <button
+                type="button"
+                title={t(controlsDisabled ? 'swarmflow.controlsDisabledHint' : 'swarmflow.stopHint')}
+                className={`${controlBtnClass} hover:text-red-500`}
+                disabled={controlsDisabled || pendingControl !== null}
+                data-testid="team-area-swarmflow-run-stop-btn"
+                onClick={() => {
+                  setPendingControl('stop');
+                  void webRequest('swarmflow.stop', { session_id: sessionId, run_id: run.id }).catch(
+                    (err) => {
+                      if (applyControlFailure(err)) {
+                        setPendingControl(null);
+                      }
+                    },
+                  );
+                }}
+              >
+                {pendingControl === 'stop' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-red-500" />
+                ) : (
+                  <Square className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {controlError && (
         <Toast message={controlError} onClose={() => setControlError(null)} variant="error" />
       )}
-      {run.error && (
+      {!compressed && run.error && (
         <button
           type="button"
           onClick={() =>
@@ -1071,7 +1743,7 @@ function RunNode({
           <span className="flex-1 min-w-0 truncate">{run.error}</span>
         </button>
       )}
-      {run.result && (
+      {!compressed && run.result && (
         <button
           type="button"
           onClick={() =>
@@ -1141,6 +1813,15 @@ export interface SwarmflowTreeViewProps {
 
 export function SwarmflowTreeView({ runs, sessionId }: SwarmflowTreeViewProps) {
   const { t } = useTranslation();
+  // Active runs pin to the top, ended ones fold below a divider, both sections
+  // keep the store's newest-first order. Rendered as ONE keyed list with the
+  // divider as a keyed item: React preserves component state only among
+  // siblings of the same list, so a run crossing the boundary keeps its
+  // toast, agent-detail modal and phase-tree expand state.
+  const { items, activeCount, endedCount } = useMemo(
+    () => orderRunsForTreeView(runs),
+    [runs],
+  );
 
   if (runs.length === 0) {
     return (
@@ -1151,12 +1832,26 @@ export function SwarmflowTreeView({ runs, sessionId }: SwarmflowTreeViewProps) {
   }
 
   return (
-    <div className="flex flex-col h-full" data-testid="team-area-swarmflow-tree-view">
-      <div className="flex-1 overflow-auto">
+    <div className="flex flex-col flex-1 min-h-0" data-testid="team-area-swarmflow-tree-view">
+      <div className="flex-1 min-h-0 overflow-auto">
         <div className="flex flex-col gap-2 p-2">
-          {runs.map((run) => (
-            <RunNode key={run.id} run={run} sessionId={sessionId} />
-          ))}
+          {items.map((item) =>
+            item === 'divider' ? (
+              <div
+                key="run-fold-divider"
+                className="flex items-center gap-2 px-1 select-none"
+                data-testid="team-area-swarmflow-run-fold-divider"
+              >
+                <span className="h-px flex-1 bg-border" />
+                <span className="whitespace-nowrap text-[10px] uppercase tracking-wide text-text-muted">
+                  {t('swarmflow.runFoldDivider', { active: activeCount, ended: endedCount })}
+                </span>
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            ) : (
+              <RunNode key={item.id} run={item} sessionId={sessionId} />
+            ),
+          )}
         </div>
       </div>
     </div>

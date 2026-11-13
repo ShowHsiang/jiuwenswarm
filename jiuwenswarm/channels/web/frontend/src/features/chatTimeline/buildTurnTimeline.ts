@@ -1,7 +1,7 @@
 /**
  * 对话轮次时间线纯函数：live / history / FileViewer 共用同一套排序与折叠分组逻辑。
  */
-import type { Message, ToolExecution } from '../../types';
+import type { Message, OutputOrder, ToolExecution } from '../../types';
 import type { ReasoningSegment } from '../../stores/chatStore';
 import { getMessageActor } from '../../components/ChatPanel/MessageItem';
 import {
@@ -83,11 +83,13 @@ export type RenderItem =
       type: 'turnSummary';
       key: string;
       turnId: number;
+      executionTurnId?: number;
       startMs: number;
       endMs: number;
       /** 工作活动跨度（工具/思考/助手气泡），不含用户消息，供「已完成」耗时 */
       workStartMs: number;
       workEndMs: number;
+      isStarting: boolean;
       isLastTurn: boolean;
       hasWork: boolean;
       /** 时间行插在本轮内容顶部，接管了本轮顶部头像时为 true */
@@ -101,7 +103,23 @@ export function toTimestampMs(value: string | undefined): number {
   return parseTimestampToMs(value);
 }
 
+function getTimelineOutputOrder(item: TimelineItem): OutputOrder | undefined {
+  switch (item.type) {
+    case 'message':
+      return item.message.outputOrder;
+    case 'reasoning':
+      return item.segment.outputOrder;
+    case 'toolExecution':
+      return item.execution.outputOrder;
+  }
+}
+
 function compareTimelineItems(a: TimelineItem, b: TimelineItem): number {
+  const aOrder = getTimelineOutputOrder(a);
+  const bOrder = getTimelineOutputOrder(b);
+  if (aOrder && bOrder && aOrder.requestId === bOrder.requestId && aOrder.sequence !== bOrder.sequence) {
+    return aOrder.sequence - bOrder.sequence;
+  }
   const aTsValid = Number.isFinite(a.timestampMs);
   const bTsValid = Number.isFinite(b.timestampMs);
   if (aTsValid && bTsValid && a.timestampMs !== b.timestampMs) {
@@ -148,6 +166,8 @@ export function buildTimelineItems(
     segment,
   }));
 
+  // Every user message is a chronological boundary. Never move a supplement
+  // ahead of assistant text that was already visible when it was sent.
   return [...messageItems, ...executionItems, ...reasoningItems].sort(compareTimelineItems);
 }
 
@@ -282,16 +302,6 @@ export function buildRenderItems(items: TimelineItem[], isTeamMode: boolean, isP
   };
 
   const pushMessage = (item: Extract<TimelineItem, { type: 'message' }>) => {
-    // 主动推荐消息是系统后台触发的主 agent 话术，不是用户这一轮的回复。
-    // assistant 消息默认沿用 currentTurnId（与上一轮同 turn），会让推荐消息并入
-    // 上一轮 turn——既存 proactive 补丁（buildTurnWorkMeta）据此把该 turn 的
-    // hasWork 置 false，误伤上一轮：上一轮 reasoning 从折叠的 turn chip
-    // （「已完成」）变成展开的 ReasoningBlock（「已完成思考」+ team_leader avatar）。
-    // 给 proactive 消息推进一个独立 turnId，自成一块。insertTurnSummaries 里
-    // 对 proactive 消息做了同样的 flush+turnId+1，两者保持同步。
-    if (item.message.role !== 'user' && item.message.isProactiveRecommendation) {
-      currentTurnId += 1;
-    }
     renderItems.push({
       type: 'message',
       key: item.key,
@@ -320,7 +330,10 @@ export function buildRenderItems(items: TimelineItem[], isTeamMode: boolean, isP
       continue;
     }
 
+    // 群广播和成员之间的回复要留在主会话里。收进活动卡片后，刷新页面就只剩用户提示词。
     if (isTeamMemberCollaborationMessage(item.message)) {
+      flushToolGroup(true);
+      pushMessage(item);
       continue;
     }
 
@@ -362,13 +375,7 @@ export function buildRenderItems(items: TimelineItem[], isTeamMode: boolean, isP
     if (isAssistantReply) {
       const inRunningTurn = isProcessing && renderItem.turnId === activeTurnId;
       renderItem.hideMeta = laterAssistantInTurn || inRunningTurn;
-      // 主动推荐消息是系统后台插入的推荐卡片，不是用户这一轮的后续回复。
-      // 若让它置 laterAssistantInTurn=true，会把它前面的上一轮回复当成「中间文字」
-      // 折叠进 turn chip，导致上一轮 agent 回复正文被整个收起（只剩「已完成」）。
-      // proactive 消息自成一块，不影响其前方回复的折叠判定。
-      if (!renderItem.message.isProactiveRecommendation) {
-        laterAssistantInTurn = true;
-      }
+      laterAssistantInTurn = true;
     }
   }
 
@@ -461,6 +468,8 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
   let hasActivity = false;
   let hasWork = false;
   let turnId = 0;
+  let executionTurnId = 0;
+  let isStarting = false;
   // 已完成轮次锚定该轮最后一个业务项：历史页从半轮开始时，后续只会在它前面
   // 补数据，末项不会变化。进行中轮次仍锚定 user，避免流式追加时反复换 key。
   let summaryAnchorKey: string | null = null;
@@ -497,10 +506,12 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
         type: 'turnSummary',
         key: `turn-summary-${anchorKey}`,
         turnId,
+        executionTurnId,
         startMs,
         endMs,
         workStartMs: Number.isFinite(workStartMs) ? workStartMs : startMs,
         workEndMs: Number.isFinite(workEndMs) ? workEndMs : endMs,
+        isStarting,
         isLastTurn,
         hasWork,
         showAvatar: false,
@@ -539,6 +550,8 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
     if (item.type === 'message' && item.message.role === 'user') {
       flush(false);
       turnId += 1;
+      if (!item.message.supplementalInput) executionTurnId = turnId;
+      if (!item.message.supplementalInput) isStarting = item.message.isTimestampPending === true;
       // 空窗起点仅并入「设目标」消息开启的轮次：goal 插队时上一提问与设目标同属一次
       // 交互流程，本轮耗时从上一提问算起；普通新提问（哪怕只隔几分钟）与上一条空窗
       // 提问无关，不继承起点，避免把无关/跨会话等待算进本轮「已完成」耗时。
@@ -560,19 +573,6 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
       out.push(item);
       turnContentStart = out.length;
       continue;
-    }
-    // 主动推荐消息自成一块（与 buildRenderItems 里推进 currentTurnId 对齐）：
-    // 先 flush 掉上一轮，再 +1 进入新 turn，避免推荐消息并入上一轮导致
-    // buildTurnWorkMeta 的 proactive 补丁误把上一轮 hasWork 置 false。
-    let startsOwnBlock = false;
-    if (
-      item.type === 'message' &&
-      item.message.role !== 'user' &&
-      item.message.isProactiveRecommendation
-    ) {
-      flush(false);
-      turnId += 1;
-      startsOwnBlock = true;
     }
     // 记录本轮当前末项。历史前插不会改变它，因此已完成轮次身份保持稳定。
     summaryAnchorKey = item.key;
@@ -610,10 +610,6 @@ function insertTurnSummaries(items: RenderItem[], isProcessing: boolean): Render
       }
     }
     out.push(item);
-    if (startsOwnBlock) {
-      // 主动推荐卡自成一块：时间行插在卡片之后、后续内容之前。
-      turnContentStart = out.length;
-    }
   }
   flush(true);
   return out;
@@ -689,7 +685,10 @@ export function messageHasDeliverable(message: Message): boolean {
 }
 
 export function filterDeliverableExecutions(executions: ToolExecution[]): ToolExecution[] {
-  return executions.filter((execution) => isDeliverableToolName(execution.toolCall.name));
+  // MCP App views stay visible when the turn is folded, like sent files.
+  return executions.filter(
+    (execution) => isDeliverableToolName(execution.toolCall.name) || Boolean(execution.result?.mcpApp)
+  );
 }
 
 function isExecutionRunning(execution: ToolExecution): boolean {
@@ -732,9 +731,11 @@ function emptyTurnMeta(turnId: number, partial?: Partial<TurnWorkMeta>): TurnWor
 
 export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): Map<number, TurnWorkMeta> {
   const map = new Map<number, TurnWorkMeta>();
+  const executionTurns = new Map<number, number>();
   let lastTurnId = Number.NEGATIVE_INFINITY;
   for (const item of items) {
     if (item.type === 'turnSummary') {
+      executionTurns.set(item.turnId, item.executionTurnId ?? item.turnId);
       lastTurnId = Math.max(lastTurnId, item.turnId);
       const prev = map.get(item.turnId);
       map.set(
@@ -788,25 +789,14 @@ export function buildTurnWorkMeta(items: RenderItem[], isProcessing: boolean): M
       map.set(item.turnId, next);
     }
   }
-  // 收集含主动推荐消息的 turnId：proactive 消息是系统插入的推荐（带
-  // isProactiveRecommendation 标记），不该和用户那轮混在一起触发 turn 折叠——
-  // 否则 proactive 触发的主 agent 这轮（带工具/思考）会让用户上一轮回复被收起。
-  // 把含 proactive 的 turn 的 hasWork 置 false，让它不 foldable，上一轮回复保持展开。
-  const proactiveTurnIds = new Set<number>();
-  for (const item of items) {
-    if (item.type === 'message' && item.message?.isProactiveRecommendation) {
-      proactiveTurnIds.add(item.turnId);
-    }
-  }
   for (const meta of map.values()) {
     if (meta.thinkingCount > 0 || meta.toolCount > 0) {
       meta.hasWork = true;
     }
-    if (proactiveTurnIds.has(meta.turnId)) {
-      meta.hasWork = false;
-    }
-    const isLast = Number.isFinite(lastTurnId) && meta.turnId === lastTurnId;
-    meta.completed = !(isProcessing && isLast);
+    const isCurrentExecution = executionTurns.has(meta.turnId)
+      ? executionTurns.get(meta.turnId) === executionTurns.get(lastTurnId)
+      : meta.turnId === lastTurnId;
+    meta.completed = !(isProcessing && isCurrentExecution);
     meta.outcomeTone = resolveWorkOutcomeTone(
       meta.toolSuccessCount,
       meta.toolFailedCount,

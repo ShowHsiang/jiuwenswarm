@@ -1,6 +1,6 @@
 # Project & Session Management (Web)
 
-> **Implementation**: `jiuwenswarm/gateway/channel_manager/web/app_web_handlers.py` (handler registration), `jiuwenswarm/gateway/channel_manager/web/git_ws_handler.py` (Git Diff WebSocket), `jiuwenswarm/server/runtime/session/project_store.py` (project storage), `jiuwenswarm/server/runtime/session/session_metadata.py` (session metadata), `jiuwenswarm/server/runtime/session/project_git.py` (Git operations), `jiuwenswarm/server/runtime/session/git_diff_status.py` (Diff aggregation), `jiuwenswarm/server/runtime/session/git_diff_watcher.py` (Diff monitoring)
+> **Implementation**: `gateway/channel_manager/web/app_web_handlers.py` (handler registration), `gateway/channel_manager/web/git_ws_handler.py` (Git Diff WebSocket), `jiuwenswarm/server/runtime/session/project_store.py` (project storage), `jiuwenswarm/server/runtime/session/session_metadata.py` (session metadata), `jiuwenswarm/server/runtime/session/project_git.py` (Git operations), `jiuwenswarm/server/runtime/session/git_diff_status.py` (Diff aggregation), `jiuwenswarm/server/runtime/session/git_diff_watcher.py` (Diff monitoring)
 > **中文版**: [../zh/项目与会话管理.md](../zh/项目与会话管理.md)
 
 ---
@@ -10,6 +10,8 @@
 The Web channel provides project-scoped session management. Sessions bind to projects through `project_id`, and can also fall back to mode-specific default projects.
 
 The current implementation adds a `work_mode` dimension to isolate regular work collaboration from code projects. `code` projects support Git status, branch operations, Diff snapshots, live Diff monitoring, and discarding/redoing the last turn's file changes. `work` projects keep the regular project/session behavior.
+
+Expert and expert group chats keep model selections per session. Returning to a session retains its selection, and reloading the page restores it from session metadata. Local choices are also retained when switching sessions before sending a message. The chat selector and outgoing requests use the same model selection. If restoration fails, the page shows an error and temporarily disables sending to avoid using the default model unintentionally.
 
 ### Core Concepts
 
@@ -23,6 +25,8 @@ The current implementation adds a `work_mode` dimension to isolate regular work 
 | **Immutability** | Once `project_id`, `project_dir`, and `work_mode` are bound to a session, they cannot be changed; no cross-project/cross-mode migration API is provided |
 
 ### Communication Convention
+
+In both personal and enterprise editions, Gateway forwards `session.list`, `session.rename`, and `session.pin` to the target AgentServer through E2A. The Server owns session data access. If the Server is stopped, not ready, or disconnected, Gateway returns `SERVICE_UNAVAILABLE` without reading or writing local sessions or loading a local compatibility module.
 
 - Transport: WebSocket JSON messages
 - Request structure: `{ "id": "<req_id>", "method": "<method_name>", "params": { ... } }`
@@ -298,18 +302,27 @@ Toggles project pin state and compacts pin order.
 
 ---
 
-### Session lifecycle and project deletion
+### Session lifecycle and project removal
 
-- `session.archive` / `session.unarchive`: `{session_ids:string[]}`, 1–100 IDs; returns `{succeeded_count, failed_count, results}`. Running sessions return `SESSION_BUSY` without stopping work. Cron/heartbeat execution sessions cannot be archived individually.
-- `session.archived.list`: optional `project_id`, `work_mode`, `keyword`, `limit` (default 20, maximum 200), `offset`; returns `{sessions,total,limit,offset,has_more}`. Sorts by `archived_at DESC, session_id ASC`.
-- `session.delete`: accepts `session_id` or batch `session_ids`; both active and archived sessions can be permanently deleted. Running work is stopped before cleanup.
-- `project.delete`: `{project_id:string}`; directly deletes all owned cron jobs, active/archived sessions and the project record. No archive prerequisite. Returns `{project_id,deleted:true,deleted_sessions,deleted_cron_jobs}`. Keeps the user's working directory. Partial failures retain progress and retry the same operation.
-- `project.sessions.archive`: `{project_id:string}`; archives a snapshot of all eligible active sessions. Busy sessions fail individually; cron jobs stay unchanged.
-- `project.sessions.delete_archived`: `{project_id:string}`; permanently deletes only archived sessions in the project.
+- `session.archive` / `session.unarchive`: `{session_ids:string[]}`, 1–100 IDs; returns `{succeeded_count, failed_count, results}`. The archive result is persisted synchronously and the session leaves the active list immediately; stopping running work, flushing writes and moving the directory happen in the background. The response no longer returns `SESSION_BUSY` and each item carries `accepted`/`finalizing`. Failed background cleanup retries a bounded number of times, then becomes `abandoned` with an error log. Cron/heartbeat execution sessions cannot be archived individually.
+- `session.archived.list`: optional `project_id`, `work_mode`, `keyword`, `limit` (default 20, maximum 200), `offset`; returns `{sessions,total,limit,offset,has_more}`. Sorts by `archived_at DESC, session_id ASC`. Each item carries `project_hidden`, marking whether its project has been removed; an archive whose directory move is still pending carries `finalizing`/`stop_pending`.
+- `session.delete`: accepts `session_id` or batch `session_ids`; both active and archived sessions can be permanently deleted. The deleted state is persisted immediately and hidden from every list; stopping running work, flushing writes and removing the directory happen in the background. The response carries `accepted`/`finalizing` and no longer returns `SESSION_BUSY`.
+- `project.remove`: `{project_id:string}`; hide the project without deleting sessions, cron jobs or the working directory. The Gateway still stops the project's cron jobs first (disables them and cancels in-flight runs; the job records are kept) and aborts the removal if that fails, so a hidden project never has running or firing cron jobs. Running sessions no longer block removal; the AgentServer stops them in the background with a bounded retry budget. Returns `{project_id,hidden:true,affected_sessions,stopped_sessions}`, where `affected_sessions` counts the active conversations hidden with the project (pinned conversations included, cron execution sessions excluded) and `stopped_sessions` lists the running conversations whose background stop was scheduled.
+- `project.restore`: `{project_id:string}`; restore a hidden project. Returns `{project_id,restored:true,work_mode,affected_sessions}`. Stopped cron jobs stay stopped after the restore and must be re-enabled manually. `project.list` / `project.info` accept `include_hidden:true`.
+- `project.sessions.archive`: `{project_id:string}`; archives a snapshot of all eligible active sessions. Running sessions are accepted too; stopping and directory moves happen in the background. Cron jobs stay unchanged.
+- `project.sessions.delete_archived`: `{project_id:string}`; permanently deletes only archived sessions in the project. Deletion is accepted immediately and cleaned up in the background.
 
 Both project session operations return `{project_id,succeeded_count,failed_count,results}`. Each result contains `session_id`, `ok`, and `code/error` on failure. An empty selection succeeds with zero counts. Default projects support these batch operations but cannot themselves be deleted.
 
-Projects have no archive or restore state. The old project archive, unarchive and archived-list methods have been removed. Legacy hidden projects become visible during migration; explicitly archived sessions and cron enabled values are preserved. Lifecycle state/events remain for session management and project deletion.
+Background cleanup is bound to its `operation_id` and runtime generation: an old retry cannot take over a later archive or stop a new runtime generation started after restoration. Waiting for mailbox consumers to stop is limited to 10 seconds per attempt; a timeout releases the cleanup slot and schedules a retry. Consumers remain tracked until they exit, so retries cannot delete their data while they still run. If an archive stop timed out, the next turn after unarchive finishes draining the old runtime before registering a new generation.
+
+An already archived session returns `accepted=true`, `finalizing=false` and `stop_pending=false` without starting another cleanup. The Gateway retains its busy guard until background cleanup completes; acceptance alone does not enable Git undo/redo. After the session directory is deleted, failed mailbox cleanup retries independently without repeating Runtime deletion. Exhausting those retries keeps the deleted target blocked. If deletion is aborted before physical deletion, queued messages resume after the old consumer finishes unwinding.
+
+When project batch archive includes the conversation currently open in the browser, the page returns to a new chat. Conversations outside the successful archive results stay open.
+
+Project removal sets `hidden=true` and clears its pin. The project's active sessions disappear from the workspace with it: they are listed under neither the project nor the default project (default project lists and session counts exclude them), and pinned conversations leave the pinned area as well. Stored project IDs are unchanged. Archived sessions are unaffected and stay in the archive page under the real project name, flagged with `project_hidden` so the page can explain that the project was removed. Restoring the project, or creating it again with the same directory and work mode, brings those sessions back, pinned ones included. The project's cron jobs are stopped when it is removed — disabled, with in-flight runs cancelled — and remain in the store invisible to the cron list; after a restore they stay stopped by default. The working directory is preserved.
+
+Archiving and pinning are independent: archiving keeps the session's pinned state, and unarchiving restores it and renumbers the pinned ordering. Undoing the archive of a session whose project was removed restores that project too; when another project already holds the name, the call fails with `PROJECT_NAME_CONFLICT` and the session stays archived until the user resolves the clash.
 
 ---
 ### project.pinned_sessions - List pinned sessions
@@ -601,3 +614,14 @@ Symmetric to `discard_turn_changes`: re-applies the file changes that were disca
 | `project.git.diff_unwatch` | `/ws/git` | Cancel watches |
 | `project.git.discard_turn_changes` | `/ws/git` | Discard the current session's last turn code changes |
 | `project.git.redo_turn_changes` | `/ws/git` | Redo the current session's last turn discarded changes |
+
+## Cross-session Agent messages and steering
+
+Non-cron Web/TUI single-Agent Sessions belonging to the same user on the same AgentServer can exchange messages through the existing tools:
+
+- Use `session_list` to find a target. `session_send_message(target_session_id, message)` defaults to `steer`: a running target handles the input in its current turn; an idle target starts a new turn.
+- Use `input_mode="follow_up"` for an independent queued task. Plan mode and active Goals always defer cross-session input to that queue. Each delivery lane is FIFO; steering can overtake independent tasks.
+- Use `session_message_list` to inspect the existing mailbox. `accepted: true` means persisted; `delivered` means supplemental input was accepted, not that the model consumed it or the target task succeeded. `succeeded` requires actual completion of an independent execution.
+- Temporary refusals before SDK submission (including pending user interactions and closing input windows) return to the independent-task queue. Interrupted or uncertain delivery becomes `unknown`, retaining the existing explicit resolution workflow without automatic replay. Failed input-boundary publication drops the supplemental input before model admission and does not fail the original task.
+
+Source Session, message ID, chain and Agent provenance are retained in delivery, UI and history. Live and restored Agent inputs use a Host-generated tool call/result pair for SDK compatibility; the payload has tool authority and grants no new user authorization. Existing ownership, idempotency, capacity and hop limits remain in force. This adds no reply protocol; previously persisted independent tasks keep their delivery mode.

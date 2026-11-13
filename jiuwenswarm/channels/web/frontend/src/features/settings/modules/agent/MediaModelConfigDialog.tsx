@@ -8,24 +8,22 @@ import { useSettingsFormDialogClose } from '../../services/useSettingsFormDialog
 import { useSettingsServices } from '../../services/SettingsServicesProvider';
 import { ModelNameField } from '../models/ModelNameField';
 import { ModelProviderSelect } from '../models/ModelProviderSelect';
-import {
-  CONTEXT_WINDOW_1M_FIELD,
-  formatContextWindowTokens,
-  ONE_MILLION_CONTEXT_WINDOW_TOKENS,
-  parseContextWindowTokens,
-} from '../models/contextWindow';
+import { ContextWindowField } from '../models/ContextWindowField';
+import { parseContextWindowTokens } from '../models/contextWindow';
 import {
   CUSTOM_VENDOR_SELECTION,
   findVendorPreset,
   normalizeModelOptions,
   parseVendorCatalog,
   selectProviderDefaultModel,
+  withoutGenerationOnlyPresets,
 } from '../models/modelAdapters';
-import type { MediaCapabilityModality } from './mediaCapabilities';
 import {
   buildMediaModelConfigUpdates,
+  buildMediaModelValidationPayload,
   createMediaModelDraft,
   type MediaModelDraft,
+  type ModelConfigurationSlot,
 } from './mediaModelConfig';
 
 const EMPTY_VENDOR_CATALOG: VendorPresetMap = {
@@ -93,7 +91,7 @@ function validateMediaModelDraft(
   if (!modelName) errors.model_name = t('config.modelList.modelNameRequired');
   else if (modelName.length > 100) errors.model_name = t('config.modelList.modelNameTooLong');
 
-  if (!value[CONTEXT_WINDOW_1M_FIELD] && parseContextWindowTokens(value.context_window_tokens) === null) {
+  if (parseContextWindowTokens(value.context_window_tokens) === null) {
     errors.context_window_tokens = t('settingsPanel.models.validation.contextWindowInvalid');
   }
 
@@ -107,13 +105,15 @@ export function MediaModelConfigDialog({
   save,
   onSaved,
   onClose,
+  titleKey,
 }: {
-  modality: MediaCapabilityModality;
+  modality: ModelConfigurationSlot;
   config: Record<string, unknown>;
   enableOnSave: boolean;
   save: SaveConfig;
   onSaved: (result: unknown) => void;
   onClose: () => void;
+  titleKey?: string;
 }) {
   const { t } = useTranslation();
   const { isConnected, request } = useSettingsServices();
@@ -125,16 +125,25 @@ export function MediaModelConfigDialog({
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [testing, setTesting] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
   const [fetchStatus, setFetchStatus] = useState('');
   const [saveError, setSaveError] = useState('');
+  const [validationFailure, setValidationFailure] = useState<{
+    error: string;
+    values: MediaModelDraft;
+  } | null>(null);
   const catalogRequestId = useRef(0);
   const fetchRequestId = useRef(0);
+  const validationRequestId = useRef(0);
   const fetchedModelLists = useRef(new Set<string>());
   const preset = findVendorPreset(catalog, values.vendor_selection);
   const custom = values.vendor_selection === CUSTOM_VENDOR_SELECTION;
-  const closeBlocked = submitting;
+  const closeBlocked = submitting || testing;
+  // Topic is a chat LLM: probe with the same config.validate_model path as
+  // ModelDialog. Vision/audio/video stay form-only (non-chat endpoints).
+  const probeBeforeSave = modality === 'topic';
   const { discardConfirmationOpen, requestClose, cancelDiscard, confirmDiscard } = useSettingsFormDialogClose({
     id: `agent-${modality}-model-dialog`,
     form,
@@ -168,7 +177,13 @@ export function MediaModelConfigDialog({
     try {
       const payload = await request<{ vendors?: unknown }>('vendors.list');
       if (currentRequestId !== catalogRequestId.current) return;
-      setCatalog(parseVendorCatalog(payload.vendors));
+      const next = withoutGenerationOnlyPresets(parseVendorCatalog(payload.vendors));
+      if (modality === 'topic') {
+        const compatible = (presets: VendorPresetMap['custom_api']) =>
+          presets.filter(preset => preset.client_provider === 'OpenAI');
+        setCatalog({ ...next, token_plan: compatible(next.token_plan), coding_plan: compatible(next.coding_plan),
+          custom_api: compatible(next.custom_api) });
+      } else setCatalog(next);
     } catch (error) {
       if (currentRequestId === catalogRequestId.current) {
         setCatalogError(
@@ -180,7 +195,7 @@ export function MediaModelConfigDialog({
     } finally {
       if (currentRequestId === catalogRequestId.current) setCatalogLoading(false);
     }
-  }, [isConnected, request, t]);
+  }, [isConnected, modality, request, t]);
 
   useEffect(() => {
     void loadCatalog();
@@ -320,7 +335,11 @@ export function MediaModelConfigDialog({
   };
 
   const errors = validateMediaModelDraft(values, catalog, t);
-  const contextWindow1mEnabled = Boolean(values[CONTEXT_WINDOW_1M_FIELD]);
+  const hasSavedTopicKey = modality === 'topic' && config.topic_has_api_key === true
+    && values.api_base === initialValues.api_base && values.vendor_selection === initialValues.vendor_selection;
+  if (hasSavedTopicKey && !values.api_key.trim()) {
+    delete errors.api_key;
+  }
   const formItems: FormItem<MediaModelDraft>[] = [
     {
       name: 'vendor_selection',
@@ -397,7 +416,7 @@ export function MediaModelConfigDialog({
         fetchStatus={fetchStatus}
         fetching={fetching}
         showRefresh={Boolean(preset)}
-        fetchDisabled={!isConnected || !preset?.models_endpoint || fetching || submitting}
+        fetchDisabled={!isConnected || !preset?.models_endpoint || fetching || submitting || testing}
         emptyText={t(
           preset
             ? (getPresetStatusKey(preset, values.api_key, []) ?? 'settingsPanel.models.noModelResults')
@@ -414,42 +433,29 @@ export function MediaModelConfigDialog({
   formItems.push({
     name: 'context_window_tokens',
     label: t('settingsPanel.models.contextWindow'),
-    component: 'input',
-    type: 'text',
+    component: 'custom',
     required: true,
-    disabled: contextWindow1mEnabled,
-    placeholder: t('settingsPanel.models.contextWindowPlaceholder'),
     helpTips: t('settingsPanel.models.contextWindowHint'),
-  });
-  formItems.push({
-    name: CONTEXT_WINDOW_1M_FIELD,
-    label: t('settingsPanel.models.contextWindow1m'),
-    component: 'switch',
-    switchLabel: t('settingsPanel.models.contextWindow1m'),
-    helpTips: t('settingsPanel.models.contextWindow1mHint'),
-    description: t('settingsPanel.models.contextWindow1mWarning'),
-    onChange: (enabled) => {
-      if (enabled) {
-        form.setFieldValue(
-          'context_window_tokens',
-          formatContextWindowTokens(ONE_MILLION_CONTEXT_WINDOW_TOKENS),
-        );
-      }
-    },
+    render: ({ id, value, error, disabled, onChange, onBlur }) => (
+      <ContextWindowField
+        id={id}
+        value={value}
+        error={error}
+        disabled={disabled}
+        placeholder={t('settingsPanel.models.contextWindowPlaceholder')}
+        presetLabel={t('settingsPanel.models.contextWindowPresets')}
+        onChange={onChange}
+        onBlur={onBlur}
+      />
+    ),
   });
 
-  const confirm = async () => {
-    if (Object.keys(errors).length) {
-      form.validate();
-      return;
-    }
-    const result = form.validate();
-    if (!result.valid) return;
+  const persist = async (draft: MediaModelDraft) => {
     setSubmitting(true);
     setSaveError('');
     try {
       const saveResult = await save(
-        buildMediaModelConfigUpdates(result.values, catalog, modality, enableOnSave),
+        buildMediaModelConfigUpdates(draft, catalog, modality, enableOnSave),
         `settingsPanel.agent.${modality}`,
       );
       onSaved(saveResult);
@@ -461,14 +467,73 @@ export function MediaModelConfigDialog({
     }
   };
 
+  const confirm = async () => {
+    if (Object.keys(errors).length) {
+      form.validate();
+      return;
+    }
+    const result = form.validate();
+    if (!result.valid) return;
+    setSaveError('');
+    setValidationFailure(null);
+    if (!probeBeforeSave) {
+      await persist(result.values);
+      return;
+    }
+    // Match ModelDialog: blank key while the stored credential is unchanged skips
+    // a re-probe and lets the backend reuse the saved key.
+    const reuseSavedKey =
+      config.topic_has_api_key === true
+      && !result.values.api_key.trim()
+      && result.values.api_base === initialValues.api_base
+      && result.values.vendor_selection === initialValues.vendor_selection;
+    if (reuseSavedKey) {
+      await persist(result.values);
+      return;
+    }
+    const currentRequestId = ++validationRequestId.current;
+    setTesting(true);
+    try {
+      await request(
+        'config.validate_model',
+        buildMediaModelValidationPayload(result.values, catalog, {
+          apiKeyFallback: initialValues.api_key,
+        }),
+        { timeoutMs: 60_000 },
+      );
+      if (currentRequestId === validationRequestId.current) {
+        setTesting(false);
+        await persist(result.values);
+      }
+    } catch (error) {
+      if (currentRequestId === validationRequestId.current) {
+        const detail = error instanceof Error ? error.message.trim() : '';
+        setValidationFailure({
+          error: detail
+            ? t('settingsPanel.models.validationFailedWithDetail', { detail })
+            : t('settingsPanel.models.validationFailed'),
+          values: result.values,
+        });
+      }
+    } finally {
+      if (currentRequestId === validationRequestId.current) setTesting(false);
+    }
+  };
+
   return (
     <>
       <FormDialog
         open
-        title={t(`settingsPanel.agent.${modality}ConfigTitle`)}
+        title={t(titleKey ?? `settingsPanel.agent.${modality}ConfigTitle`)}
         submitting={closeBlocked}
-        confirmDisabled={!isConnected || fetching}
-        confirmLabel={t(enableOnSave ? 'settingsPanel.agent.saveAndEnable' : 'common.save')}
+        confirmDisabled={!isConnected || fetching || testing || submitting}
+        confirmLabel={t(
+          testing
+            ? 'settingsPanel.models.testingConnection'
+            : enableOnSave
+              ? 'settingsPanel.agent.saveAndEnable'
+              : 'common.save',
+        )}
         cancelLabel={t('common.cancel')}
         dialogClassName="settings-model-dialog"
         testIdPrefix="settings-agent-media-config-dialog"
@@ -491,14 +556,14 @@ export function MediaModelConfigDialog({
               {t('settingsPanel.models.catalogLoadFailedCustomAvailable')}
               <small>{catalogError}</small>
             </span>
-            <Button size="sm" disabled={!isConnected || catalogLoading || submitting} onClick={() => void loadCatalog()} data-testid="settings-agent-media-config-dialog-catalog-retry-btn">
+            <Button size="sm" disabled={!isConnected || catalogLoading || submitting || testing} onClick={() => void loadCatalog()} data-testid="settings-agent-media-config-dialog-catalog-retry-btn">
               {t('settingsPanel.feedback.retry')}
             </Button>
           </div>
         ) : null}
         <Form<MediaModelDraft>
           form={form}
-          disabled={submitting}
+          disabled={submitting || testing}
           optionalText={t('common.optional')}
           showOptional={false}
           testIdPrefix="settings-agent-media-config-dialog"
@@ -523,6 +588,23 @@ export function MediaModelConfigDialog({
         message={t('settingsPanel.dialog.discardConfirm')}
         onConfirm={confirmDiscard}
         onCancel={cancelDiscard}
+      />
+      <SettingsConfirmDialog
+        open={validationFailure !== null}
+        title={t('settingsPanel.models.validationBeforeSaveTitle')}
+        message={t('settingsPanel.models.validationBeforeSaveMessage')}
+        error={validationFailure?.error}
+        confirming={submitting}
+        confirmLabel={t('settingsPanel.models.continueSave')}
+        cancelLabel={t('settingsPanel.models.returnToEdit')}
+        confirmVariant="warning"
+        onCancel={() => setValidationFailure(null)}
+        onConfirm={() => {
+          if (!validationFailure) return;
+          const draft = validationFailure.values;
+          setValidationFailure(null);
+          void persist(draft);
+        }}
       />
     </>
   );

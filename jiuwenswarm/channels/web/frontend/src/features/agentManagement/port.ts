@@ -1,4 +1,4 @@
-import type { CatalogItems } from '../catalogCache';
+import type { CatalogCacheMetadata, CatalogItems } from '../catalogCache';
 import type {
   AgentCatalogItem,
   AgentDetail,
@@ -15,7 +15,8 @@ import type {
   McpOption,
   SkillOption,
 } from './types';
-import { resolveAgentTagPayload } from './tagOptions';
+import { resolveAgentGroupTagPayload } from './tagOptions';
+import { generateUuidV4 } from '../../utils/uuid';
 
 export type AgentInstallResult =
   | { kind: 'ok' }
@@ -56,6 +57,14 @@ export interface AgentCatalogListOptions {
   enrichTags?: boolean;
   filter?: 'builtin+hub' | 'mine';
   includeTeamCompatibility?: boolean;
+  query?: string;
+  /** 企业版列表遇到 Pod 冷启动时回调。个人版不会触发。 */
+  onPodStarting?: () => void;
+}
+
+export interface SkillListOptions {
+  includeTeamMarketplace?: boolean;
+  onTeamMarketplaceLoaded?: (options: SkillOption[], cache?: CatalogCacheMetadata) => void;
 }
 
 export interface AgentManagementClient {
@@ -64,8 +73,9 @@ export interface AgentManagementClient {
   getDefinition(id: string): Promise<AgentDetail>;
   getDefinitionFiles(id: string): Promise<DefinitionFileEntry[]>;
   getDefinitionFile(id: string, relativePath: string): Promise<AgentFileContent>;
-  listSkillOptions(): Promise<SkillOption[]>;
+  listSkillOptions(options?: SkillListOptions): Promise<SkillOption[]>;
   listMcpOptions(): Promise<McpOption[]>;
+  installSkill(option: SkillOption): Promise<void>;
   createAgent(draft: AgentDraft): Promise<void>;
   updateAgent(draft: AgentDraft): Promise<void>;
   deleteDefinition(id: string): Promise<void>;
@@ -75,12 +85,14 @@ export interface AgentManagementClient {
 }
 
 export interface AgentGroupListOptions {
-  filter?: 'builtin' | 'local' | 'all';
+  filter?: 'builtin' | 'builtin+hub' | 'local' | 'all';
+  cache_mode?: 'prefer_cache';
+  query?: string;
 }
 
 export interface AgentGroupManagementClient {
   readonly source: AgentManagementSource;
-  listGroups(options?: AgentGroupListOptions): Promise<AgentGroupCatalogItem[]>;
+  listGroups(options?: AgentGroupListOptions): Promise<CatalogItems<AgentGroupCatalogItem>>;
   getGroup(id: string): Promise<AgentGroupDetail>;
   getGroupFiles(id: string): Promise<DefinitionFileEntry[]>;
   getGroupFile(id: string, relativePath: string): Promise<AgentFileContent>;
@@ -88,6 +100,21 @@ export interface AgentGroupManagementClient {
   importGroup(path: string): Promise<{ id: string }>;
   installGroup(id: string): Promise<void>;
   uninstallGroup(id: string): Promise<{ notice?: string }>;
+}
+
+function derivePackageId(name: string, fallbackPrefix: 'agent' | 'agent-group'): string {
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  // Preserve the 50-character ID budget, including the UUID suffix.
+  const prefix = slug.length >= 3 ? slug.slice(0, 13) : fallbackPrefix;
+  return `${prefix}-${generateUuidV4()}`;
+}
+
+export function deriveAgentId(name: string): string {
+  return derivePackageId(name, 'agent');
+}
+
+export function deriveAgentGroupId(name: string): string {
+  return derivePackageId(name, 'agent-group');
 }
 
 export function buildAgentGroupCreatePayload(draft: AgentGroupDraft): Record<string, unknown> {
@@ -105,7 +132,7 @@ export function buildAgentGroupCreatePayload(draft: AgentGroupDraft): Record<str
     quickInputs: draft.suggestedPrompts.map(prompt => prompt.trim()).filter(Boolean),
   };
   if (draft.category.trim()) payload.category = draft.category.trim();
-  const tags = resolveAgentTagPayload(draft.tagIds, draft.customTags);
+  const tags = resolveAgentGroupTagPayload(draft.tagIds, draft.customTags);
   if (tags.length > 0) payload.tags = tags;
   return payload;
 }
@@ -116,14 +143,50 @@ export function resolveAgentGroupSelectionId(
   return agent.runtimePackageName.trim() || agent.id.trim();
 }
 
+/** Team selection is keyed by runtime package, even when catalog entries have different source IDs. */
+export function dedupeAgentGroupOptions(agents: AgentCatalogItem[]): AgentCatalogItem[] {
+  const bySelectionId = new Map<string, AgentCatalogItem>();
+  for (const agent of agents) {
+    const selectionId = resolveAgentGroupSelectionId(agent);
+    const previous = bySelectionId.get(selectionId);
+    if (!previous || (!previous.installed && agent.installed)) {
+      bySelectionId.set(selectionId, agent);
+    }
+  }
+  return Array.from(bySelectionId.values());
+}
+
 export function isAgentGroupAgentSelectable(
   agent: Pick<AgentCatalogItem, 'source' | 'installed' | 'teamCompatible'>,
   mode: 'leader' | 'member',
 ): boolean {
-  if (agent.source === 'hub' && (!agent.installed || !agent.teamCompatible)) return false;
+  if (!agent.installed) return false;
+  if (agent.source === 'hub' && !agent.teamCompatible) return false;
   return mode === 'leader'
     ? agent.teamCompatible?.leader !== false
     : agent.teamCompatible?.member !== false;
+}
+
+/** A selected/pending/bound Expert Team owns the Team skill slot for the session. */
+export function isAgentGroupSelected(
+  mode: string | undefined,
+  intent: AgentGroupSelectionIntent | undefined,
+  boundGroupId?: string | null,
+  pendingGroupId?: string | null,
+): boolean {
+  if (mode !== 'team') return false;
+  if (boundGroupId?.trim() || pendingGroupId?.trim()) return true;
+  return intent?.kind === 'select' && Boolean(intent.id.trim());
+}
+
+export function resolveSelectedSkillsForRequest(
+  mode: string | undefined,
+  selectedSkills: string[],
+  intent: AgentGroupSelectionIntent | undefined,
+  boundGroupId?: string | null,
+  pendingGroupId?: string | null,
+): string[] {
+  return isAgentGroupSelected(mode, intent, boundGroupId, pendingGroupId) ? [] : selectedSkills;
 }
 
 export function buildAgentGroupSelectionPayloadForMode(
@@ -140,6 +203,12 @@ export function buildAgentGroupSelectionPayloadForMode(
     || !intent.id.trim()
   ) return {};
   return { agent_group_name: intent.id.trim() };
+}
+
+export function isExternalHarnessCatalogItem(
+  item: Pick<AgentCatalogItem, 'runtime'>,
+): boolean {
+  return Boolean(item.runtime?.provider_name?.trim());
 }
 
 export function buildDefinitionSelectionPayload(intent: AgentSelectionIntent): Record<string, string> {

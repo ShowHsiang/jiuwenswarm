@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useConnectorStore } from '../../stores/connectorStore';
+import { useConnectorStore, CONNECTOR_ERROR_TOAST_ID } from '../../stores/connectorStore';
 import { usePluginPackageStore } from '../../stores/pluginPackageStore';
 import { MarketplacePage, type TopTab, type MarketKind } from './MarketplacePage';
 import { PluginDetailPage } from './PluginDetailPage';
@@ -9,9 +9,8 @@ import { CreatePluginPage } from './CreatePluginPage';
 import { RegisterMcpPage } from './RegisterMcpPage';
 import { UploadFileCreateModal } from './UploadFileCreateModal';
 import { Toast } from './Toast';
+import { toast } from '../ui/Toast/toastStore';
 import { equipmentListFilter } from '../../features/equipmentMarketplace';
-import { ApplicationPluginsPanel } from '../../applicationPlugins/ApplicationPluginsPanel';
-import type { ApplicationPluginContribution } from '../../applicationPlugins/types';
 
 // "管理我的插件/MCP" 一次性跳转握手：调用方（InputArea.tsx 的扩展面板）先把目标 tab 存进这个
 // 模块级变量，再触发 `jiuwen:nav` 切到 connectorMarket——ConnectorMarketPanel 挂载是这次导航
@@ -27,7 +26,6 @@ export function requestManageView(myKind: MarketKind) {
 
 type View =
   | { name: 'market' }
-  | { name: 'application-plugins' }
   | { name: 'plugin-detail'; id: string; fromMy: boolean }
   | { name: 'mcp-detail'; connectorName: string }
   | { name: 'create-manual' }
@@ -72,10 +70,6 @@ interface ConnectorMarketPanelProps {
    * 不传这个 prop 就退化成原来的"尚未接入"提示（同款可选 prop 处理）。
    */
   onCreateViaChat?: () => void;
-  applicationPlugins?: ApplicationPluginContribution[];
-  applicationPluginsLoading?: boolean;
-  applicationPluginsError?: string;
-  onRefreshApplicationPlugins?: () => Promise<void>;
 }
 
 export function ConnectorMarketPanel({
@@ -83,10 +77,6 @@ export function ConnectorMarketPanel({
   onUsePluginExample,
   onUseExtension,
   onCreateViaChat,
-  applicationPlugins = [],
-  applicationPluginsLoading = false,
-  applicationPluginsError = '',
-  onRefreshApplicationPlugins = async () => {},
 }: ConnectorMarketPanelProps = {}) {
   const { t } = useTranslation();
   const [view, setView] = useState<View>({ name: 'market' });
@@ -124,19 +114,28 @@ export function ConnectorMarketPanel({
   const clearPluginNotice = usePluginPackageStore((s) => s.clearNotice);
   const pluginSuccess = usePluginPackageStore((s) => s.successMessage);
   const clearPluginSuccess = usePluginPackageStore((s) => s.clearSuccess);
-  const [errorToast, setErrorToast] = useState<string | null>(null);
   const [successToast, setSuccessToast] = useState<string | null>(null);
 
   useEffect(() => {
     if (connectorError) {
-      setErrorToast(connectorError);
+      // 与抽屉共用 id 以合并同一次失败；显式补上页面 Toast 的 testid/data-variant，
+      // 否则全局默认 ui-toast 无法被自动化识别。
+      toast.open({
+        id: CONNECTOR_ERROR_TOAST_ID,
+        content: connectorError,
+        variant: 'error',
+        duration: 5,
+        testId: 'connector-market-toast',
+        dataVariant: 'error',
+      });
       clearConnectorError();
     }
   }, [connectorError, clearConnectorError]);
 
   useEffect(() => {
     if (pluginError) {
-      setErrorToast(pluginError);
+      // 插件错误与连接器错误共用同一 id：页内任意操作失败都替换上一条，不叠两条。
+      toast.open({ id: CONNECTOR_ERROR_TOAST_ID, content: pluginError, variant: 'error', duration: 5 });
       clearPluginError();
     }
   }, [pluginError, clearPluginError]);
@@ -228,17 +227,6 @@ export function ConnectorMarketPanel({
             setUploadModalOpen(true);
           }}
           onRegisterCustomMcp={() => setView({ name: 'register-mcp' })}
-          onOpenApplicationPlugins={() => setView({ name: 'application-plugins' })}
-        />
-      )}
-
-      {view.name === 'application-plugins' && (
-        <ApplicationPluginsPanel
-          plugins={applicationPlugins}
-          loading={applicationPluginsLoading}
-          error={applicationPluginsError}
-          onRefresh={onRefreshApplicationPlugins}
-          onBack={() => setView({ name: 'market' })}
         />
       )}
 
@@ -247,7 +235,11 @@ export function ConnectorMarketPanel({
           id={view.id}
           fromMy={view.fromMy}
           onBack={() => setView({ name: 'market' })}
-          onDeleted={() => setView({ name: 'market' })}
+          onDeleted={() => {
+            setTopTab('my');
+            setMyKind('plugin');
+            setView({ name: 'market' });
+          }}
           onUse={
             onUseExtension
               ? (runtimePackageName) => onUseExtension({ kind: 'plugin', id: runtimePackageName })
@@ -331,7 +323,6 @@ export function ConnectorMarketPanel({
         />
       )}
 
-      {errorToast && <Toast message={errorToast} variant="error" onClose={() => setErrorToast(null)} />}
       {successToast && <Toast message={successToast} variant="success" onClose={() => setSuccessToast(null)} />}
     </div>
   );

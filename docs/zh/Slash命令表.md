@@ -805,6 +805,9 @@ TUI 通过 `hooks.list` RPC 请求 Gateway，Gateway 从 `config.yaml` 的 `hook
 
 #### Hooks 概念速览
 
+用户配置的工具 hooks 也适用于子 Agent 和 swarm 成员的工具调用。
+此时 hook 输入包含子 Agent 的 `session_id` 和 `subagent_type`（未命名的 swarm 成员使用 `"swarm_member"`）。
+
 Hooks 是在特定事件触发时自动执行的扩展逻辑，支持以下 17 种事件：
 
 | 事件 | 执行层 | 触发时机 |
@@ -835,6 +838,7 @@ Hooks 是在特定事件触发时自动执行的扩展逻辑，支持以下 17 �
 | `prompt` | 调用 LLM 审查。模板中 `$ARGUMENTS` 替换为 JSON 上下文，`$TOOL_NAME` 替换为工具名。LLM 响应中的 JSON `decision: "block"` 可阻断。 | `prompt`、`timeout`（默认 15s）、`model` |
 
 - **阻断行为**：退出码 2（command）或 `decision: "block"`（prompt）会阻止当前操作（如跳过工具调用），并将原因反馈给模型。
+- **PreToolUse 终止**：阻断时跳过该工具及同批尚未开始执行的工具（包括审批恢复后的调用），将原因保留在工具消息并作为最终响应返回，结束当前 Agent 执行及任务循环，不再调用模型自动重试。Goal 轮次（包括其审批恢复）被阻断时，会将原 Goal 标记为 `blocked` 并清除其排队的续跑任务，需解决 Hook 限制后显式恢复。被跳过工具的 `PostToolUse` 不会执行；用户仍可发起新的请求。已经开始执行的其他并行工具不会被撤销。
 - **输入修改**：PreToolUse hook 可通过 stdout JSON 的 `modifiedInput` 字段修改工具输入参数。
 - **附加上下文**：可通过 stdout JSON 的 `additionalContext` 字段注入额外信息到工具结果或模型上下文。
 - **全局开关**：`config.yaml` 中 `hooks.disable_all_hooks: true` 可禁用所有 hooks。

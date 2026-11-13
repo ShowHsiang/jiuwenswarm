@@ -1,9 +1,16 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from jiuwenswarm.common import updater
-from jiuwenswarm.common.upgrade_executor import PipExecutor
+from jiuwenswarm.common import upgrade_executor
+from jiuwenswarm.common.upgrade_executor import DesktopExecutor, PipExecutor
+
+
+@pytest.fixture(autouse=True)
+def isolate_updater_workspace(monkeypatch, tmp_path):
+    monkeypatch.setattr(updater, "get_user_workspace_dir", lambda: tmp_path)
 
 
 def test_desktop_env_forces_desktop_install_mode(monkeypatch):
@@ -68,6 +75,24 @@ def test_pip_mode_uses_canonical_package_identity(monkeypatch):
     )
 
 
+def test_updater_status_reports_installed_build_version(monkeypatch):
+    monkeypatch.setattr(updater, "get_runtime_version", lambda: "0.2.5.beta1.dev20261009")
+    monkeypatch.setattr(updater, "get_runtime_build_date", lambda: "2026-10-09")
+
+    status = updater.UpdaterService().get_status()
+
+    assert status["current_version"] == "0.2.5.beta1.dev20261009"
+    assert status["current_build_date"] == "2026-10-09"
+
+
+def test_updater_does_not_replace_build_date_with_release_date(monkeypatch):
+    monkeypatch.setattr(updater, "get_runtime_build_date", lambda: "2026-10-20")
+    service = updater.UpdaterService()
+    service._update_status(published_at="2026-10-26T08:00:00Z", state="available")
+
+    assert service.get_status()["current_build_date"] == "2026-10-20"
+
+
 def test_pip_executor_installs_canonical_package_name(monkeypatch):
     checked_packages = []
     statuses = []
@@ -90,6 +115,76 @@ def test_pip_executor_installs_canonical_package_name(monkeypatch):
 
     assert checked_packages == ["workswarm"]
     assert statuses[-1]["error"] == "pip install failed: editable test stop"
+
+
+def test_pip_executor_detects_uv_editable_install(monkeypatch):
+    statuses = []
+    executor = PipExecutor(
+        {
+            "package_name": "workswarm",
+            "repo_name": "jiuwenswarm",
+            "timeout_seconds": 20,
+        },
+        statuses.append,
+    )
+    commands = []
+    monkeypatch.setattr(executor, "_resolve_uv_command", lambda: "uv")
+    monkeypatch.setattr(
+        upgrade_executor.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            commands.append(command)
+            or SimpleNamespace(
+                returncode=0,
+                stdout="Name: workswarm\nEditable project location: C:\\src\\workswarm\n",
+            )
+        ),
+    )
+
+    executor.install()
+
+    assert commands == [["uv", "pip", "show", "workswarm"]]
+    assert statuses[-1]["error"] == (
+        "pip install failed: 'workswarm' is installed as an editable package. "
+        "Use 'git pull && uv sync' to update instead."
+    )
+
+
+def test_desktop_executor_rejects_truncated_download(monkeypatch, tmp_path):
+    class TruncatedResponse:
+        headers = {"Content-Length": "10"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size):
+            del size
+            if not hasattr(self, "_read"):
+                self._read = True
+                return b"short"
+            return b""
+
+    statuses = []
+    monkeypatch.setattr(upgrade_executor, "urlopen", lambda request, timeout: TruncatedResponse())
+    monkeypatch.setattr(upgrade_executor, "get_user_workspace_dir", lambda: tmp_path)
+    executor = DesktopExecutor(
+        {
+            "timeout_seconds": 20,
+            "download_url": "https://example.test/installer",
+            "asset_name": "WorkSwarm-current.dmg",
+        },
+        statuses.append,
+    )
+
+    executor.install()
+
+    assert statuses[-1]["state"] == "error"
+    assert "Incomplete download" in statuses[-1]["error"]
+    assert not (tmp_path / ".updates" / "WorkSwarm-current.dmg").exists()
+    assert not (tmp_path / ".updates" / "WorkSwarm-current.dmg.part").exists()
 
 
 def test_global_asset_name_pattern_applies_to_all_platforms(monkeypatch):
@@ -481,6 +576,177 @@ def test_desktop_check_prefers_workswarm_installer_for_multiple_candidates(
 
 
 @pytest.mark.parametrize(
+    ("platform", "asset_name"),
+    [
+        ("win32", "WorkSwarm-current.exe"),
+        ("darwin", "WorkSwarm-current.dmg"),
+        ("linux", "JiuwenSwarm-0.2.5.beta1.tar.gz"),
+    ],
+)
+def test_desktop_check_restores_completed_download(
+    monkeypatch,
+    tmp_path,
+    platform,
+    asset_name,
+):
+    from jiuwenswarm.common.version_source import ReleaseAsset, ReleaseInfo
+
+    installer = tmp_path / ".updates" / asset_name
+    installer.parent.mkdir()
+    installer.write_bytes(b"complete")
+    monkeypatch.setattr(sys, "platform", platform)
+    release = ReleaseInfo(
+        version="0.2.5.beta1",
+        assets=[
+            ReleaseAsset(
+                name=asset_name,
+                download_url="https://example.test/installer",
+                size=installer.stat().st_size,
+            )
+        ],
+    )
+
+    service = updater.UpdaterService()
+    service._resolve_desktop_asset({}, release)
+
+    status = service.get_status()
+    assert status["state"] == "downloaded"
+    assert status["downloaded_path"] == str(installer)
+    assert status["downloaded_bytes"] == installer.stat().st_size
+    assert status["total_bytes"] == installer.stat().st_size
+
+
+@pytest.mark.parametrize(
+    ("content", "release_size"),
+    [
+        (b"incomplete", len(b"incomplete") + 1),
+        (b"", 0),
+        (b"", 1),
+    ],
+)
+def test_desktop_check_does_not_restore_unverified_download(
+    monkeypatch,
+    tmp_path,
+    content,
+    release_size,
+):
+    from jiuwenswarm.common.version_source import ReleaseAsset, ReleaseInfo
+
+    asset_name = "WorkSwarm-current.dmg"
+    installer = tmp_path / ".updates" / asset_name
+    installer.parent.mkdir()
+    installer.write_bytes(content)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    release = ReleaseInfo(
+        version="0.2.5.beta1",
+        assets=[
+            ReleaseAsset(
+                name=asset_name,
+                download_url="https://example.test/installer",
+                size=release_size,
+            )
+        ],
+    )
+
+    service = updater.UpdaterService()
+    service._resolve_desktop_asset({}, release)
+
+    status = service.get_status()
+    assert status["state"] == "update_available"
+    assert status["downloaded_path"] == ""
+    assert status["downloaded_bytes"] == 0
+    assert status["total_bytes"] == 0
+
+
+def test_desktop_check_restores_nonempty_download_without_release_size(
+    monkeypatch,
+    tmp_path,
+):
+    from jiuwenswarm.common.version_source import ReleaseAsset, ReleaseInfo
+
+    asset_name = "WorkSwarm-current.dmg"
+    installer = tmp_path / ".updates" / asset_name
+    installer.parent.mkdir()
+    installer.write_bytes(b"complete")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    release = ReleaseInfo(
+        version="0.2.5.beta1",
+        assets=[
+            ReleaseAsset(
+                name=asset_name,
+                download_url="https://example.test/installer",
+            )
+        ],
+    )
+
+    service = updater.UpdaterService()
+    service._resolve_desktop_asset({}, release)
+
+    status = service.get_status()
+    assert status["state"] == "downloaded"
+    assert status["downloaded_path"] == str(installer)
+    assert status["downloaded_bytes"] == installer.stat().st_size
+
+
+def test_desktop_check_removes_only_obsolete_completed_installers(
+    monkeypatch,
+    tmp_path,
+):
+    from jiuwenswarm.common.version_source import ReleaseAsset, ReleaseInfo
+
+    updates_dir = tmp_path / ".updates"
+    updates_dir.mkdir()
+    current = updates_dir / "WorkSwarm-current.dmg"
+    current.write_bytes(b"current")
+    obsolete_names = (
+        "WorkSwarm-old.exe",
+        "WorkSwarm-old.dmg",
+        "WorkSwarm-old.tar.gz",
+    )
+    for name in obsolete_names:
+        (updates_dir / name).write_bytes(b"obsolete")
+    partial = updates_dir / "WorkSwarm-current.dmg.part"
+    partial.write_bytes(b"partial")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    release = ReleaseInfo(
+        version="0.2.5.beta1",
+        assets=[
+            ReleaseAsset(
+                name=current.name,
+                download_url="https://example.test/installer",
+                size=current.stat().st_size,
+            )
+        ],
+    )
+
+    service = updater.UpdaterService()
+    service._resolve_desktop_asset({}, release)
+
+    assert current.exists()
+    assert all(not (updates_dir / name).exists() for name in obsolete_names)
+    assert partial.exists()
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin"])
+def test_desktop_cleanup_preserves_current_installer_with_different_casing(
+    monkeypatch,
+    tmp_path,
+    platform,
+):
+    updates_dir = tmp_path / ".updates"
+    updates_dir.mkdir()
+    installer = updates_dir / "WorkSwarm-Current.DMG"
+    installer.write_bytes(b"complete")
+    monkeypatch.setattr(sys, "platform", platform)
+
+    updater.UpdaterService._cleanup_obsolete_desktop_installers(
+        "workswarm-current.dmg"
+    )
+
+    assert installer.exists()
+
+
+@pytest.mark.parametrize(
     ("platform", "legacy_name", "preferred_name"),
     [
         (
@@ -581,6 +847,7 @@ def test_desktop_check_rejects_multiple_workswarm_installers(monkeypatch):
 )
 def test_desktop_check_does_not_update_for_same_or_older_timestamp(
     monkeypatch,
+    tmp_path,
     latest_published_at,
 ):
     from jiuwenswarm.common.version_source import ReleaseInfo
@@ -588,6 +855,10 @@ def test_desktop_check_does_not_update_for_same_or_older_timestamp(
     monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setenv("JIUWENSWARM_DESKTOP", "1")
     monkeypatch.setattr(sys, "platform", "win32")
+    updates_dir = tmp_path / ".updates"
+    updates_dir.mkdir()
+    obsolete = updates_dir / "WorkSwarm-old.exe"
+    obsolete.write_bytes(b"obsolete")
 
     class FakeSource:
         def fetch_latest(self, current_version=""):
@@ -614,6 +885,7 @@ def test_desktop_check_does_not_update_for_same_or_older_timestamp(
 
     assert status["state"] == "up_to_date"
     assert status["has_update"] is False
+    assert not obsolete.exists()
 
 
 def test_pip_check_keeps_version_comparison(monkeypatch):

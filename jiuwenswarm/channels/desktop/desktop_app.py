@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import ctypes
 import http.client
 import json
 import logging
-import mimetypes
 import os
 import secrets
 import shlex
@@ -19,11 +19,15 @@ import tempfile
 import threading
 import time
 import uuid
+import webbrowser
+import weakref
+from contextlib import contextmanager
+from concurrent.futures import Future
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
-from urllib.parse import quote
+from typing import Any, BinaryIO, Callable, Iterator
+from urllib.parse import quote, urlsplit
 
 from logging.handlers import RotatingFileHandler
 
@@ -53,6 +57,11 @@ from jiuwenswarm.common.utils import (
     wait_for_pid_exit,
     wait_for_tcp_port,
 )
+from jiuwenswarm.common.update_shutdown import (
+    create_shutdown_receipt,
+    complete_shutdown_receipt,
+    require_clean_shutdown,
+)
 from jiuwenswarm.instance_manager.config import (
     BASE_PORTS,
     PORT_TYPES,
@@ -76,6 +85,138 @@ STARTUP_DOCTOR_TIMEOUT_SECONDS = DOCTOR_TIMEOUT_SECONDS + 15.0
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DESKTOP_BLOB_CHUNK_SIZE = 1024 * 1024
 MAX_JAVASCRIPT_SAFE_INTEGER = 9_007_199_254_740_991
+_MACOS_RUNTIME_REF: weakref.ReferenceType[Any] | None = None
+
+DESKTOP_WINDOW_PREFERENCES_FILENAME = "desktop-window.json"
+CLOSE_ACTION_ASK = "ask"
+CLOSE_ACTION_HIDE = "hide"
+CLOSE_ACTION_QUIT = "quit"
+VALID_CLOSE_ACTIONS = frozenset(
+    {CLOSE_ACTION_ASK, CLOSE_ACTION_HIDE, CLOSE_ACTION_QUIT}
+)
+
+
+# Only the current frontend origin may request microphone access.
+_WK_MEDIA_CAPTURE_MICROPHONE = 1  # WKMediaCaptureTypeMicrophone
+_WK_PERMISSION_GRANT = 1  # WKPermissionDecisionGrant
+_WK_PERMISSION_DENY = 2  # WKPermissionDecisionDeny
+
+
+def _install_macos_media_capture_permission(get_frontend_url: Callable[[], str]) -> None:
+    """给 pywebview 的 WKUIDelegate 补上媒体授权回调。
+
+    pywebview 的 BrowserDelegate 没实现
+    webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:，
+    WKWebView 因此直接拒绝 getUserMedia（NotAllowedError，不弹框）。
+    回调只在网页调用 getUserMedia 时触发，所以启动阶段不会要权限；
+    放行后首次使用由 macOS 弹系统麦克风授权。getDisplayMedia 不走这个回调。
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import objc  # type: ignore[import-not-found]
+        from webview.platforms.cocoa import BrowserView
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[desktop] media permission hook unavailable: %s", exc)
+        return
+    delegate_cls = BrowserView.BrowserDelegate
+    if getattr(delegate_cls, "_jiuwenswarm_media_permission_installed", False):
+        return
+
+    def media_permission(_self, _webview, origin, _frame, media_type, decision_handler):
+        allowed = False
+        try:
+            expected = urlsplit(get_frontend_url())
+            default_port = 443 if expected.scheme == "https" else 80
+            expected_origin = (expected.scheme, expected.hostname, expected.port or default_port)
+            request_origin = (
+                str(origin.protocol()), str(origin.host()), int(origin.port()) or default_port,
+            )
+            allowed = (
+                expected.scheme in {"http", "https"}
+                and request_origin == expected_origin
+                and int(media_type) == _WK_MEDIA_CAPTURE_MICROPHONE
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
+        logger.info(
+            "[desktop] media capture request type=%s allowed=%s",
+            media_type, allowed,
+        )
+        decision_handler(_WK_PERMISSION_GRANT if allowed else _WK_PERMISSION_DENY)
+
+    objc.classAddMethods(
+        delegate_cls,
+        [
+            objc.selector(
+                media_permission,
+                selector=b"webView:requestMediaCapturePermissionForOrigin:"
+                b"initiatedByFrame:type:decisionHandler:",
+                signature=b"v@:@@@q@?",
+            )
+        ],
+    )
+    delegate_cls._jiuwenswarm_media_permission_installed = True  # pylint: disable=protected-access
+
+
+def _macos_display_capture_supported() -> bool:
+    """WKWebView 的 getDisplayMedia 只能经 ScreenCaptureKit 系统选屏框拿到画面。
+
+    选屏框类 SCContentSharingPicker 自 macOS 14 起才有；更早的系统 WebKit
+    只弹“允许共享屏幕”确认，之后永远拿不到画面，网页收到 NotAllowedError，
+    与用户取消无法区分。这里把能力告诉前端，不支持时直接降级纯语音。
+    """
+    if sys.platform != "darwin":
+        return True
+    try:
+        from Foundation import NSBundle  # type: ignore[import-not-found]
+        import objc  # type: ignore[import-not-found]
+
+        bundle = NSBundle.bundleWithPath_("/System/Library/Frameworks/ScreenCaptureKit.framework")
+        if bundle is None or not bundle.load():
+            return False
+        objc.lookUpClass("SCContentSharingPicker")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.info("[desktop] screen capture picker unavailable: %s", exc)
+        return False
+
+
+def _desktop_window_preferences_path() -> Path:
+    return get_user_workspace_dir() / "config" / DESKTOP_WINDOW_PREFERENCES_FILENAME
+
+
+def _load_close_action() -> str | None:
+    path = _desktop_window_preferences_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        logger.warning("[desktop] failed to load window preferences: %s", exc)
+        return None
+    action = payload.get("close_action") if isinstance(payload, dict) else None
+    return action if action in VALID_CLOSE_ACTIONS else None
+
+
+def _save_close_action(action: str) -> bool:
+    if action not in VALID_CLOSE_ACTIONS:
+        return False
+    path = _desktop_window_preferences_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"close_action": action}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("[desktop] failed to save window preferences: %s", exc)
+        return False
+    return True
+
+
+def _is_windows_desktop() -> bool:
+    return os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -116,6 +257,18 @@ DATA_URL_EXPORT_SPECS = {
         allowed_suffixes=frozenset({".json"}),
         allowed_parameters=frozenset({"charset=utf-8"}),
         file_types=("JSON Archive (*.json)",),
+    ),
+    # Trajectory panel exports (.trajectory.zip / .trajectory.jsonl). Keep in
+    # sync with BLOB_EXPORT_SPECS in electron/main.cjs (contract test).
+    "application/zip": _DataUrlExportSpec(
+        allowed_suffixes=frozenset({".zip"}),
+        allowed_parameters=frozenset(),
+        file_types=("ZIP Archive (*.zip)",),
+    ),
+    "application/jsonl": _DataUrlExportSpec(
+        allowed_suffixes=frozenset({".jsonl"}),
+        allowed_parameters=frozenset({"charset=utf-8"}),
+        file_types=("JSONL Archive (*.jsonl)",),
     ),
 }
 DesktopSaveResult = dict[str, bool]
@@ -231,9 +384,6 @@ ATTACHMENT_DIALOG_EXTENSIONS: tuple[str, ...] = (
     ".flv",
 )
 UPDATE_CLEANUP_PATTERNS = (
-    "*.exe",
-    "*.dmg",
-    "*.tar.gz",
     "*.exe.part",
     "*.dmg.part",
     "*.tar.gz.part",
@@ -383,7 +533,7 @@ def _build_child_command(name: str, extra_args: list[str] | None = None) -> list
     elif name == "agent":
         base = [sys.executable, "-m", "jiuwenswarm.server.app_agentserver"]
     elif name == "gateway":
-        base = [sys.executable, "-m", "jiuwenswarm.gateway.app_gateway"]
+        base = [sys.executable, "-m", "agent_gateway.app_gateway"]
     elif name == "app":
         base = [sys.executable, "-m", "jiuwenswarm.app"]
     elif name == "web":
@@ -447,6 +597,53 @@ def _build_child_env(
     return env
 
 
+@contextmanager
+def _child_log_file(
+    name: str,
+    startup_diagnostics_dir: Path | None = None,
+) -> Iterator[BinaryIO]:
+    """Open the persistent stdout/stderr sink for a managed child process."""
+    log_dirs: list[Path] = []
+    last_error: OSError | None = None
+    try:
+        log_dirs.append(get_logs_dir())
+    except OSError as exc:
+        last_error = exc
+
+    if startup_diagnostics_dir is not None and startup_diagnostics_dir not in log_dirs:
+        log_dirs.append(startup_diagnostics_dir)
+
+    for log_dir in log_dirs:
+        log_path = log_dir / f"child-{name}.log"
+        stream: BinaryIO | None = None
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stream = open(log_path, "ab", buffering=0)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            marker = f"\n===== [desktop] starting {name} at {timestamp} =====\n"
+            stream.write(marker.encode("utf-8"))
+            logger.info("[desktop] %s child stdout/stderr -> %s", name, log_path)
+        except OSError as exc:
+            if stream is not None:
+                stream.close()
+            last_error = exc
+            logger.warning(
+                "[desktop] failed to open child log for %s at %s: %s",
+                name,
+                log_path,
+                exc,
+            )
+            continue
+
+        try:
+            yield stream
+        finally:
+            stream.close()
+        return
+
+    raise RuntimeError(f"Unable to create child log for {name}") from last_error
+
+
 def _start_process(
     name: str,
     command: list[str],
@@ -455,18 +652,19 @@ def _start_process(
     desktop_token: str = "",
 ) -> subprocess.Popen[bytes]:
     logger.info("[desktop] starting %s: %s", name, command)
-    kwargs: dict[str, object] = {
-        "env": _build_child_env(name, ports, startup_diagnostics_dir, desktop_token),
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    # macOS/Linux: 用 start_new_session=True 创建新进程组，
-    # 以便后续用 os.killpg 杀掉整个进程树（含孙子进程）。
-    if os.name != "nt":
-        kwargs["start_new_session"] = True
-    else:
-        kwargs["creationflags"] = _creationflags()
-    return subprocess.Popen(command, **kwargs)
+    with _child_log_file(name, startup_diagnostics_dir) as child_log:
+        kwargs: dict[str, object] = {
+            "env": _build_child_env(name, ports, startup_diagnostics_dir, desktop_token),
+            "stdout": child_log,
+            "stderr": child_log,
+        }
+        # macOS/Linux: 用 start_new_session=True 创建新进程组，
+        # 以便后续用 os.killpg 杀掉整个进程树（含孙子进程）。
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
+        else:
+            kwargs["creationflags"] = _creationflags()
+        return subprocess.Popen(command, **kwargs)
 
 
 # frozen exe 冷启动时, C 扩展 (.pyd) 与大量 .py 首次从 _MEIPASS 读盘很慢.
@@ -577,12 +775,21 @@ def _wait_for_port_release(host: str, port: int, timeout: float = 15.0) -> bool:
     return wait_for_tcp_port(host, port, timeout=timeout, target_state="disconnected")
 
 
+def _shutdown_runtime_before_update() -> None:
+    from jiuwenswarm.server.supervisor.shutdown import shutdown_resident_worker
+
+    result = asyncio.run(shutdown_resident_worker(timeout=30, include_legacy=True))
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError(f"Worker shutdown incomplete: {result}")
+
+
 def _launch_windows_installer_helper(
     installer_path: str,
     app_executable: str,
     parent_pid: int = 0,
     backend_port: int = BACKEND_PORT,
     frontend_port: int = FRONTEND_PORT,
+    shutdown_receipt: str = "",
 ) -> None:
     target = Path(installer_path).expanduser().resolve()
 
@@ -599,8 +806,11 @@ def _launch_windows_installer_helper(
         frontend_port,
     )
 
-    _wait_for_port_release(BACKEND_HOST, backend_port, timeout=15.0)
-    _wait_for_port_release(FRONTEND_HOST, frontend_port, timeout=15.0)
+    require_clean_shutdown(shutdown_receipt)
+    _shutdown_runtime_before_update()
+    if (not _wait_for_port_release(BACKEND_HOST, backend_port, timeout=15.0)
+            or not _wait_for_port_release(FRONTEND_HOST, frontend_port, timeout=15.0)):
+        raise TimeoutError("Update stopped: backend/frontend ports are still occupied")
     logger.info("[update-helper] ports released, proceeding with install")
 
     try:
@@ -617,6 +827,9 @@ def _launch_windows_installer_helper(
 class _WindowApi:
     def __init__(self, runtime: "DesktopRuntime") -> None:
         self._runtime = runtime
+        if sys.platform == "darwin" and hasattr(runtime, "paste_clipboard"):
+            # Expose only where the host implements the native paste command.
+            self.paste_clipboard = runtime.paste_clipboard
 
     def minimize_window(self) -> bool:
         return self._runtime.minimize_window()
@@ -627,9 +840,135 @@ class _WindowApi:
     def close_window(self) -> bool:
         return self._runtime.close_window()
 
+    # pywebview drops the first argument of exposed methods from the JS signature.
+    @classmethod
+    def get_close_action(cls) -> str | None:
+        if not _is_windows_desktop():
+            return None
+        return _load_close_action() or CLOSE_ACTION_ASK
+
+    @classmethod
+    def set_close_action(cls, action: str) -> bool:
+        if not _is_windows_desktop():
+            return False
+        return _save_close_action(action)
+
     def get_startup_status(self) -> dict[str, str]:
         """Return a snapshot consumed by the local Loading page."""
         return self._runtime.get_startup_status()
+
+    @staticmethod
+    def open_external_url(url: str) -> bool:
+        """Open SkillHub OAuth in the system browser, outside the desktop WebView."""
+        base = (
+            os.getenv("SKILLHUB_OAUTH_BASE_URL")
+            or os.getenv("TEAM_SKILLS_HUB_BASE_URL")
+            or "https://swarmskills.openjiuwen.com"
+        ).rstrip("/")
+        parsed, expected = urlsplit(url), urlsplit(base)
+        if (parsed.scheme, parsed.netloc) != (expected.scheme, expected.netloc):
+            return False
+        if parsed.path not in {
+            "/api/v1/auth/oauth/gitcode/start",
+            "/api/v1/auth/oauth/github/start",
+        }:
+            return False
+        return bool(webbrowser.open(url))
+
+    @staticmethod
+    def open_app_link(url: str) -> bool:
+        """Open an MCP App's ``ui/open-link`` URL in the system browser.
+
+        Only plain http(s) URLs without embedded credentials are accepted.
+        """
+        parsed = urlsplit(str(url))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        return bool(webbrowser.open(parsed.geturl()))
+
+    @staticmethod
+    def capture_oauth_token(options: dict) -> dict | None:
+        """隐式授权一键授权（对齐 Electron 的 desktop:capture-oauth-token）。
+
+        部分远程 MCP（如百度网盘）官方只提供隐式授权：授权成功 302 到厂商的
+        login_success 静态页，access_token 放在 URL # 片段里。授权直链不硬编码
+        （百度个人体验密钥会不定期变更，设计文档风险 #1），而是实时抓取厂商文档页
+        HTML 提取当前链接。随后开一个 pywebview 子窗加载授权页，轮询地址栏 URL
+        截取成功页片段里的 access_token。抓取失败、用户关窗或超时返回 None，
+        前端保持手动粘贴。
+        """
+        import html as html_module
+        import re
+        import urllib.request
+        from urllib.parse import parse_qs
+
+        if not isinstance(options, dict):
+            return None
+        doc_url = str(options.get("docPageUrl") or "").strip()
+        success_prefix = str(options.get("successUrlPrefix") or "").strip()
+        title = str(options.get("title") or "").strip()[:64] or "授权"
+        try:
+            doc_parts = urlsplit(doc_url)
+            success_parts = urlsplit(success_prefix)
+        except ValueError:
+            return None
+        success_origin = f"{success_parts.scheme}://{success_parts.netloc}"
+        # 校验：仅 https、不带内嵌凭据；成功页前缀必须是该 origin 下的路径。
+        if doc_parts.scheme != "https" or "@" in doc_parts.netloc:
+            return None
+        if success_parts.scheme != "https" or not success_prefix.startswith(f"{success_origin}/"):
+            return None
+
+        # 从文档页 HTML 提取当前授权直链：必须落在成功页同源、路径含 authorize。
+        try:
+            with urllib.request.urlopen(doc_url, timeout=10) as resp:  # noqa: S310 已校验 https
+                page = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+        except (OSError, ValueError) as exc:
+            logger.warning("[desktop] fetch oauth doc page failed: %s", exc)
+            return None
+        pattern = re.escape(success_origin) + r"/[\w./-]*authorize\?[^\"'<>\s]+"
+        match = re.search(pattern, page)
+        if not match:
+            return None
+        authorize_url = html_module.unescape(match.group(0))
+        try:
+            auth_parts = urlsplit(authorize_url)
+        except ValueError:
+            return None
+        if f"{auth_parts.scheme}://{auth_parts.netloc}" != success_origin:
+            return None
+
+        state = {"closed": False, "token": None}
+        win = webview.create_window(title, url=authorize_url, width=480, height=720)
+        if win is None:
+            return None
+
+        def _on_closed() -> None:
+            state["closed"] = True
+
+        win.events.closed += _on_closed
+        # js_api 在独立线程执行，阻塞轮询不会卡住 UI；JS 侧 promise 一直等到返回。
+        deadline = time.monotonic() + 300
+        while not state["closed"] and time.monotonic() < deadline:
+            try:
+                current = win.get_current_url() or ""
+            except Exception:  # noqa: BLE001 窗口中途销毁
+                break
+            if current.startswith(success_prefix):
+                params = parse_qs(urlsplit(current).fragment)
+                token = (params.get("access_token") or [""])[0].strip()
+                if token:
+                    state["token"] = token
+                    break
+            time.sleep(0.3)
+        if not state["closed"]:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        return {"accessToken": state["token"]} if state["token"] else None
 
     def install_update(self, installer_path: str) -> bool:
         return self._runtime.install_update(installer_path)
@@ -781,6 +1120,172 @@ def _clipboard_file_paths() -> list[str]:
     return []
 
 
+def _global_lock_bytes(handle: int) -> bytes | None:
+    """Copy bytes from a Win32 HGLOBAL clipboard handle."""
+    if not handle:
+        return None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+
+    ptr = kernel32.GlobalLock(handle)
+    if not ptr:
+        return None
+    try:
+        size = int(kernel32.GlobalSize(handle))
+        if size <= 0:
+            return None
+        return ctypes.string_at(ptr, size)
+    finally:
+        kernel32.GlobalUnlock(handle)
+
+
+def _dib_to_png_bytes(dib: bytes) -> bytes | None:
+    """Convert a CF_DIB payload (BITMAPINFOHEADER + pixels) to PNG bytes."""
+    if len(dib) < 40:
+        return None
+    try:
+        from io import BytesIO
+        import struct
+
+        from PIL import Image
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        header_size = struct.unpack_from("<I", dib, 0)[0]
+        if header_size < 40 or header_size > len(dib):
+            return None
+        bit_count = struct.unpack_from("<H", dib, 14)[0]
+        clr_used = struct.unpack_from("<I", dib, 32)[0]
+        if clr_used == 0 and bit_count <= 8:
+            clr_used = 1 << bit_count
+        # BITMAPFILEHEADER(14) + DIB
+        pixel_offset = 14 + header_size + (clr_used * 4 if bit_count <= 8 else 0)
+        file_size = 14 + len(dib)
+        bmp = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, pixel_offset) + dib
+        with Image.open(BytesIO(bmp)) as image:
+            out = BytesIO()
+            image.save(out, format="PNG")
+            return out.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[desktop] clipboard DIB convert failed: %s", exc)
+        return None
+
+
+def _clipboard_image_png_bytes_windows() -> bytes | None:
+    """Read a bitmap/PNG image from the Windows clipboard (screenshots, Copy Image)."""
+    user32 = ctypes.windll.user32
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+    cf_dib = 8
+    png_format = user32.RegisterClipboardFormatW("PNG")
+
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        if png_format and user32.IsClipboardFormatAvailable(png_format):
+            handle = user32.GetClipboardData(png_format)
+            data = _global_lock_bytes(int(handle) if handle else 0)
+            if data and data.startswith(PNG_SIGNATURE):
+                return data
+        if user32.IsClipboardFormatAvailable(cf_dib):
+            handle = user32.GetClipboardData(cf_dib)
+            dib = _global_lock_bytes(int(handle) if handle else 0)
+            if dib:
+                return _dib_to_png_bytes(dib)
+    finally:
+        user32.CloseClipboard()
+    return None
+
+
+def _clipboard_image_png_bytes_macos() -> bytes | None:
+    """Read PNG/TIFF image bytes from the macOS general pasteboard."""
+    try:
+        from AppKit import (  # type: ignore[import-not-found]
+            NSPasteboard,
+            NSPasteboardTypePNG,
+            NSPasteboardTypeTIFF,
+        )
+        from PIL import Image
+        from io import BytesIO
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        pasteboard = NSPasteboard.generalPasteboard()
+        png_data = pasteboard.dataForType_(NSPasteboardTypePNG)
+        if png_data is not None:
+            raw = bytes(png_data)
+            if raw:
+                return raw
+        tiff_data = pasteboard.dataForType_(NSPasteboardTypeTIFF)
+        if tiff_data is None:
+            return None
+        raw = bytes(tiff_data)
+        if not raw:
+            return None
+        with Image.open(BytesIO(raw)) as image:
+            out = BytesIO()
+            image.save(out, format="PNG")
+            return out.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[desktop] clipboard image read failed: %s", exc)
+        return None
+
+
+def _clipboard_image_png_bytes() -> bytes | None:
+    try:
+        if os.name == "nt":
+            return _clipboard_image_png_bytes_windows()
+        if sys.platform == "darwin":
+            return _clipboard_image_png_bytes_macos()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[desktop] clipboard image read failed: %s", exc)
+    return None
+
+
+def _clipboard_image_pick() -> dict[str, Any] | None:
+    """Build a LocalFilePick-shaped dict for a clipboard bitmap/screenshot."""
+    raw = _clipboard_image_png_bytes()
+    if not raw:
+        return None
+    filename = "clipboard-image.png"
+    # Synthetic path so frontend normalizePick accepts image+base64 payloads.
+    path = f"clipboard://{filename}"
+    size = len(raw)
+    if size > MAX_IMAGE_BYTES:
+        return {
+            "path": path,
+            "filename": filename,
+            "size": size,
+            "mime_type": "image/png",
+            "kind": "image",
+            "error": "image_too_large",
+        }
+    return {
+        "path": path,
+        "filename": filename,
+        "size": size,
+        "mime_type": "image/png",
+        "kind": "image",
+        "base64": base64.b64encode(raw).decode("ascii"),
+    }
+
+
 class DesktopRuntime:
     def __init__(
         self, frontend_host: str, ports: dict[str, int]
@@ -799,6 +1304,10 @@ class DesktopRuntime:
         self._blob_save_lock = threading.Lock()
         self._blob_save_transfers: dict[str, _BlobSaveTransfer] = {}
         self._is_shutting_down = False
+        self._update_shutdown_receipt: Path | None = None
+        self._allow_window_close = False
+        self._tray_icon = None
+        self._tray_menu = None
         self._desktop_dnd_bound = False
         self._startup_cancelled = threading.Event()
         # 先行导航(web 静态页就绪即跳转前端)后, 若后端随后启动失败, 需把
@@ -847,7 +1356,7 @@ class DesktopRuntime:
         ``wait`` seconds for a still-shutting-down Gateway from an upgrade
         restart to release the lock, then raises if a live holder remains.
         """
-        from jiuwenswarm.instance_manager.lock import GatewayLock
+        from agent_gateway.gateway_lock import GatewayLock
 
         workspace = get_user_workspace_dir()
         holder = GatewayLock.find_holder(workspace)
@@ -1236,6 +1745,15 @@ class DesktopRuntime:
         self.window.minimize()
         return True
 
+    def show_and_maximize_window(self) -> bool:
+        if self.window is None:
+            return False
+        if hasattr(self.window, "show"):
+            self.window.show()
+        if hasattr(self.window, "maximize"):
+            self.window.maximize()
+        return True
+
     def toggle_fullscreen_window(self) -> bool:
         if self.window is None:
             return False
@@ -1251,15 +1769,298 @@ class DesktopRuntime:
         if self.window is None or not hasattr(self.window, "destroy"):
             return False
 
+        self._allow_window_close = True
+
         def _delayed_destroy() -> None:
             time.sleep(0.15)
             try:
                 self.window.destroy()
             except Exception as exc:  # noqa: BLE001
+                if sys.platform == "darwin":
+                    self._allow_window_close = False
                 logger.warning("[desktop] failed to close desktop window: %s", exc)
 
         threading.Thread(target=_delayed_destroy, daemon=True).start()
         return True
+
+    def paste_clipboard(self) -> None:
+        """Send the same Cocoa paste action as Cmd+V, on the UI thread."""
+        from PyObjCTools import AppHelper  # type: ignore[import-not-found]
+
+        result: Future[None] = Future()
+
+        def _paste() -> None:
+            try:
+                if self.window is None or self.window.native is None:
+                    raise RuntimeError("Desktop window is unavailable")
+                responder = self.window.native.firstResponder()
+                if responder is None or not responder.respondsToSelector_("paste:"):
+                    raise RuntimeError("Focused view does not support paste")
+                responder.paste_(None)
+                result.set_result(None)
+            except Exception as exc:
+                result.set_exception(exc)
+
+        # Exposed pywebview API methods run on a worker thread.
+        AppHelper.callAfter(_paste)
+        result.result()
+
+    def _configure_macos_window_lifecycle(self) -> None:
+        """Keep the macOS app alive when its main window is closed."""
+        if sys.platform != "darwin" or self.window is None:
+            return
+
+        native_window = getattr(self.window, "native", None)
+        if native_window is None:
+            logger.warning("[desktop] macOS native window is unavailable")
+            return
+
+        try:
+            import AppKit  # type: ignore[import-not-found]
+            import objc  # type: ignore[import-not-found]
+            from PyObjCTools import AppHelper  # type: ignore[import-not-found]
+            from webview.platforms.cocoa import BrowserView
+
+            def _set_window_lifecycle() -> None:
+                global _MACOS_RUNTIME_REF  # pylint: disable=global-statement
+
+                close_button = native_window.standardWindowButton_(
+                    AppKit.NSWindowCloseButton
+                )
+                if close_button is None:
+                    logger.warning("[desktop] macOS close button is unavailable")
+                    return
+                close_button.setTarget_(native_window)
+                close_button.setAction_("orderOut:")
+
+                _MACOS_RUNTIME_REF = weakref.ref(self)
+                window_delegate = BrowserView.WindowDelegate
+                bool_signature = getattr(objc, "_C_NSBOOL")
+                close_interceptor_attr = (
+                    "_jiuwenswarm_close_interceptor_installed"
+                )
+                if not getattr(window_delegate, close_interceptor_attr, False):
+                    original_should_close = window_delegate.windowShouldClose_
+
+                    def window_should_close(
+                        _delegate, window
+                    ) -> bool:
+                        runtime_ref = _MACOS_RUNTIME_REF
+                        runtime = runtime_ref() if runtime_ref is not None else None
+                        runtime_window = (
+                            getattr(runtime.window, "native", None)
+                            if runtime is not None
+                            else None
+                        )
+                        if runtime is not None and window is runtime_window:
+                            if not runtime._allow_window_close:  # pylint: disable=protected-access
+                                window.orderOut_(None)
+                                return False
+                        return original_should_close(_delegate, window)
+
+                    close_handler = objc.selector(
+                        window_should_close,
+                        selector=b"windowShouldClose:",
+                        signature=bool_signature + b"@:@",
+                    )
+                    setattr(window_delegate, "windowShouldClose_", close_handler)
+                    setattr(window_delegate, close_interceptor_attr, True)
+
+                reopen_selector = (
+                    b"applicationShouldHandleReopen:hasVisibleWindows:"
+                )
+                if BrowserView.AppDelegate.instancesRespondToSelector_(
+                    reopen_selector
+                ):
+                    return
+
+                def application_should_handle_reopen(
+                    _delegate, _application, _has_visible_windows
+                ) -> bool:
+                    runtime_ref = _MACOS_RUNTIME_REF
+                    runtime = runtime_ref() if runtime_ref is not None else None
+                    if runtime is not None and runtime.window is not None:
+                        runtime.window.show()
+                    return True
+
+                signature = bool_signature + b"@:@" + bool_signature
+                reopen_handler = objc.selector(
+                    application_should_handle_reopen,
+                    selector=reopen_selector,
+                    signature=signature,
+                )
+                setattr(
+                    BrowserView.AppDelegate,
+                    "applicationShouldHandleReopen_hasVisibleWindows_",
+                    reopen_handler,
+                )
+
+            # pywebview dispatches the shown event on a worker thread. Cocoa
+            # controls must be changed on the application thread.
+            AppHelper.callAfter(_set_window_lifecycle)
+        except (AttributeError, ImportError, RuntimeError) as exc:
+            logger.warning("[desktop] failed to configure macOS window lifecycle: %s", exc)
+
+    def _prompt_windows_close_action(self) -> tuple[str | None, bool]:
+        """Ask whether the native close button should hide or quit."""
+        if self.window is None or getattr(self.window, "native", None) is None:
+            return None, False
+        try:
+            import clr  # type: ignore[import-not-found]
+
+            clr.AddReference("System.Drawing")
+            clr.AddReference("System.Windows.Forms")
+            import System.Windows.Forms as WinForms  # type: ignore[import-not-found]
+            from System.Drawing import Point, Size  # type: ignore[import-not-found]
+
+            dialog = WinForms.Form()
+            dialog.Text = f"关闭 {DISPLAY_NAME}"
+            dialog.FormBorderStyle = WinForms.FormBorderStyle.FixedDialog
+            dialog.StartPosition = WinForms.FormStartPosition.CenterParent
+            dialog.MaximizeBox = False
+            dialog.MinimizeBox = False
+            dialog.ShowInTaskbar = False
+            native_icon = getattr(self.window.native, "Icon", None)
+            if native_icon is not None:
+                dialog.Icon = native_icon
+
+            message = WinForms.Label()
+            message.Text = "关闭窗口后，您希望隐藏到系统托盘，还是退出应用？"
+            message.AutoSize = False
+            message.Size = Size(382, message.GetPreferredSize(Size(382, 0)).Height)
+            message.Location = Point(24, 24)
+            first_option_top = max(62, message.Bottom + 14)
+
+            hide_option = WinForms.RadioButton()
+            hide_option.Text = "最小化到托盘"
+            hide_option.Checked = True
+            hide_option.AutoSize = True
+            hide_option.Location = Point(28, first_option_top)
+
+            quit_option = WinForms.RadioButton()
+            quit_option.Text = "退出应用"
+            quit_option.AutoSize = True
+            quit_option.Location = Point(28, first_option_top + 32)
+
+            remember = WinForms.CheckBox()
+            remember.Text = "记住我的选择"
+            remember.Checked = False
+            remember.AutoSize = True
+            remember.Location = Point(24, first_option_top + 76)
+
+            confirm_button = WinForms.Button()
+            confirm_button.Text = "确认"
+            confirm_button.DialogResult = WinForms.DialogResult.OK
+            confirm_button.Location = Point(238, first_option_top + 124)
+            confirm_button.Size = Size(80, 32)
+
+            cancel_button = WinForms.Button()
+            cancel_button.Text = "取消"
+            cancel_button.DialogResult = WinForms.DialogResult.Cancel
+            cancel_button.Location = Point(326, first_option_top + 124)
+            cancel_button.Size = Size(80, 32)
+            dialog.ClientSize = Size(430, cancel_button.Bottom + 20)
+
+            dialog.Controls.Add(message)
+            dialog.Controls.Add(hide_option)
+            dialog.Controls.Add(quit_option)
+            dialog.Controls.Add(remember)
+            dialog.Controls.Add(confirm_button)
+            dialog.Controls.Add(cancel_button)
+            dialog.AcceptButton = confirm_button
+            dialog.CancelButton = cancel_button
+            try:
+                result = dialog.ShowDialog(self.window.native)
+                if result == WinForms.DialogResult.OK:
+                    action = CLOSE_ACTION_HIDE if hide_option.Checked else CLOSE_ACTION_QUIT
+                    return action, bool(remember.Checked)
+                return None, False
+            finally:
+                dialog.Dispose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[desktop] failed to show close behavior dialog: %s", exc)
+            return None, False
+
+    def _ensure_windows_tray(self) -> bool:
+        if self._tray_icon is not None:
+            return True
+        if self.window is None or getattr(self.window, "native", None) is None:
+            return False
+        try:
+            import clr  # type: ignore[import-not-found]
+
+            clr.AddReference("System.Drawing")
+            clr.AddReference("System.Windows.Forms")
+            import System.Windows.Forms as WinForms  # type: ignore[import-not-found]
+            from System.Drawing import SystemIcons  # type: ignore[import-not-found]
+
+            tray = WinForms.NotifyIcon()
+            tray.Icon = getattr(self.window.native, "Icon", None) or SystemIcons.Application
+            tray.Text = DISPLAY_NAME[:63]
+            menu = WinForms.ContextMenuStrip()
+            show_item = WinForms.ToolStripMenuItem("显示并最大化")
+            quit_item = WinForms.ToolStripMenuItem("退出")
+            show_item.Click += lambda _sender, _args: self.show_and_maximize_window()
+            quit_item.Click += lambda _sender, _args: self.close_window()
+            menu.Items.Add(show_item)
+            menu.Items.Add(WinForms.ToolStripSeparator())
+            menu.Items.Add(quit_item)
+            tray.ContextMenuStrip = menu
+            tray.DoubleClick += lambda _sender, _args: self.show_and_maximize_window()
+            tray.Visible = True
+            self._tray_menu = menu
+            self._tray_icon = tray
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[desktop] failed to create Windows tray icon: %s", exc)
+            return False
+
+    def _dispose_windows_tray(self) -> None:
+        tray = self._tray_icon
+        self._tray_icon = None
+        self._tray_menu = None
+        if tray is None:
+            return
+        try:
+            tray.Visible = False
+            tray.Dispose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[desktop] failed to dispose Windows tray icon: %s", exc)
+
+    def _on_closing(self) -> bool | None:
+        if not _is_windows_desktop() or self._allow_window_close:
+            return None
+        action = _load_close_action()
+        remember = False
+        if action in (None, CLOSE_ACTION_ASK):
+            action, remember = self._prompt_windows_close_action()
+        if action is None:
+            return False
+        if remember:
+            _save_close_action(action)
+        if action == CLOSE_ACTION_QUIT:
+            self._allow_window_close = True
+            return None
+        if self._ensure_windows_tray() and hasattr(self.window, "hide"):
+            self.window.hide()
+        elif hasattr(self.window, "minimize"):
+            self.window.minimize()
+        return False
+
+    @staticmethod
+    def _bytes_from_download_data_url(url: str) -> bytes:
+        """Decode a FileReader-style data URL used by file-preview text downloads."""
+        if not isinstance(url, str) or not url.startswith("data:"):
+            raise ValueError("not_data_url")
+        _header, separator, payload = url.partition(",")
+        if not separator:
+            raise ValueError("invalid_data_url")
+        metadata = _header[5:].split(";")
+        if metadata and metadata[-1].lower() == "base64":
+            return base64.b64decode(payload, validate=True)
+        from urllib.parse import unquote_to_bytes
+
+        return unquote_to_bytes(payload)
 
     def download_file(self, url: str, filename: str) -> DesktopSaveResult:
         """选择保存位置并在实际写入完成后返回结果。"""
@@ -1284,7 +2085,16 @@ class DesktopRuntime:
             )
             os.close(temp_fd)
             temp_path = Path(temp_name)
-            urllib.request.urlretrieve(url, temp_path)
+            # File-preview text downloads (e.g. manifest.json) pass a data: URL.
+            if isinstance(url, str) and url.startswith("data:"):
+                temp_path.write_bytes(self._bytes_from_download_data_url(url))
+            else:
+                # urllib 的 HTTP 请求行只接受 ASCII：中文文件名/空格等非 ASCII 字符
+                # 必须先百分号编码，否则抛 UnicodeEncodeError，表现为桌面端下载失败。
+                # safe 保留 URL 结构字符与已有的 %xx 转义，避免二次编码。
+                urllib.request.urlretrieve(
+                    quote(url, safe=":/?#[]@!$&'()*+,;=%"), temp_path
+                )
             os.replace(temp_path, target_path)
             temp_path = None
             logger.info("[desktop] file downloaded to: %s", target_path)
@@ -1555,7 +2365,9 @@ class DesktopRuntime:
             logger.error("[desktop] local file picker unavailable")
             return []
 
-        from jiuwenswarm.channels.web.file_picker import (
+        # M0-b：file_picker 已迁 gateway 仓侧；desktop 仅需"记住上次目录"两个
+        # 纯函数——本地副本（与 gateway 侧状态文件同路径，行为等价）。
+        from jiuwenswarm.channels.desktop.picker_dir_state import (
             remember_file_picker_dir,
             resolve_file_picker_initial_dir,
         )
@@ -1645,7 +2457,9 @@ class DesktopRuntime:
             logger.warning("[desktop] failed to stat selected file %s: %s", path, exc)
             return None
 
-        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        from jiuwenswarm.channels.desktop.picker_dir_state import attachment_mime_type
+
+        mime_type = attachment_mime_type(filename)
         absolute = str(path)
         if ext in IMAGE_EXTENSIONS:
             if size > MAX_IMAGE_BYTES:
@@ -1714,7 +2528,21 @@ class DesktopRuntime:
         return results
 
     def get_clipboard_files(self) -> list[dict[str, Any]]:
-        return self.describe_local_files(_clipboard_file_paths())
+        """Return Explorer/Finder file picks, or a clipboard screenshot image pick."""
+        # Brief retries: OpenClipboard can fail while another app still holds it.
+        picks: list[dict[str, Any]] = []
+        for attempt in range(3):
+            paths = _clipboard_file_paths()
+            if paths:
+                picks = self.describe_local_files(paths)
+                if picks:
+                    return picks
+            image = _clipboard_image_pick()
+            if image is not None:
+                return [image]
+            if attempt < 2:
+                time.sleep(0.05)
+        return picks
 
     def _evaluate_js(self, script: str) -> None:
         if self.window is None:
@@ -1746,6 +2574,8 @@ class DesktopRuntime:
         require ``copy`` — ``move``/``none`` are rejected and show the forbidden
         cursor.
         """
+        if not _macos_display_capture_supported():
+            self._run_js("window.__JIUWEN_DESKTOP_SCREEN_CAPTURE__ = false;")
         self._run_js(
             """
 (function () {
@@ -1763,6 +2593,42 @@ class DesktopRuntime:
     if (!dt || !dt.types) return false;
     try {
       return Array.from(dt.types).indexOf('Files') !== -1;
+    } catch (err) {
+      return false;
+    }
+  }
+  // Archive managers expose dragged folders as virtual FileSystemEntry
+  // directories. Letting pywebview serialize that DataTransfer can recurse
+  // through a large virtual tree and freeze/crash WebView2, so reject it before
+  // the document-level Python bridge sees the event.
+  function hasDirectory(dt) {
+    if (!dt || !dt.items) return false;
+    try {
+      return Array.from(dt.items).some(function (item) {
+        if (!item || item.kind !== 'file' || typeof item.webkitGetAsEntry !== 'function') return false;
+        var entry = item.webkitGetAsEntry();
+        return Boolean(entry && entry.isDirectory);
+      });
+    } catch (err) {
+      return false;
+    }
+  }
+  // WinRAR and similar archive/mail clients expose dragged entries as Shell
+  // virtual files rather than real filesystem entries. Passing those objects to
+  // pywebview's document drop handler makes WebView2 call
+  // postMessageWithAdditionalObjects and can crash the renderer. Reject them
+  // before the pywebview listener serializes the DataTransfer.
+  function hasVirtualFiles(dt) {
+    if (!dt || !dt.items) return false;
+    try {
+      var fileItems = Array.from(dt.items).filter(function (item) {
+        return item && item.kind === 'file';
+      });
+      if (!fileItems.length) return false;
+      return fileItems.some(function (item) {
+        if (typeof item.webkitGetAsEntry !== 'function') return false;
+        return item.webkitGetAsEntry() === null;
+      });
     } catch (err) {
       return false;
     }
@@ -1791,6 +2657,11 @@ class DesktopRuntime:
     function accept(e) {
       if (!hasFiles(e.dataTransfer)) return;
       e.preventDefault();
+      if (hasDirectory(e.dataTransfer)) {
+        try { e.dataTransfer.dropEffect = 'none'; } catch (err) {}
+        e.stopImmediatePropagation();
+        return;
+      }
       try { e.dataTransfer.dropEffect = 'copy'; } catch (err) {}
       window.dispatchEvent(new CustomEvent('jiuwen-desktop-file-drag', {detail:{active:true}}));
     }
@@ -1805,6 +2676,16 @@ class DesktopRuntime:
     window.addEventListener('drop', function (e) {
       if (!hasFiles(e.dataTransfer)) return;
       e.preventDefault();
+      if (hasVirtualFiles(e.dataTransfer)) {
+        e.stopImmediatePropagation();
+        window.dispatchEvent(new CustomEvent('jiuwen-desktop-virtual-file-drop-rejected'));
+        endDrag();
+        return;
+      }
+      if (hasDirectory(e.dataTransfer)) {
+        e.stopImmediatePropagation();
+        window.dispatchEvent(new CustomEvent('jiuwen-desktop-directory-drop-rejected'));
+      }
       endDrag();
     }, true);
   }
@@ -1827,6 +2708,12 @@ class DesktopRuntime:
       e.stopImmediatePropagation();
       // Preserve the anti-navigation default prevention the bridge used to give.
       e.preventDefault();
+    }, false);
+    document.addEventListener('drop', function (e) {
+      if (!hasFiles(e.dataTransfer) || !hasVirtualFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      window.dispatchEvent(new CustomEvent('jiuwen-desktop-virtual-file-drop-rejected'));
     }, false);
   }
 })();
@@ -1906,6 +2793,16 @@ class DesktopRuntime:
                 paths.append(path.strip())
         if not paths:
             logger.warning("[desktop] drop files missing pywebviewFullPath: %s", raw_files)
+            return
+        # Never pass directories (including archive-manager temporary/virtual
+        # extraction directories) into the local-file upload pipeline. The page
+        # normally rejects FileSystemEntry directories before this callback; this
+        # is the native-path fallback for shells that expose only full paths.
+        if any(Path(path).is_dir() for path in paths):
+            logger.info("[desktop] rejected directory drop")
+            self._run_js(
+                "window.dispatchEvent(new CustomEvent('jiuwen-desktop-directory-drop-rejected'));"
+            )
             return
         described = self.describe_local_files(paths)
         if described:
@@ -2123,6 +3020,7 @@ class DesktopRuntime:
             return False
 
         app_executable = Path(sys.executable).resolve()
+        self._update_shutdown_receipt = create_shutdown_receipt(get_user_workspace_dir() / ".updates")
 
         if os.name == "nt":
             ok = self._launch_windows_install_helper(target, app_executable)
@@ -2173,6 +3071,7 @@ class DesktopRuntime:
         q_log_file = shlex.quote(str(log_file))
         q_temp_target = shlex.quote(f"{install_target}.new")
         q_old_target = shlex.quote(f"{install_target}.old")
+        q_shutdown_receipt = shlex.quote(str(getattr(self, "_update_shutdown_receipt", "")))
 
         helper_content = f"""#!/bin/bash
 set -e
@@ -2192,6 +3091,9 @@ while kill -0 "{parent_pid}" 2>/dev/null; do
 done
 echo "[helper] parent process exited"
 
+# Confirm resident Runtime shutdown before replacing any installed archive.
+{shlex.quote(str(app_executable))} --desktop-run-worker-lifecycle --shutdown-worker --timeout 30 --shutdown-receipt {q_shutdown_receipt}
+
 # Wait for backend/frontend ports to release
 wait_port_release() {{
     local port=$1
@@ -2204,7 +3106,8 @@ wait_port_release() {{
         fi
         sleep 0.5
     done
-    echo "[helper] warning: port $port ($name) still in use after 15s, proceeding anyway"
+    echo "[helper] port $port ($name) still in use after 15s; keeping installed app"
+    return 1
 }}
 wait_port_release {backend_port} backend
 wait_port_release {frontend_port} frontend
@@ -2300,8 +3203,7 @@ echo "=== install helper finished: $(date) ==="
         )
         return True
 
-    @staticmethod
-    def _launch_linux_install_helper(target: Path, app_executable: Path) -> bool:
+    def _launch_linux_install_helper(self, target: Path, app_executable: Path) -> bool:
         parent_pid = os.getpid()
         updates_dir = get_user_workspace_dir() / ".updates"
         updates_dir.mkdir(parents=True, exist_ok=True)
@@ -2319,6 +3221,7 @@ echo "=== install helper finished: $(date) ==="
         q_install_dir = shlex.quote(install_dir)
         q_backup_dir = shlex.quote(backup_dir)
         q_executable = shlex.quote(f"{install_dir}/{EXECUTABLE_NAME}")
+        q_shutdown_receipt = shlex.quote(str(getattr(self, "_update_shutdown_receipt", "")))
 
         helper_content = f"""#!/bin/bash
 set -e
@@ -2328,6 +3231,7 @@ while kill -0 "$PARENT_PID" 2>/dev/null; do
 done
 
 BACKUP={q_backup_dir}
+{q_executable} --desktop-run-worker-lifecycle --shutdown-worker --timeout 30 --shutdown-receipt {q_shutdown_receipt}
 if [ -d {q_install_dir} ]; then
     mv {q_install_dir} "$BACKUP"
 fi
@@ -2368,6 +3272,8 @@ nohup {q_executable} >/dev/null 2>&1 &
                 str(self.backend_port),
                 "--frontend-port",
                 str(self.frontend_port),
+                "--shutdown-receipt",
+                str(getattr(self, "_update_shutdown_receipt", "")),
             ],
         )
         logger.info("[desktop] launching update helper: %s", helper_cmd)
@@ -2388,12 +3294,30 @@ nohup {q_executable} >/dev/null 2>&1 &
             processes = list(self.processes.values())
 
         self._abort_all_blob_saves()
-        deadline = time.monotonic() + 8.0
+        shutdown_ok = True
+        deadline = time.monotonic() + 30.0
         logger.info("[desktop] shutting down child processes")
 
         for process in processes:
             if process.poll() is None:
-                _terminate_process_tree(process)
+                try:
+                    _terminate_process_tree(process)
+                except (OSError, RuntimeError):
+                    shutdown_ok = False
+                    logger.exception("[desktop] service tree cleanup incomplete")
+
+        # A previous launch may own a resident Worker even before this
+        # application's first service is registered. Final exit owns both.
+        from jiuwenswarm.server.supervisor.shutdown import shutdown_resident_worker
+        try:
+            result = asyncio.run(shutdown_resident_worker(timeout=max(.001, deadline - time.monotonic()),
+                include_legacy=True))
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                shutdown_ok = False
+                logger.error("[desktop] resident Worker final shutdown incomplete: %s", result)
+        except Exception:
+            shutdown_ok = False
+            logger.exception("[desktop] resident Worker final shutdown incomplete")
 
         while time.monotonic() < deadline:
             if all(process.poll() is not None for process in processes):
@@ -2402,10 +3326,20 @@ nohup {q_executable} >/dev/null 2>&1 &
 
         for process in processes:
             if process.poll() is None:
-                _kill_process_tree(process)
+                shutdown_ok = False
+                try:
+                    _kill_process_tree(process)
+                except (OSError, RuntimeError):
+                    logger.exception("[desktop] forced service tree cleanup incomplete")
 
         with self._lock:
             self.processes.clear()
+        receipt = getattr(self, "_update_shutdown_receipt", None)
+        if receipt is not None:
+            try:
+                complete_shutdown_receipt(receipt, ok=shutdown_ok)
+            except (OSError, RuntimeError):
+                logger.exception("[desktop] failed to record update shutdown receipt")
 
     @staticmethod
     def _clear_wkwebview_system_cache() -> None:
@@ -2424,13 +3358,49 @@ nohup {q_executable} >/dev/null 2>&1 &
             shutil.rmtree(cache_dir)
             logger.info("[desktop] cleared WKWebView HTTP cache: %s", cache_dir)
 
+    # WebView2 user-data-folder HTTP-cache subdirectories (relative to storage_path).
+    # Only these are cleared on launch; profile data (Local Storage, IndexedDB,
+    # Cookies) is preserved so per-origin UI state survives restarts.
+    _WEBVIEW_CACHE_SUBDIRS = (
+        "EBWebView/Default/Cache",
+        "EBWebView/Default/Code Cache",
+        "EBWebView/Default/GPUCache",
+        "EBWebView/Default/DawnGraphiteCache",
+        "EBWebView/Default/DawnWebGPUCache",
+        "EBWebView/Default/Media Cache",
+        "EBWebView/Default/Service Worker/CacheStorage",
+        "EBWebView/Default/Service Worker/ScriptCache",
+        "EBWebView/GrShaderCache",
+        "EBWebView/ShaderCache",
+        "EBWebView/GraphiteDawnCache",
+        "EBWebView/Crashpad/reports",
+        "EBWebView/Crashpad/completed",
+    )
+
+    @classmethod
+    def _clear_webview_http_cache(cls, storage_path: Path) -> None:
+        """Clear WebView2 HTTP/JS/GPU caches, keeping localStorage/IndexedDB.
+
+        The whole storage_path used to be wiped on every launch to avoid stale
+        cached JS/CSS, but that also erased localStorage, losing per-origin UI
+        state (e.g. proactive-recommendation feedback buttons) across restarts.
+        Clear only the cache subdirectories instead. ignore_errors=True so a
+        leftover WebView2 process from a crashed previous run cannot abort
+        startup; partial cache cleanup is harmless.
+        """
+        for rel in cls._WEBVIEW_CACHE_SUBDIRS:
+            cache_dir = storage_path / rel
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                logger.info("[desktop] cleared webview cache: %s", cache_dir)
+
     def run(self, window_title: str, width: int, height: int, debug: bool) -> None:
         self._clear_wkwebview_system_cache()
 
         storage_path = get_user_workspace_dir() / "tmp" / "webview"
-        if storage_path.exists():
-            shutil.rmtree(storage_path)
         storage_path.mkdir(parents=True, exist_ok=True)
+        self._clear_webview_http_cache(storage_path)
+        _install_macos_media_capture_permission(lambda: self.frontend_display_url)
 
         self.window = webview.create_window(
             window_title,
@@ -2447,7 +3417,12 @@ nohup {q_executable} >/dev/null 2>&1 &
         )
 
         self.window.events.loaded += self._on_loaded_first
+        self.window.events.closing += self._on_closing
         self.window.events.closed += self._on_closed
+        if sys.platform == "darwin":
+            shown_event = getattr(self.window.events, "shown", None)
+            if shown_event is not None:
+                shown_event += self._configure_macos_window_lifecycle
 
         def _start_services_and_report() -> None:
             def _navigate_on_web_ready() -> None:
@@ -2759,35 +3734,15 @@ if(bridgeNeverResponded||bridgeStoppedResponding){
         self._schedule_desktop_file_dnd_bind()
 
     def _on_closed(self) -> None:
+        self._dispose_windows_tray()
         self.shutdown()
 
 
 def _psutil_terminate(pid: int, force: bool = False) -> None:
-    """Terminate a process and all its descendants using psutil.
+    """Signal owned services while preserving resident Worker branches."""
+    from jiuwenswarm.common.process_supervision import signal_service_tree
 
-    Unlike ``taskkill.exe``, this is a pure-Python operation that does not
-    spawn an external console process, avoiding console window flashes on
-    Windows (console=False builds).
-    """
-    try:
-        import psutil
-
-        parent = psutil.Process(pid)
-        # 获取所有子孙进程（在杀父进程之前先拿到完整列表）
-        children = parent.children(recursive=True)
-        kill_fn = (lambda p: p.kill()) if force else (lambda p: p.terminate())
-        # 先杀子孙，再杀父进程，避免子孙变成孤儿
-        for child in reversed(children):
-            try:
-                kill_fn(child)
-            except psutil.NoSuchProcess:
-                pass
-        try:
-            kill_fn(parent)
-        except psutil.NoSuchProcess:
-            pass
-    except Exception:  # noqa: BLE001
-        pass
+    signal_service_tree(pid, force=force)
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
@@ -2828,6 +3783,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--installer-path", default="", help=argparse.SUPPRESS)
     parser.add_argument("--app-executable", default="", help=argparse.SUPPRESS)
     parser.add_argument("--parent-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--shutdown-receipt", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--backend-port", type=int, default=BACKEND_PORT, help=argparse.SUPPRESS
     )
@@ -2872,6 +3828,7 @@ def main() -> None:
             args.parent_pid,
             backend_port=args.backend_port,
             frontend_port=args.frontend_port,
+            shutdown_receipt=args.shutdown_receipt,
         )
         return
 

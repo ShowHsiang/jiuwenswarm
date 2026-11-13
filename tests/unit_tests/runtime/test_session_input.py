@@ -14,6 +14,21 @@ from jiuwenswarm.runtime.service import AgentRuntime, RuntimeStateError
 from jiuwenswarm.runtime.session.model import SessionExecutionState, SessionWorkKind
 
 
+@pytest.fixture(autouse=True)
+def isolated_agent_dirs(tmp_path, monkeypatch):
+    """会话/lifecycle 持久状态落在 tmp，而不是真实用户主目录。
+
+    claim_runtime 按 get_agent_sessions_dir 的父目录写 runtime owner 文件；
+    不隔离时并行 worker 会通过共享文件争抢 "input-session" 的 owner
+    （assert_runtime_owner 报 another live AgentServer owns）。
+    """
+    sessions = tmp_path / "agent" / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setattr(
+        "jiuwenswarm.common.utils.get_agent_sessions_dir", lambda: sessions
+    )
+
+
 def request(rid="supplement", *, input_mode="steer", **params):
     return AgentRequest(
         request_id=rid, channel_id="web", session_id="input-session",
@@ -87,6 +102,7 @@ async def setup_runtime(monkeypatch):
         get_agent_for_session_nowait=Mock(return_value=agent),
     )
     plan = SimpleNamespace(
+        active_sessions=set(),
         ensure_state=AsyncMock(return_value=SimpleNamespace(events=[])),
         check_post_process_exit=AsyncMock(return_value=[]), reset_session=Mock(),
     )
@@ -132,6 +148,39 @@ async def test_new_input_bypasses_busy_lane_without_answer_or_second_agent(setup
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protected_mode", ["plan", "goal", "agent.code.plan", "agent.work.plan"])
+@pytest.mark.parametrize("busy", [False, True])
+async def test_protected_cross_session_input_never_uses_active_or_idle_delivery(
+    setup_runtime, protected_mode, busy,
+):
+    from agent_gateway.common.session_message import SESSION_MESSAGE_INTERNAL_KEY
+    from jiuwenswarm.runtime.session_input import SessionInputQueueRequiredError
+
+    runtime, agent, manager = setup_runtime
+    original = None
+    if busy:
+        original = asyncio.create_task(collect(runtime.stream(request("original", input_mode=None))))
+        await asyncio.wait_for(agent.entered.wait(), 2)
+    if protected_mode == "plan":
+        runtime.plan_controller.active_sessions.add("input-session")
+    elif protected_mode == "goal":
+        manager.has_active_goal = Mock(return_value=True)
+    supplement = request(**{SESSION_MESSAGE_INTERNAL_KEY: {"message_id": "sm-steer"}})
+    if protected_mode.startswith("agent."):
+        supplement.params["mode"] = protected_mode
+    with pytest.raises(SessionInputQueueRequiredError):
+        await collect(runtime.stream(supplement))
+    assert not agent.delivered
+    assert not agent.cancelled
+    if original is not None:
+        assert not original.done()
+        agent.release.set()
+        await asyncio.wait_for(original, 2)
+    else:
+        assert not agent.entered.is_set()
+
+
+@pytest.mark.asyncio
 async def test_input_rejection_does_not_end_original(setup_runtime):
     runtime, agent, _ = setup_runtime
     original = asyncio.create_task(collect(runtime.stream(request("original", input_mode=None))))
@@ -152,9 +201,61 @@ async def test_idle_input_owns_normal_execution_and_output(setup_runtime, unary)
     req = request()
     req.is_stream = not unary
     events = await runtime.invoke(req) if unary else await collect(runtime.stream(req))
+    if not unary:
+        assert events[0].event_type == "runtime.accepted"
+        assert events[0].payload["input_delivery"] == "chat"
+        assert events[0].request_id == req.request_id
+        assert events[0].payload["execution_id"] == events[-1].payload["execution_id"]
     assert events[-1].event_type == "chat.final"
     manager.get_agent_for_session_nowait.assert_not_called()
     runtime._prepare_chat_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unary", [False, True])
+@pytest.mark.parametrize("query", ["", "Compare this screenshot"])
+async def test_idle_image_steer_is_rejected_before_ack_or_execution(setup_runtime, tmp_path, monkeypatch, unary, query):
+    from jiuwenswarm.runtime.session_input import SessionInputTargetError
+    from jiuwenswarm.server.runtime.attachments import steer_images
+
+    runtime, agent, _ = setup_runtime
+    other_upload = tmp_path / "agent" / "sessions" / "other-session" / "uploads" / "private.png"
+    other_upload.parent.mkdir(parents=True)
+    other_upload.write_bytes(b"private image bytes must not be read")
+    resolve_images = Mock(side_effect=AssertionError("idle image references must not be read"))
+    monkeypatch.setattr(steer_images, "resolve_steer_image_references", resolve_images)
+    req = request(query=query, media_items=[{
+        "type": "image", "path": str(other_upload), "filename": other_upload.name,
+        "mime_type": "image/png",
+    }])
+    req.is_stream = not unary
+    received = []
+    with pytest.raises(SessionInputTargetError, match="requires an active execution") as rejected:
+        if unary:
+            received.extend(await runtime.invoke(req))
+        else:
+            async for event in runtime.stream(req):
+                received.append(event)
+    assert rejected.value.code == "SESSION_INPUT_TARGET_CHANGED"
+    assert received == []
+    runtime._prepare_chat_turn.assert_not_awaited()
+    resolve_images.assert_not_called()
+    assert not agent.entered.is_set() and not agent.delivered
+    assert other_upload.read_bytes() == b"private image bytes must not be read"
+
+
+@pytest.mark.asyncio
+async def test_image_only_steer_still_routes_to_current_execution(setup_runtime):
+    runtime, agent, _ = setup_runtime
+    original = asyncio.create_task(collect(runtime.stream(request("original", input_mode=None))))
+    await asyncio.wait_for(agent.entered.wait(), 2)
+    images = [{"type": "image", "path": "/session/uploads/shot.png", "filename": "shot.png", "mime_type": "image/png"}]
+    events = await collect(runtime.stream(request("image-supplement", query="", media_items=images)))
+    assert [event.event_type for event in events] == ["runtime.accepted"]
+    assert agent.delivered[-1].params["media_items"] == images
+    assert not original.done() and not agent.cancelled
+    agent.release.set()
+    await original
 
 
 @pytest.mark.asyncio
@@ -166,7 +267,7 @@ async def test_input_does_not_answer_or_supersede_pending_interaction(setup_runt
         await collect(runtime.stream(request()))
     root = runtime._session_coordinator.snapshot_session("input-session").executions[0]
     assert root.state is SessionExecutionState.WAITING_FOR_CONTROL
-    assert root.waiting_control_id == "question-1"
+    assert root.waiting_control_ids == {"question-1"}
     assert not agent.delivered
 
 
@@ -212,4 +313,62 @@ async def test_conflicting_modes_fail_without_dispatch(setup_runtime):
     runtime, _, _ = setup_runtime
     with pytest.raises(ValueError, match="must agree"):
         await collect(runtime.stream(request(runtime_mode="follow_up")))
+    runtime._prepare_chat_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unary", [False, True])
+async def test_bound_input_keeps_original_execution_and_returns_its_id(setup_runtime, unary):
+    runtime, agent, _ = setup_runtime
+    original = asyncio.create_task(collect(runtime.stream(request("original", input_mode=None))))
+    await asyncio.wait_for(agent.entered.wait(), 2)
+    before = runtime._session_coordinator.snapshot_session("input-session")
+    target = before.executions[0].execution_id
+    req = request(expected_execution_id=target)
+    req.is_stream = not unary
+    events = await runtime.invoke(req) if unary else await collect(runtime.stream(req))
+    assert [event.event_type for event in events] == ["runtime.accepted"]
+    assert events[0].payload["execution_id"] == target
+    after = runtime._session_coordinator.snapshot_session("input-session")
+    assert len([item for item in after.executions if item.work_kind is SessionWorkKind.CHAT_STREAM]) == 1
+    assert not original.done() and not agent.cancelled
+    agent.release.set()
+    assert (await original)[-1].payload["execution_id"] == target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["idle", "ended", "different_execution"])
+async def test_bound_input_never_falls_back_or_targets_replacement(setup_runtime, state):
+    runtime, agent, _ = setup_runtime
+    target = "missing-execution"
+    if state == "ended":
+        agent.release.set()
+        events = await collect(runtime.stream(request("original", input_mode=None)))
+        target = events[-1].payload["execution_id"]
+    original = None
+    if state == "different_execution":
+        original = asyncio.create_task(collect(runtime.stream(request("replacement", input_mode=None))))
+        await asyncio.wait_for(agent.entered.wait(), 2)
+    before = runtime._session_coordinator.snapshot_session("input-session")
+    with pytest.raises(RuntimeError, match="targeted execution has ended or changed"):
+        await collect(runtime.stream(request(expected_execution_id=target)))
+    after = runtime._session_coordinator.snapshot_session("input-session")
+    assert after.executions == before.executions
+    assert not agent.delivered and not agent.cancelled
+    if original:
+        assert not original.done()
+        agent.release.set()
+        await original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [
+    {"expected_execution_id": ""}, {"expected_execution_id": 42},
+    {"expected_execution_id": "original", "input_mode": "follow_up"},
+])
+async def test_invalid_execution_binding_is_rejected(setup_runtime, params):
+    runtime, agent, _ = setup_runtime
+    with pytest.raises(ValueError, match="expected_execution_id"):
+        await collect(runtime.stream(request(**params)))
+    assert not agent.delivered
     runtime._prepare_chat_turn.assert_not_awaited()
