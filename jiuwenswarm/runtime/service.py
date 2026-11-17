@@ -1027,7 +1027,7 @@ class AgentRuntime:
             target.mode,
             work_mode=target.work_mode,
         ):
-            raise ValueError(f"target session is not Work/Code Normal: {target_id}")
+            raise ValueError(f"target session is not a Work/Code Session: {target_id}")
         if source.user_id != target.user_id:
             raise PermissionError("source and target sessions have different owners")
         from jiuwenswarm.common.schema.agent import AgentRequest
@@ -1278,20 +1278,13 @@ class AgentRuntime:
         work_mode: object = None,
     ) -> bool:
         """Return whether a mode uses the single-Agent Session Runtime."""
-        from agent_gateway.common.mode_matrix import (
-            NEW_AGENT_CODE_NORMAL,
-            NEW_AGENT_WORK_NORMAL,
-        )
         from jiuwenswarm.runtime.request import resolve_agent_request_mode
 
         _mode, _sub_mode, canonical = resolve_agent_request_mode(
             mode,
             work_mode=work_mode,
         )
-        return deprecate_mode(canonical) in {
-            NEW_AGENT_WORK_NORMAL,
-            NEW_AGENT_CODE_NORMAL,
-        }
+        return is_single_agent_mode(deprecate_mode(canonical))
 
     async def _prepare_chat_turn(
         self,
@@ -1745,6 +1738,7 @@ class AgentRuntime:
         if attachment_completion is not None:
             return [attachment_completion]
         self._validate_permission_answer(request)
+        self._validate_answer_source(request)
         if self._is_session_input_request(request):
             async with aclosing(self.stream(
                 request, trigger_hook=trigger_hook, on_control_event=on_control_event,
@@ -2287,6 +2281,7 @@ class AgentRuntime:
             yield attachment_completion
             return
         self._validate_permission_answer(request)
+        self._validate_answer_source(request)
         is_session_input = self._is_session_input_request(request)
         is_team_session_message = (
             self._request_targets_team(request)
@@ -3734,6 +3729,23 @@ class AgentRuntime:
         if not isinstance(answers, list):
             raise InteractionAnswerError("answers must be a list")
         validate_answer_items(answers)
+
+    @classmethod
+    def _validate_answer_source(cls, request: AgentRequest) -> None:
+        """Reject answers carried under an unknown source (#6285).
+
+        Runs before session lane admission; the raised
+        ``InteractionAnswerError`` reaches the client as an error response
+        frame instead of the request deadlocking behind the interaction
+        still waiting for those answers.
+        """
+        params = request.params if isinstance(request.params, dict) else {}
+        if request.req_method is not ReqMethod.CHAT_SEND:
+            return
+        # pylint: disable-next=import-outside-toplevel
+        from jiuwenswarm.runtime.interaction import validate_answer_source
+
+        validate_answer_source(params)
 
     @staticmethod
     def _is_interrupt_resume_request(request: AgentRequest) -> bool:

@@ -62,7 +62,7 @@ def _isolate_user_workspace(tmp_path_factory):
     flush_pending_writes = session_metadata.flush_pending_writes
     with pytest.MonkeyPatch.context() as mp:
         data = tmp_path_factory.mktemp("unit_workspace") / ".jiuwenswarm"
-        config_dir = data / "infra" / "config"
+        config_dir = data / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(
             Path(__file__).resolve().parents[2] / "jiuwenswarm/resources/config.yaml",

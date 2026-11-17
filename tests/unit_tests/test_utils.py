@@ -458,22 +458,6 @@ def test_oversized_structured_log_keeps_valid_json():
     assert "test-only-secret" not in masked
 
 
-class TestUserWorkspace:
-    """Test user workspace functions."""
-
-    @patch("jiuwenswarm.common.utils.get_user_workspace_dir")
-    @patch("jiuwenswarm.common.utils._find_package_root")
-    @patch("pathlib.Path.exists")
-    @patch("builtins.input")
-    def test_init_user_workspace_cancelled(
-        self, mock_input, mock_exists, mock_find_root, mock_get_workspace_dir, temp_workspace
-    ):
-        """Test user workspace initialization when user cancels."""
-        # This test requires more complex mocking due to file operations
-        # Simplified version
-        pass
-
-
 def test_prepare_workspace_does_not_copy_legacy_heartbeat_template(
     tmp_path: Path,
 ) -> None:
@@ -502,7 +486,6 @@ def test_prepare_workspace_copies_rsi_program_dataset_creator(
 
     assert (
         workspace_dir
-        / "domain"
         / "agent"
         / "workspace"
         / "skills"
@@ -764,10 +747,10 @@ class TestHardcodedPathsPhase2:
 
         # Original hardcoded: get_user_workspace_dir() / "agent" / "home" / "cron_jobs.json"
         # New: get_agent_home_dir() / "cron_jobs.json"
-        # get_agent_home_dir() = get_user_workspace_dir() / "domain" / "agent" / "home"
+        # get_agent_home_dir() = get_user_workspace_dir() / "agent" / "home"
 
         workspace = get_user_workspace_dir()
-        expected_path = workspace / "domain" / "agent" / "home" / "cron_jobs.json"
+        expected_path = workspace / "agent" / "home" / "cron_jobs.json"
         actual_path = get_agent_home_dir() / "cron_jobs.json"
 
         assert str(actual_path.resolve()) == str(expected_path.resolve()), \
@@ -787,7 +770,7 @@ class TestHardcodedPathsPhase2:
         from jiuwenswarm.common.utils import get_user_workspace_dir
 
         workspace = get_user_workspace_dir()
-        expected_path = workspace / "domain" / "agent" / "workspace" / "task-data.json"
+        expected_path = workspace / "agent" / "workspace" / "task-data.json"
         actual_path = Path(_get_task_data_path())
 
         assert str(actual_path.resolve()) == str(expected_path.resolve()), \
@@ -806,7 +789,7 @@ class TestHardcodedPathsPhase2:
         from jiuwenswarm.common.utils import get_deepagent_user_md_path, get_user_workspace_dir
 
         workspace = get_user_workspace_dir()
-        expected_path = workspace / "domain" / "agent" / "workspace" / "USER.md"
+        expected_path = workspace / "agent" / "workspace" / "USER.md"
         actual_path = get_deepagent_user_md_path()
 
         assert str(actual_path.resolve()) == str(expected_path.resolve()), \
@@ -829,7 +812,7 @@ class TestAdditionalHardcodedPaths:
         monkeypatch.setattr(RailManager, "_instance", None)
 
         workspace = get_user_workspace_dir()
-        expected_path = workspace / "domain" / "agent" / "workspace" / "extensions"
+        expected_path = workspace / "agent" / "workspace" / "extensions"
         rail_manager = RailManager()
 
         extensions_dir = getattr(rail_manager, '_extensions_dir')
@@ -862,7 +845,7 @@ class TestAdditionalHardcodedPaths:
         from jiuwenswarm.common.utils import get_interactions_dir, get_user_workspace_dir
 
         workspace = get_user_workspace_dir()
-        expected_path = workspace / "domain" / "agent" / "workspace" / "interactions"
+        expected_path = workspace / "agent" / "workspace" / "interactions"
         actual_path = get_interactions_dir()
 
         assert str(actual_path.resolve()) == str(expected_path.resolve()), \
@@ -983,7 +966,7 @@ class TestCleanupStaleOpenjiuwenDescs:
         cleanup_call = source.index("cleanup_stale_openjiuwen_descs()")
 
         # 只约束 openjiuwen SDK 本体：清理针对的是 SDK 会读取的过期描述文件。
-        # ``openjiuwen_protocol`` 是独立的纯协议包，不读取 workspace 描述文件，
+        # ``e2a`` 是独立的纯协议包，不读取 workspace 描述文件，
         # 按导入分组规则可以排在清理调用之前。
         sdk_import_markers = (
             "from openjiuwen.",

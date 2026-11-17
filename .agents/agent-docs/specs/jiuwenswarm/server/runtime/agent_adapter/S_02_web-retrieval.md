@@ -13,6 +13,7 @@ modules:
   - jiuwenswarm/agents/harness/common/prompt
   - jiuwenswarm/agents/harness/common/rails
   - jiuwenswarm/agents/harness/common/recommendation
+  - scripts
 files:
   - jiuwenswarm/server/runtime/agent_adapter/trusted_web_search.py
   - jiuwenswarm/server/runtime/agent_adapter/interface_deep.py
@@ -29,6 +30,13 @@ files:
   - jiuwenswarm/agents/harness/common/recommendation/topic_search.py
   - jiuwenswarm/agents/harness/common/recommendation/topic_model.py
   - jiuwenswarm/agents/harness/common/recommendation/topic_starter.py
+  - scripts/release_dependencies.py
+  - scripts/build.sh
+  - scripts/build.ps1
+  - setup.py
+  - pyproject.toml
+  - uv.lock
+  - MANIFEST.in
 ---
 
 # SDK Web 检索接入
@@ -50,6 +58,26 @@ files:
   备用市场最终接受的来源才记录。不得在包装层重新放回拒绝候选或添加另一套市场重试。
 - 必须同时使用含 `_on_search_results` 与 `WebResearchBudgetRail` 的 SDK；旧 SDK 缺钩子时工具返回明确错误，
   不能降级成没有来源记录的“正常”搜索。只更新 Swarm 不足以升级 SDK 行为。
+- `WebResearchBudgetRail` 导入或构造失败时记录警告并跳过该可选 Rail，不能阻止 Work/Code 会话创建；
+  其余 Rail 仍照常装配。该降级不表示检索预算已生效，应安装匹配 SDK 后重启。
+- Core/Gateway 候选仅用于 editable 开发验证。wheel、sdist 与 PyInstaller 入口校验主依赖、extras、
+  uv overrides、uv sources 及已有锁文件，拒绝非官方仓库、浮动修订或同一依赖的不一致固定版本。
+  直链依赖先按 URL 结构剥离 query/fragment，再校验官方仓库和完整 SHA；合法的 `#subdirectory=...`
+  不属于修订号。该规范化不放宽仓库、SHA 或锁文件一致性要求。
+  转 Ready 仅代表进入检视，不解除发布阻断；需先合入对应官方仓、分别统一切换官方完整 SHA、更新锁文件并复测。
+- `scripts/build.sh` / `build.ps1` 的非隔离 wheel 构建先用同一个 Python 安装 `build`、`wheel>=0.46.3`、
+  `setuptools>=70.1.0` 和 `packaging>=23.0`，安装失败即停止。test extra 与 test group 显式包含
+  build-system 依赖；冻结打包的 dev extra 显式包含 `packaging`，不依赖间接安装碰巧满足。
+  `setup.py` 的更早期 editable 元数据入口在仅缺少 `setuptools.command.bdist_wheel` 时使用
+  `wheel.bdist_wheel`；其他模块导入错误仍抛出。wheel 也在 build-system 中直接声明，避免依赖探测
+  尚未结束时先因构建命令导入失败。两条后端路径均保留 wheel/sdist 的官方依赖发布门禁。
+- Swarm 按官方基线固定 Core 的完整 Git SHA；SDK 主依赖、uv source 与保留各 extras 的
+  override 使用同一官方修订。Gateway 发布依赖为兼容版本范围；其自身 tool.uv.sources
+  不传递给 Swarm，不能据此认定下游已经使用某个 Git 提交。
+  Harmony 仅保留版本下限，claude/codex/cua/distribute 声明所需 SDK extras，不引入另一条旧直链。
+  更新依赖后须重新锁定，并核对实际安装 Gateway 的 SDK requirement 不存在冲突直链。
+  sdist 包含 uv.lock，保证从源码包构建 wheel 时仍可校验传递 SDK 的官方来源与固定版本，
+  锁文件不作为 wheel 的运行时资源。依赖可解析不等于具备配套搜索能力，仍须分别验证。
 - 两个默认 rail builder 都包含一份 `WebResearchBudgetRail`；Code 动态配置对该 Rail 去重。
   新 invocation、新并发会话有独立预算；同一 invocation 的模型轮次和并行工具共享。
 - 免费来源仅支持 DDG（含 reader 入口）与 Bing；环境模板提供独立开关和检索预算。
@@ -64,6 +92,10 @@ files:
 
 - Work/默认 Code 的 `BrowserTaskPromptRail` 在每次模型调用前使用 SDK 的
   `is_paid_search_enabled()` / `is_free_search_enabled()` 读取当前配置。
+  某个导出缺失时仅替代该可用性判断：免费来源读取 `FREE_SEARCH_DDG_ENABLED` / `FREE_SEARCH_BING_ENABLED`，
+  付费来源读取 `BOCHA_API_KEY` / `PERPLEXITY_API_KEY` / `SERPER_API_KEY` / `JINA_API_KEY`。
+  判断仍逐轮读取环境，不恢复已移除的 360 来源；已有 SDK 导出保持优先。
+  这不替代搜索结果钩子或预算能力，也不承诺旧 SDK 的实际搜索工具可用。
   仅在没有付费搜索 key、DDG/Bing 都关闭且实际挂载 `browser_agent` 时，追加中英文浏览器检索提示；
   配置改变后下一次模型调用移除或重新追加，不缓存初始状态，不影响工具注册与付费/免费优先规则。
 - 用户未指定引擎或方式、需要发现网络来源时，提示主 Agent 使用同步
@@ -81,7 +113,9 @@ files:
   缺失或空值按 false 返回；读取 `.env` 的已保存值优先于前端服务的旧环境，启动默认值不得覆盖已有 true。
 - 两个免费开关的修改均走 search reload scope，沿用既有全局搜索重载通知。
   存量 MCP AbilityManager 根据任意免费来源启用状态添加或移除 `mcp_free_search`，付费工具继续按 API key 独立判断。
-- 推荐状态按 DDG/Bing 任意一种开启判断；支持 duckduckgo、duckduckgo-jina、bing 回执，不要求两个开关同时开启。
+- 推荐的搜索能力按 DDG/Bing 任意一种开启判断；支持 duckduckgo、duckduckgo-jina、bing 回执，不要求两个开关同时开启。
+  两者均关闭不阻止推荐服务创建、预置话题或热榜展示；`native_search_missing` 仅提示搜索配置缺失，
+  不覆盖模型配置状态。实际搜索仍遵循 SDK 开关，不能绕过禁用来源或记录成功回执。
 - 已移除 360 的配置读写、工具分支和推荐回执。旧 `.env` 的 `FREE_SEARCH_360_ENABLED` 不再生效，
   不会单独注册免费工具或开启推荐搜索；SDK 显式 `provider=360` 返回不支持，不偷偷切换引擎。
 - 原生推荐的直接搜索不隐式创建模型，保留 SDK 候选的 `unavailable` / `uncertain` 字段与原因；

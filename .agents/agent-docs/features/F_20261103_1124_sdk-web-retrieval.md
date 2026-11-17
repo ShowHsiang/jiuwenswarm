@@ -12,6 +12,8 @@ modules:
   - jiuwenswarm/agents/harness/common/tools
   - jiuwenswarm/agents/harness/common/recommendation
   - jiuwenswarm/channels/web/frontend
+  - jiuwenswarm/agents/harness/common/rails
+  - scripts
 files:
   - jiuwenswarm/server/runtime/agent_adapter/trusted_web_search.py
   - jiuwenswarm/server/runtime/agent_adapter/interface_deep.py
@@ -40,7 +42,16 @@ files:
   - tests/unit_tests/gateway/test_app_web_handlers.py
   - docs/en/Configuration.md
   - docs/zh/配置信息.md
+  - jiuwenswarm/agents/harness/common/rails/browser_task_prompt_rail.py
+  - scripts/release_dependencies.py
+  - scripts/build.sh
+  - scripts/build.ps1
+  - tests/unit_tests/agentserver/test_browser_search_fallback_prompt.py
+  - tests/unit_tests/test_release_dependencies.py
+  - pyproject.toml
   - uv.lock
+  - MANIFEST.in
+  - Makefile
 designs: []
 design_note: 用户在对话中确认实际搜索案例分析后的调整策略，无独立设计文档。
 ---
@@ -315,6 +326,244 @@ DDG 对照部分可用；源响应、页面防护和最终证据核验的限制�
 Python 使用已激活的 Swarm venv、两仓 PYTHONPATH、隔离 JIUWENSWARM_DATA_DIR，pytest 指定
 `-o addopts= -o log_cli=false -o asyncio_mode=auto -p no:cacheprovider`；
 未运行格式化、静态检查、全仓测试或桌面打包。Core 合并后相关行为回归 **369 passed**。
+
+## 独立官方 PR 交付（2026-11-04）
+
+按用户新授权从官方 `develop` 的 `26acdaddae1fa0daf0f888f8012f0284a2548204` 单独挑选免费搜索改动，
+不合入 fork 的 merge 或其他历史提交。关联 `Refs #9193`；该 Issue 还包括 wheel 默认启用搜索的诉求，
+本次不修改默认引擎开关，不能把本 PR 描述成完整关闭该 Issue。
+
+本节替代上一节 fork 交付所用的 SDK 修订。配套 core PR 为
+https://github.com/openJiuwen-ai/agent-core/pull/2466 ，其分支从官方 `8ede5297c` 出发，
+只有免费搜索实现、测试、文档三个连续提交。Swarm 的依赖、所有 extras overrides 和锁文件统一固定为
+`3781cec780ce12d88ad4be4a6bf68d0ab6b7a91b`，不再依赖含其他 fork 历史的 `9e4673601`。
+消费方 PR 先以 Draft 提交；待 core 合入后改回官方可分发修订并重新生成锁文件，再转为可合并状态。
+
+独立 PR checkout 中重新核对两仓实际导入路径并执行回归：core **369 passed**，Swarm 上述 8 个
+Python 文件 **565 passed**，前端 `npm run test:settings-panel` **66 passed**。
+使用现有激活 venv、两份干净 PR 源码 PYTHONPATH 和隔离数据目录；原本 develop 工作区及本地 editable
+配置保持不变。此候选未重新执行外部搜索/模型 E2E，不把上一节线上结果当作此候选的成功率。
+仍未运行全仓测试、格式化、静态检查、生产前端构建或桌面打包。
+
+## GitCode 检视修复（2026-11-10）
+
+本轮针对 !9841 的三条意见，以 `78240cade7bf4b2f069a2a4c5fc0925eab18f009` 为基线。
+用户授权检视并修复必要问题，没有授权本轮提交或推送；不修改主工作区、真实配置或现有服务。
+随后用户明确授权仅将这三项修复提交并推送到 !9841，关联 GitCode #5651；提交邮箱仅本次使用
+`dingyangkai@huawei.com`，不修改仓库默认身份。其他模块的自动索引更新不纳入本次提交。
+
+- 可用性 helper：当前固定 SDK 已导出两个函数，但删除任一导出的回归能复现模块导入失败。
+  两个导入分别提供现有环境变量回退，保留可用的 SDK 实现和逐轮热更新；不接入第二套搜索实现，
+  也不把其他 SDK 接口不兼容隐藏为正常搜索。覆盖单独/同时缺失、6 个配置源、空白 key、旧 360 标志。
+- 非隔离构建：`--no-isolation` 不自动安装后端依赖，但仍检查依赖，不是完全忽略 build-system。
+  两个构建脚本显式安装已声明的 setuptools/packaging，使用同一个 Python，安装失败即停止。
+  test extra/group 与冻结打包 dev extra 补直接依赖；不增加旧 wheel 后端兼容分支。
+- 官方 pin：6 种主依赖、extra、override 中带 fragment/query 的合法官方固定版本在修复前被误拒。
+  现在用现有 `urlsplit` 剥离这两个 URL 部分再检查仓库和完整 SHA；fork、浮动分支、短 SHA 仍拒绝。
+  锁文件只增加 workswarm 的直接依赖边及声明，332 个包的版本、来源、原有 marker 和 SDK pin 均未变化。
+
+测试使用现有 Swarm venv 的 Python 3.11.5，PYTHONPATH 依次为当前 checkout、
+`.tmp/search-pr-10729-upstream-20261110`、`.tmp/search-pr-10570-upstream-20261110` 和
+`.tmp/search-pr-10570-compatible-20261106`，以匹配本 PR 固定的官方依赖，不使用 editable Core。
+pytest 选项为 `-q -o addopts= -o log_cli=false -o asyncio_mode=auto -p no:cacheprovider --tb=short`。
+
+- 发布门禁、build config、浏览器搜索提示三个文件：**107 passed**，正常退出。
+  构建 bootstrap 测试使用 stub Python，分别验证 Bash/PowerShell 安装成功和失败的真实控制流，
+  不执行 pip/npm 安装；既有测试另覆盖实际 setuptools wheel/sdist/editable 构建钩子。
+  初次沙箱运行的 6 个失败均为 Windows 临时元数据重命名或 Git Bash 启动权限错误，普通用户权限重跑后通过。
+- 加入来源包装、必需 Rail 装配、权限冷启动、免费搜索设置四个文件后：**247 项断言通过**，
+  JUnit 无 failure/error；但退出时 `tests/conftest.py:35` 清理临时日志被 Windows 文件锁阻止，命令退出码 1。
+  不把退出清理问题当产品回归，也不将该命令描述为完整通过；没有为本轮修复修改公共测试清理逻辑。
+- `uv lock --check --offline` 和对当前仓库运行 `validate_release_dependencies` 均通过；
+  用 TOML 结构对比确认除 workswarm 依赖声明外其他包记录及顶层元数据完全一致。
+  JUnit 在本地 `.tmp/search-pr-review-fixes-{unrestricted,expanded}-20261110.xml`，不提交测试产物。
+
+未运行格式化、静态检查、全仓测试、完整桌面打包或真实搜索/模型任务；未安装主环境依赖或重启服务。
+当前契约同步到 `S_02_web-retrieval`，不新建管理器、设计文档或重复检索策略。
+
+## CI editable 构建回归修复（2026-11-10）
+
+针对已推送的 `92d33bdf6dc095e38ae41e2ed0c117af453bac93`，用户提供 build、st_gateway、UT 三份
+本轮 CI 日志。用户先明确选择只修 build/UT、Gateway 保持不动，随后授权仅将本节修复、测试和记录
+提交并推送到 !9841，关联 #5651。本次 author/committer 邮箱使用 `dingyangkai@huawei.com`，
+不修改 Git 默认身份，不带入无关自动索引变更；推送后跟进新 SHA 的 CI 结果。
+
+- build（15:51:56）与 UT（15:47）都在 `uv sync --all-extras` 调用
+  `setuptools.build_meta.get_requires_for_build_editable` 时失败，尚未执行前端构建或测试用例。
+  两者都在 `setup.py:7` 抛 `No module named 'setuptools.command.bdist_wheel'`，后端来自镜像的
+  `/usr/local/python3/lib/python3.11/site-packages`。日志未给出完整环境及 setuptools 版本，
+  不能进一步认定是哪个 PYTHONPATH 或隔离配置造成旧后端被加载。UT 的上传列表为空，不能当作断言失败。
+- 上一节仅补后续 `python -m build --no-isolation` 的安装步骤，未覆盖前置 editable 入口；
+  本节替代“不增加旧 wheel 后端兼容分支”的决策。仅捕获缺少指定模块的 `ModuleNotFoundError`，
+  回退 wheel 提供的命令；现代后端仍优先，其他导入错误不吞掉，不移除发行包依赖门禁。
+  build-system、test extra/group、两个构建脚本显式使用 `wheel>=0.46.3`，避免 wheel 0.46.0/0.46.1
+  不再提供旧命令的兼容问题。锁文件新增 wheel 0.48.0 及 workswarm 的对应依赖边，未改已有包版本、来源或 marker。
+- st_gateway（15:48:53）是独立的 pip 解析失败：Swarm 固定 Core `2dc7477af89ceedbad550de88aac3291db578506`，
+  官方 Gateway `435d3323425e1051c6fe2d1feadcba68b4be020d` 固定 Core
+  `f3f8f576164cc405c046e43079c8ad00ee17f0c4`。二者即使都声明 0.1.20，直接 URL 仍冲突。
+  uv override 未进入 pip 的 Requires-Dist 解析。核对官方 Gateway develop 仍是后者，且两个 Core
+  提交的 Web 检索实现并不相同，不能降级来掩盖冲突。本轮不改 Gateway、SDK pin 或运行时搜索行为，
+  不跳过测试、不使用 `--no-deps`；因此不承诺本轮能让 st_gateway 通过。
+
+验证：
+
+- 独立 `.tmp/ci-9841-build-legacy` 环境使用 Python 3.11.5、setuptools 69.5.1、wheel 0.48.0。
+  修复前真实 editable 构建重现同一导入异常。修复后直接调用既有构建测试函数完成 **14 项检查**：
+  官方/fork 两种依赖各覆盖三类 get_requires 和三类 build hook，另验证 skip-build 不能绕过门禁，
+  以及真实项目 pyproject/setup 的 get_requires/prepare_metadata_for_build_editable。
+  这不是全套 pytest：独立环境没有应用依赖，直接复用同一测试函数及断言隔离构建入口。
+- 现有环境 setuptools 82.0.1 上，发布门禁、build config、浏览器搜索提示三个文件共 **117 passed**，
+  包括现代/旧模块选择、无关 ImportError 透传、依赖探测和实际项目元数据回归。
+  使用上一节官方 SDK 源码覆盖与 pytest 参数；报告为本地 `.tmp/ci-9841-build-fix-modern.xml`。
+- `uv lock --check --offline` 通过。TOML 结构对比确认 332 个已有包中只有 workswarm 依赖声明变化，
+  顶层元数据及平台 marker 不变，新增 wheel 后总计 333 个包。
+
+未运行全仓 UT、完整前端/桌面打包或 CI 镜像重建；远端 CI 需推送后重跑验证。
+没有改变主工作区、主虚拟环境、Git 默认身份或用户服务，也未新增跳过用例。
+
+## 合并官方 develop（2026-11-11）
+
+!9841 以 `e5bbb24d5` 为源分支基线，合并官方 `b98ec8c7d`。
+解决 pyproject 的 source 冲突并重新生成文档总索引，保留 Core 官方 `2dc7477a`，
+Gateway 引用跟随官方 Swarm 更新为 `54e5330d3ea6be972aa38de4c42a898ea73fed37`。
+官方删除的已迁出 Gateway 测试保持删除，没有借此跳过本地新发现的群任务测试。
+
+用户明确要求暂不提交 11 月 10 日的群锁取消修复；对应运行时代码、测试清理、新用例和故障记录
+单独备份，不进入本次合并。主工作区环境不变，使用独立锁定环境验证本 PR 候选。
+
+- Python 3.11.5，真实安装官方 Core `2dc7477a`、Gateway `54e5330d`，没有本地 SDK 覆盖。
+- 发布依赖门禁、真实构建 hook、搜索/浏览器路由、提示词、配置与推荐逻辑：**441 passed**。
+  Windows 日志退出清理仅由临时测试启动器完成，不进入候选提交；未绕过任何测试断言。
+- `npm run test:settings-panel`：**67 passed、1 failed**。失败为
+  `modelSettings.test.mjs:721` 的源码反向断言：测试禁止 `MODEL_SELECTION_REFERENCED`，
+  但 `ModelsSettings.tsx:457` 已使用此错误码。两个文件均与官方目标分支一致，本次不改动。
+- `uv lock --check --offline` 通过；未运行全仓 CI 或声称 st_gateway 安装通过。
+
+核对时官方 Gateway develop 为 `127851ab`，SDK pin 仍是 `f3f8f576`，依赖对齐 PR !76 未合入。
+因此 Gateway 代码虽已前移，pip 的两个 Core 直链冲突仍存在；不能将 Core 降级来隐藏问题。
+
+## 再次同步官方 develop（2026-11-12）
+
+用户授权合并官方 `737041a075c79c1bb0b10aa8e27252ca0df670ac` 并推送 !9841；
+源分支基线为 `8752a4011de9d0472ea6b7dac8dee5853421c48a`。保留本轮之前已提交的搜索、构建和
+群锁取消修复，合并官方其他更新；原有三个未提交文档索引单独备份，不作为本轮新增实现提交。
+
+官方 !9918 已移除母仓对 Core 的直接依赖及 uv override，解决的是 wheel/pip 中同名 SDK 的
+双 Git URL 约束。但该变更仍经 Gateway `54e5330d` 选择 Core `f3f8f576`，不是 SDK 升级。
+核对官方 Gateway develop 的 pyproject 仍使用该 Core，Gateway !76 仍未合入；
+`f3f8f576` 中不存在本 PR 所需的 `openjiuwen/harness/rails/web_research_rail.py`。
+用户明确选择本次更新先保留 Core `2dc7477a` 及配套 override/source，待 Gateway 官方 pin 前移后
+再删除直接 SDK pin，采用 !9918 的单一传递来源。不能以降级搜索能力换取安装阶段通过。
+本轮不修改 Gateway 业务代码，不采用个人 fork 依赖，也不声称 pip 的 st_gateway 冲突已经修复。
+
+群锁冲突继续使用 `_finish_group_lock_io` 等待获取/释放完成后传递取消，保留上一轮回归覆盖，
+而不是恢复为未完成的后台释放回调。文档索引按合并后的源文档重新生成，不手工选择丢弃一边。
+
+合并候选验证使用独立 `.tmp/pr9841-merge-venv`，Core 为官方 `2dc7477a`，无本地 SDK 覆盖：
+
+- 12 个后端文件：**379 passed、6 failed、1 skipped**，未新增跳过。
+  搜索、构建、配置、推荐、群锁和续跑用例均通过；失败全部为真实 Worker 启动后的 IPC 等待超时。
+  本地子进程 stderr 明确记录 `Worker source changed after the parent validated it` /
+  `Invalid Worker parent identity`。这定位到父子身份校验，但不能据此替代缺少子进程日志的 Linux CI 根因证据。
+- 单独运行 recovery 失败用例，附只读父子指纹诊断：**1 passed**；代码和环境指纹均一致。
+  收集相同 12 个文件但只运行该用例也通过，进一步将本地问题缩小到先前用例的执行副作用；
+  不提高 timeout、不关闭身份校验。
+- `npm run test:settings-panel`：**67 passed、1 failed**，仍为上轮记录的模型删除错误码源码断言。
+  直接运行旧 fixture 缓存曾出现设置键不一致，重新通过 npm 脚本构建 fixture 后该项通过，
+  不将缓存不一致误报为产品回归。
+
+进一步确认 `test_setup_selects_the_available_wheel_backend` 在 pytest 进程导入 `setuptools`，
+后者将自身 `_vendor` 加入 `sys.path`。独立复现中，该导入不修改安装包或源码，却使
+`environment_identity()` 从 `7656803f` 变为 `6013c38f`，多枚举 12 个 vendor distribution。
+Worker 新进程没有该导入副作用，启动校验因此拒绝运行；这解释了单独通过、组合失败的本地现象。
+
+本轮追加最小测试隔离：只在 `test_release_dependencies.py` 的 autouse fixture 为每个用例提供
+独立 `sys.path` 列表，pytest monkeypatch 退出时恢复原对象。不修改生产 dependency identity、
+SDK/Worker 行为、超时或断言。第一次修复后同组 **383 passed、2 failed、1 skipped**，Worker
+用例全部通过；两项 editable 构建失败为新临时目录过长触发 WinError 206。
+最终使用 `.tmp/t9841a` 重跑同一完整组合：**385 passed、1 skipped**，包括原报告五项 Worker
+失败用例及本地额外复现的第六项。JUnit 为本地 `.tmp/ut9841-update-final-20261112.xml`，不提交。
+`uv lock --check --offline` 通过，锁文件内容仍与合并前一致，没有修改已有包版本或 marker。
+
+未运行全仓 UT、Linux CI、完整桌面构建或真实搜索 E2E；主工作区、主环境和用户服务不变。
+远端五项 UT 是否为相同根因仍需新 CI 回执，不能把本机复现等同于取得了 CI 子进程 stderr。
+Gateway pin 前移后仍须重锁并重新验证普通 pip 安装。
+
+## 采用 Gateway 单一 SDK 来源（2026-11-12）
+
+用户随后明确改为由 Gateway 传递 SDK，接受等待 Gateway 后续更新。本节替代上一节的
+"暂时保留 SDK 直接 pin" 决策，不改写之前使用 Core `2dc7477a` 的验证事实。
+
+- 移除 Swarm 主依赖中的 Core 直链、五个 SDK uv override 及 SDK source；Harmony 改为
+  `openjiuwen>=0.1.20`，其余 SDK extras 保留。Gateway 固定来源仍为官方 `54e5330d`。
+- 不修改 Gateway 仓库、搜索实现、缺失能力的显式错误或已有搜索测试；不以跳过用例掩盖 SDK 差距。
+- `MANIFEST.in` 将 uv.lock 放入 sdist，使仅有传递 SDK 时，从 sdist 重建 wheel 仍可通过原有
+  官方依赖门禁；不放宽门禁，也不将锁文件装入 wheel。增加真实 sdist -> wheel 回归，检查 wheel
+  元数据仅通过 Gateway 获取基础 SDK，保留可选 extras。
+- 后续 Gateway 更新 SDK 后，还需要更新 Swarm 的 Gateway SHA 并重新锁定，不能把当前
+  传递依赖调整表述为已经使用最新 Core。
+
+验证：
+
+- `uv lock --check --offline` 通过；333 个包中只有 workswarm 与 openjiuwen 的声明改变，
+  其他包版本、包内容与平台 marker 均保持原样。SDK 当前为 Gateway 指定的 `f3f8f576`。
+- `uv sync --locked --all-extras --offline --dry-run` 通过。另建独立
+  `.tmp/pr9841-transitive-venv`，实际执行 `uv sync --locked --no-default-groups --group test --offline`，
+  成功安装 280 个包；`uv pip check` 通过。没有使用 SDK override 或本地源码替换。
+  下载该 SDK 的 Git 缓存获取失败后，仅从本机既有 Git 仓补入相同官方完整 SHA 对象再构建。
+- 发布依赖与 build config 的两个测试文件在已有环境和上述真实锁定环境均为 **74 passed**，
+  覆盖原生 editable 元数据、官方来源检查、保留 extras、旧 setuptools 入口与 sdist -> wheel。
+- 在新锁定环境追加 `test_trusted_web_search.py` 后为 **74 passed、31 errors**。
+  31 项均在 fixture 初始化读取 `free_search.resolve_search_model` 时失败，旧 SDK 未提供该接口；
+  测试正文尚未执行，不把它们表述成 31 个独立业务回归，也不跳过测试。
+  JUnit 在本地 `.tmp/ut9841-transitive-sdk-20261112.xml`，不提交运行产物。
+
+这次消除了 Swarm 与 Gateway 对 Core 的两个不同直链声明；未运行远端 st_gateway 或声称
+整套 CI 已通过。Gateway 官方固定提交前移后，需重锁并重跑搜索及 ST，才能交付本 PR 的完整搜索能力。
+主工作区环境和已有三个未提交索引不纳入本次提交。
+
+## 同步官方依赖新方案与合并冲突（2026-11-16）
+
+!9841 以 `b4e2f4f39` 合并官方 develop `15aecfac1`。原分支及三个未提交索引分别备份，
+不将用户索引 WIP 混入合并。冲突涉及 Makefile、pyproject、搜索适配器及四个生成索引。
+
+官方 `6cf813d88` 已恢复根项目固定 SDK；Gateway `2c40ac15` 的发布依赖改为
+`openjiuwen>=0.1.20`，自身 uv source 指向 `2f4bedb9`。后者不会作为传递依赖 source 生效，
+与 11 月 12 日 Gateway 直接依赖 Core Git URL 的前提不同。用户确认跟随最新官方方案，
+本节替代上一节的纯 Gateway 传递决策：
+
+- Swarm 固定官方 Core `2f4bedb9c5d85ab70d7c79d36183e6a98799e94e`，采用官方 Gateway
+  `2c40ac150276477a8079ef7937674b600b6a1420`；保留各 SDK extra，Harmony 不带回旧 `f3f8f576` 直链。
+- 协议迁移跟随官方 E2A `06a75d66` 和 PyPI A4P `0.1.0`，不保留已被替换的 openjiuwen-protocol pin。
+- 两仓 SDK 约束不再是互斥的 Git URL；增加已安装 Gateway 元数据回归，防止未来再次出现该冲突。
+  SDK Web 工具目录和 WebResearchBudgetRail 在 `2f4bedb9` 与此前验证的 `2dc7477a` 间无代码差异。
+- 搜索适配器保留单一 `_on_search_results` 回调、上下文透传、finally lease 清理与旧 SDK 明确错误。
+  删除自动合并产生的重复方法和重复测试日志清理；没有复制 SDK 搜索、质量或预算实现。
+- 文档索引由合并后的源文档重新生成，不直接丢弃任一侧的有效条目。Makefile 明确要求先更新
+  固定 SHA 再重新锁定，避免把 `uv lock --upgrade-package` 描述成自动跟踪 develop。
+
+验证使用独立 `.tmp/pr9841-20261116-venv`，真实安装上述官方 SDK / Gateway / E2A，
+`uv sync --locked --no-default-groups --group test`、`uv pip check` 和
+`uv lock --check --offline` 均通过。锁文件相对官方仅增加本 PR 的构建测试依赖及元数据。
+
+- 后端 12 个相关文件首轮 **407 passed、1 failed、1 skipped**。唯一失败为群续跑用例
+  `test_idle_timeout_releases_the_session_for_a_queued_continuation[True]`：SDK `atomic_write`
+  替换测试临时 `executions.json` 时发生 Windows `PermissionError (WinError 5)`，随后等待超时。
+  不放宽断言或修改生产逻辑，单独重跑整个续跑文件为 **49 passed**；尚不能据此认定该异常已修复。
+  搜索、发布构建、已安装 Gateway 约束和 Worker 回归在首轮均通过。
+- 前端 `npm run test:settings-panel` 为 **69 passed**，未手工改动前端逻辑。
+- 未运行全仓 UT、远端 ST、完整桌面构建或真实搜索 E2E。主工作区环境、用户服务和
+  Gateway 业务代码不变；本地结果不等同于新 CI 已通过。
+
+验证期间官方 develop 前移至 `078e8f5d2`，追加合并该提交（包含双工任务更新和 STUDIO 文案修正），
+没有新增冲突。最终候选重跑同一 12 文件组合为 **407 passed、1 failed、1 skipped**；
+前一轮的群续跑用例本轮通过，唯一失败改为
+`test_slow_legacy_retirement_cannot_exceed_election_deadline` 的 `close` 精确次数断言：
+40ms 测试窗口内观测到 2 次，而非 1 次。该测试、群续跑测试和 RuntimeSupervisor
+均与官方 develop 完全一致；不将其直接归因于搜索修复，也不声称已修复计时抖动。
+单独复跑三个 Worker 文件为 **39 passed、1 skipped**，前端再次为 **69 passed**。
+两个组合运行的失败记录均保留；未修改 Worker、放宽 deadline、改变断言或新增跳过。
+最终 JUnit 位于本地 `.tmp/ut9841-final-20261116.xml` 与 `.tmp/ut9841-worker-20261116.xml`，不提交。
 
 ## 残余限制
 

@@ -182,7 +182,6 @@ def test_client_message_rules_do_not_remove_web_research_budget(
     rails = adapter._build_agent_rails(
         {}, {"permissions": {"enabled": False}}, mode="agent",
     )
-
     budget_rails = [rail for rail in rails if isinstance(rail, WebResearchBudgetRail)]
     assert budget_rails == [adapter._web_research_budget_rail]
     if omit_message_rules:

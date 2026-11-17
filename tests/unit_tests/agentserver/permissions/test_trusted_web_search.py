@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -261,6 +262,65 @@ async def test_adapter_matches_upstream_output_and_argument_normalization(
     assert trusted.card.model_dump() == upstream.card.model_dump()
     assert ledger.contains(root_session_id="session-1", url=url)
     assert ledger.contains(root_session_id="session-1", url="https://docs.invalid/v1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("assessment_status", ["ok", "unavailable"])
+async def test_adapter_preserves_quality_annotations_and_search_context(monkeypatch, assessment_status):
+    from openjiuwen.harness.tools.web import free_search
+
+    url = "https://release-notes.invalid/v1"
+    rows = [{
+        "title": "Provisional release notes",
+        "url": url,
+        "snippet": "Unverified summary",
+        "date": "2026-11-06",
+        "relevance": "uncertain",
+        "relevance_reason": "entity needs verification",
+        "assessment_status": assessment_status,
+    }]
+    callback = object()
+    model = object()
+    budget = SimpleNamespace(original_task="Check the release date")
+    requests = []
+
+    def get_budget(actual_callback):
+        assert actual_callback is callback
+        return budget
+
+    def get_model(actual_callback, configured_model):
+        assert actual_callback is callback
+        return model
+
+    async def search(request):
+        requests.append(request)
+        return "duckduckgo", rows
+
+    monkeypatch.setattr(free_search, "get_web_budget", get_budget)
+    monkeypatch.setattr(free_search, "resolve_search_model", get_model)
+    monkeypatch.setattr(WebFreeSearchTool, "_search_free", staticmethod(search))
+    inputs = {"query": "release", "provider": "duckduckgo"}
+    expected = await WebFreeSearchTool(agent_id="agent-1").invoke(
+        inputs, _tool_callback_context=callback,
+    )
+    ledger = SessionTrustedSearchUrls("session-1")
+    _bind(ledger)
+
+    actual = await TrustedWebFreeSearchTool(agent_id="agent-1").invoke(
+        inputs, _tool_callback_context=callback,
+    )
+
+    assert actual == expected
+    assert "Content status: uncertain" in actual
+    assert "Search-reported date (unverified): 2026-11-06" in actual
+    assert ("Assessment status: unavailable" in actual) == (assessment_status == "unavailable")
+    assert ledger.contains(root_session_id="session-1", url=url)
+    assert len(requests) == 2
+    for request in requests:
+        assert request.provider == "duckduckgo"
+        assert request.budget is budget
+        assert request.model is model
+        assert request.original_task == budget.original_task
 
 
 @pytest.mark.asyncio
@@ -769,3 +829,30 @@ def test_work_and_code_assembly_include_one_sdk_budget_rail(monkeypatch, mode):
     budget_rails = [rail for rail in rails if isinstance(rail, WebResearchBudgetRail)]
     assert len(budget_rails) == 1
     assert adapter._web_research_budget_rail is budget_rails[0]
+
+
+@pytest.mark.parametrize("mode", ["agent", "code"])
+@pytest.mark.parametrize("failure", ["missing_module", "constructor"])
+def test_optional_search_budget_failure_does_not_abort_agent_assembly(monkeypatch, caplog, mode, failure):
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+    from jiuwenswarm.server.runtime.agent_adapter.interface_code import JiuwenSwarmCodeAdapter
+    from openjiuwen.harness.rails import web_research_rail
+
+    adapter = JiuWenSwarmDeepAdapter() if mode == "agent" else JiuwenSwarmCodeAdapter()
+    original_instantiate = adapter._instantiate_rails
+
+    def instantiate_selected(infos, config):
+        selected = [info for info in infos if info.attr_name == "_web_research_budget_rail"]
+        assert len(selected) == 1
+        return original_instantiate(selected, config)
+
+    monkeypatch.setattr(adapter, "_instantiate_rails", instantiate_selected)
+    if failure == "missing_module":
+        monkeypatch.setitem(sys.modules, "openjiuwen.harness.rails.web_research_rail", None)
+    else:
+        monkeypatch.setattr(web_research_rail, "WebResearchBudgetRail", Mock(side_effect=RuntimeError("invalid budget")))
+
+    rails = adapter._build_agent_rails({}, {"permissions": {"enabled": False}}, mode=mode)
+    assert all(type(rail).__name__ != "WebResearchBudgetRail" for rail in rails)
+    assert any(type(rail).__name__ == "PromptSuggestionForkRail" for rail in rails)
+    assert "WebResearchBudgetRail create failed" in caplog.text

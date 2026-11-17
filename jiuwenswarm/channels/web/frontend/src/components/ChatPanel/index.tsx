@@ -1334,6 +1334,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     exposureAcknowledged: boolean;
   } | null>(null);
   const [recommendationState, setRecommendationState] = useState("");
+  const [topicStarterRead, setTopicStarterRead] = useState<{ visitId: string; pending: boolean } | null>(null);
   const [recommendationRefresh, setRecommendationRefresh] = useState(0);
   const keepSlateOnRefreshRef = useRef(false);
   // The switch event lands before the re-read. Hold that state across the refresh so the
@@ -1345,9 +1346,14 @@ export const ChatPanel = React.memo(function ChatPanel({
   const readyWhileHiddenRef = useRef(false);
   const [topicStarterErrorKey, setTopicStarterErrorKey] = useState<string | null>(null);
   // Disabled still shows packaged cold-start cards; personalized generation waits on the switch.
-  const visibleTopicSlate = dynamicSlate?.visitId === topicStarterVisitId
+  const topicStartersEnabled = !isEnterprise();
+  const visibleTopicSlate = topicStartersEnabled && dynamicSlate?.visitId === topicStarterVisitId
     ? dynamicSlate.slate : null;
   const visibleTopicSlateId = visibleTopicSlate?.slateId;
+  const topicStarterLoading = Boolean(
+    topicStartersEnabled && isConnected && activeSessionId && !hasConversation && !visibleTopicSlate &&
+    (topicStarterRead?.visitId !== topicStarterVisitId || topicStarterRead.pending),
+  );
   const acceptingDynamicRef = useRef(false);
   const interactedRecommendationVisitRef = useRef<string | null>(null);
   const topicStarterClickLatchRef = useRef<string | null>(null);
@@ -1723,6 +1729,7 @@ export const ChatPanel = React.memo(function ChatPanel({
   }, [activeSessionId, rememberSessionScrollTop, restoreSessionScrollTop]);
 
   useEffect(() => {
+    if (!topicStartersEnabled) return;
     const handleTopicPageVisibility = () => {
       const visible = document.visibilityState === 'visible';
       setPageVisible(visible);
@@ -1734,7 +1741,7 @@ export const ChatPanel = React.memo(function ChatPanel({
     };
     document.addEventListener('visibilitychange', handleTopicPageVisibility);
     return () => document.removeEventListener('visibilitychange', handleTopicPageVisibility);
-  }, []);
+  }, [topicStartersEnabled]);
 
   useLayoutEffect(() => {
     const el = scrollContainerRef.current;
@@ -1847,26 +1854,32 @@ export const ChatPanel = React.memo(function ChatPanel({
     [sendTopicStarterEvent],
   );
 
-  useEffect(() => useChatStore.subscribe((state, previous) => {
-    if (!activeSessionId || hasConversation || state.activeSessionId !== activeSessionId) return;
-    const input = state.runtimes[activeSessionId]?.inputValue;
-    const previousInput = previous.runtimes[activeSessionId]?.inputValue;
-    if (previousInput && !input && !visibleTopicSlateRef.current && !acceptingDynamicRef.current) {
-      interactedRecommendationVisitRef.current = null;
-      acceptingDynamicRef.current = true;
-      setRecommendationRefresh(value => value + 1);
-    }
-  }), [activeSessionId, hasConversation]);
+  useEffect(() => {
+    if (!topicStartersEnabled) return;
+    return useChatStore.subscribe((state, previous) => {
+      if (!activeSessionId || hasConversation || state.activeSessionId !== activeSessionId) return;
+      const input = state.runtimes[activeSessionId]?.inputValue;
+      const previousInput = previous.runtimes[activeSessionId]?.inputValue;
+      if (previousInput && !input && !visibleTopicSlateRef.current && !acceptingDynamicRef.current) {
+        interactedRecommendationVisitRef.current = null;
+        acceptingDynamicRef.current = true;
+        setRecommendationRefresh(value => value + 1);
+      }
+    });
+  }, [activeSessionId, hasConversation, topicStartersEnabled]);
 
   // v6 展示只读预计算池，后台 Ark 配置与会话回答模型相互独立。因此新欢迎页
   // WebChannel ready 后立即请求，不等待模型列表，也不把会话 model_name 传给 Topic Starter。
   // 连接恢复会重新进入该 effect，避免页面先启动时的一次失败永久留下静态入口。
   useEffect(() => {
-    acceptingDynamicRef.current = Boolean(activeSessionId && !hasConversation && interactedRecommendationVisitRef.current !== topicStarterVisitId);
-    if (!isConnected || !activeSessionId || hasConversation) {
+    acceptingDynamicRef.current = topicStartersEnabled && Boolean(
+      activeSessionId && !hasConversation && interactedRecommendationVisitRef.current !== topicStarterVisitId,
+    );
+    if (!topicStartersEnabled || !isConnected || !activeSessionId || hasConversation) {
       return;
     }
     const requestSessionId = activeSessionId;
+    setTopicStarterRead({ visitId: topicStarterVisitId, pending: true });
     const requestParams = buildTopicStarterRequest(requestSessionId, topicStarterProjectId, workMode);
     let active = true;
     let receivedScopeState = false;
@@ -1952,13 +1965,25 @@ export const ChatPanel = React.memo(function ChatPanel({
           setRecommendationState("failed");
         }
         console.error('topic_starters.get failed:', error);
+      })
+      .finally(() => {
+        if (active) setTopicStarterRead({ visitId: topicStarterVisitId, pending: false });
       });
     return () => {
       active = false;
       unsubscribeReady();
       unsubscribeControl();
     };
-  }, [activeSessionId, hasConversation, isConnected, topicStarterProjectId, topicStarterVisitId, recommendationRefresh, workMode]);
+  }, [
+    activeSessionId,
+    hasConversation,
+    isConnected,
+    topicStarterProjectId,
+    topicStarterVisitId,
+    recommendationRefresh,
+    workMode,
+    topicStartersEnabled,
+  ]);
 
 
   useEffect(() => {
@@ -2600,8 +2625,17 @@ export const ChatPanel = React.memo(function ChatPanel({
                   onClearGoal={onClearGoal}
                 />
               </div>
-              <div className="chat-suggestions" data-testid="chat-panel-welcome-suggestions">
-                {recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
+              {topicStartersEnabled && <div className="chat-suggestions" data-testid="chat-panel-welcome-suggestions">
+                {topicStarterLoading ? (
+                  <div
+                    className="chat-suggestions__title"
+                    role="status"
+                    aria-live="polite"
+                    data-testid="chat-panel-topic-loading"
+                  >
+                    {t('chat.topicStarter.statusLoading')}
+                  </div>
+                ) : recommendationState !== 'disabled' && topicStarterShowsStatus(recommendationState, Boolean(visibleTopicSlate)) ? (
                   <div
                     className="chat-suggestions__title"
                     role="status"
@@ -2643,7 +2677,7 @@ export const ChatPanel = React.memo(function ChatPanel({
                     />
                   );
                 })}
-              </div>
+              </div>}
               {isGroupCreateWelcome && (
                 <div className="chat-welcome__capabilities" data-testid="chat-panel-welcome-capabilities">
                   <span className="chat-welcome__capability">

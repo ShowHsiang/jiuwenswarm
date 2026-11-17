@@ -39,6 +39,11 @@ from agent_gateway.common.session_message import (
 )
 from agent_gateway.common.interrupt_resume import CLIENT_TOOL_INTERRUPT_SOURCE
 from agent_gateway.extensions.registry import ExtensionRegistry
+from e2a.constants import (
+    E2A_CANCEL_SOURCE_CLIENT_DISCONNECT,
+    E2A_INTERNAL_CANCEL_SOURCE_KEY,
+)
+
 from jiuwenswarm.agents.harness.code.prompt.plan_approval import (
     PLAN_EXECUTE_OPTION_VALUES,
     PLAN_REMINDER_ORIGINAL_QUERY_KEY,
@@ -84,12 +89,9 @@ from jiuwenswarm.common.context_keys import (
     JIUWENSWARM_CHANNEL_CONTEXT_KEY,
     JIUWENSWARM_SKIP_A2UI_CONTEXT_KEY,
 )
-from jiuwenswarm.common.e2a.constants import (
-    E2A_CANCEL_SOURCE_CLIENT_DISCONNECT,
-    E2A_INTERNAL_CANCEL_SOURCE_KEY,
-)
 from jiuwenswarm.common.hook_event import AgentServerHookEvents
 from jiuwenswarm.common.hooks_context import MemoryHookContext
+from jiuwenswarm.common.input_guard import InputTooLongError
 from jiuwenswarm.common.schema.agent import (
     AgentRequest,
     AgentResponse,
@@ -487,6 +489,34 @@ def _person_drove_turn(request: AgentRequest, *, is_team_mode: bool) -> bool:
     )
 
 
+async def _check_user_input_guard(adapter: Any, request: AgentRequest, query: Any) -> None:
+    """Ask the adapter to reject one input that cannot fit its model window.
+
+    Runs before the user turn is written to history, so a rejected message is
+    never restored into the context on the next session warmup. Adapters that
+    do not implement the gate (for example external harnesses) are unaffected.
+
+    Only :class:`InputTooLongError` propagates. Any other failure is logged
+    and ignored: this gate is an optimization, never a new failure mode.
+    """
+    checker = getattr(adapter, "check_user_input_guard", None)
+    if not callable(checker):
+        return
+    try:
+        result = checker(request, query)
+        # Adapters currently implement this as a coroutine; accept a sync
+        # implementation too so an extension cannot silently bypass the gate.
+        if inspect.isawaitable(result):
+            await result
+    except InputTooLongError:
+        raise
+    except Exception:  # noqa: BLE001 - the gate must never break a request
+        logger.warning(
+            "[JiuWenSwarm] input guard check failed; continuing request",
+            exc_info=True,
+        )
+
+
 def _should_record_user_history(params: Any) -> bool:
     # History visibility is not permission authority: retain Heartbeat turns.
     if not isinstance(params, dict):
@@ -621,6 +651,30 @@ def _resolve_final_record_timestamp(
     if isinstance(extra_fields, dict):
         extra_fields.setdefault("completed_at", completed_at)
     return segment_started_at
+
+
+async def persist_cancelled_llm_usage(
+    chunk: AgentResponseChunk, *, request: AgentRequest, session_id: str,
+) -> None:
+    """Preserve an accepted usage event when its output consumer has closed."""
+    payload = chunk.payload
+    extra = {key: value for key, value in payload.items() if key not in ("event_type", "content")}
+    params = request.params if isinstance(request.params, dict) else {}
+    extra = with_cross_session_history_metadata(
+        _with_heartbeat_history_metadata(
+            _with_web_agent_template_metadata(
+                extra, params, request.channel_id, event_type="chat.usage_metadata", payload=payload,
+            ), params,
+        ), _cross_session_marker_from_params(params),
+    ) or {}
+    timestamp = resolve_final_record_timestamp(
+        event_type="chat.usage_metadata", segment_started_at=None, extra_fields=extra,
+    )
+    await _run_history_io(
+        append_history_record, session_id=session_id, request_id=request.request_id,
+        channel_id=request.channel_id, role="assistant", event_type="chat.usage_metadata",
+        content="", timestamp=timestamp, extra=extra, mode=params.get("mode", "unknown"),
+    )
 
 
 def _history_media_string(item: dict[str, Any], *keys: str) -> str | None:
@@ -2081,11 +2135,16 @@ class JiuWenSwarm:
         # One turn, one renderer: single-agent and team both deliver
         # ``turn.render()``. The team path additionally keeps ``turn.text`` to
         # parse directives / ``$member`` routing before it renders.
+        files = params.get("files") or {}
+        if request_channel == "web" and not cross_session_turn and isinstance(files, dict):
+            from jiuwenswarm.server.runtime.attachments.video_attachments import video_upload_prompt_files
+
+            files = video_upload_prompt_files(files, request.session_id)
         turn = UserTurn(
             text=query,
             channel=channel,
             language=language,
-            files=params.get("files", {}) or {},
+            files=files,
             trusted_dirs=trusted_dirs,
             skills=skills,
             metadata=metadata,
@@ -2177,6 +2236,10 @@ class JiuWenSwarm:
         # Only Host-authenticated provenance may select Agent/tool input. Never
         # trust a client-supplied copy inside the SDK's extensible run context.
         run_extra = inputs["run"]["context"]["extra"]
+        # Explicit selectors belong to this turn, not history or a reused run
+        # context. Keep the prompt and routing on the same parsing rules, and
+        # clear stale nested selections even when this turn selects nothing.
+        run_extra["skills"] = turn.resolved_skills
         run_extra.pop(SESSION_MESSAGE_INTERNAL_KEY, None)
         cross_session = metadata.get(SESSION_MESSAGE_INTERNAL_KEY)
         if isinstance(cross_session, dict):
@@ -3116,7 +3179,10 @@ class JiuWenSwarm:
                     )
             elif method == ReqMethod.PLUGIN_PACKAGES_INSTALL:
                 ok, payload = await asyncio.wait_for(
-                    package_manager.install_equipment_from_hub_gated("plugin_packages", params),
+                    package_manager.install_equipment_from_hub_gated(
+                        "plugin_packages", params,
+                        before_replace=self._prepare_live_plugin_replacement,
+                    ),
                     timeout=120,
                 )
                 if not ok:
@@ -3427,14 +3493,14 @@ class JiuWenSwarm:
 
     async def process_message(self, request: AgentRequest) -> AgentResponse:
         """Process a request through the facade-owned Session scheduler."""
-        from jiuwenswarm.enterprise.capabilities.experts.allowlist import bind_request_subject
+        from jiuwenswarm.enterprise.capabilities.experts.request_packages import bind_request_subject
 
         with bind_request_subject(request.metadata):
             return await self._process_message(request, schedule_session=True)
 
     async def execute_message(self, request: AgentRequest) -> AgentResponse:
         """Execute one request when scheduling is owned by AgentRuntime."""
-        from jiuwenswarm.enterprise.capabilities.experts.allowlist import bind_request_subject
+        from jiuwenswarm.enterprise.capabilities.experts.request_packages import bind_request_subject
 
         with bind_request_subject(request.metadata):
             return await self._process_message(request, schedule_session=False)
@@ -3639,6 +3705,11 @@ class JiuWenSwarm:
         # proactive_recommendation 是系统触发的推荐指令（不是用户说的话），不写 user
         # history——否则刷新页面会显示"[主动推荐指令] xxx"这种用户没说过的消息。
         if _should_record_user_history(request.params):
+            try:
+                await _check_user_input_guard(adapter, request, query)
+            except InputTooLongError:
+                _schedule_feedback_once("error")
+                raise
             await _run_history_io(
                 append_history_record,
                 session_id=session_id,
@@ -3905,7 +3976,7 @@ class JiuWenSwarm:
         """Inject an interaction answer into this Session's active execution."""
         if not is_interrupt_resume_payload(request.params):
             raise ValueError("control input must answer an active interaction")
-        from jiuwenswarm.enterprise.capabilities.experts.allowlist import bind_request_subject
+        from jiuwenswarm.enterprise.capabilities.experts.request_packages import bind_request_subject
 
         # 续聊不经过 process_message。这里绑定当次请求的名单，深研适配器里的 allows 才能放行已授权专家。
         # 不把 ContextVar token 留过 yield。关流可能发生在另一个 Task，跨上下文 reset 会抛 ValueError。
@@ -4216,7 +4287,7 @@ class JiuWenSwarm:
         self, request: AgentRequest
     ) -> AsyncIterator[AgentResponseChunk]:
         """处理流式请求，并带上本次请求的用户身份。"""
-        from jiuwenswarm.enterprise.capabilities.experts.allowlist import bind_request_subject
+        from jiuwenswarm.enterprise.capabilities.experts.request_packages import bind_request_subject
 
         # 不把 ContextVar token 留过 yield。关流可能发生在另一个 Task，跨上下文 reset 会抛 ValueError。
         stream = self._process_message_stream(request)
@@ -4375,26 +4446,6 @@ class JiuWenSwarm:
                 TEAM_EXECUTION_CONTEXT_METADATA_KEY,
                 None,
             )
-        if (
-            request.req_method != ReqMethod.COMMAND_GOAL
-            and _should_record_user_history(params_for_history)
-        ):
-            await _run_history_io(
-                append_history_record,
-                session_id=session_id,
-                request_id=request.request_id,
-                channel_id=request.channel_id,
-                role="user",
-                content=_history_user_content(params_for_history, query),
-                timestamp=time.time(),
-                extra=_history_user_extra(params_for_history),
-                channel_metadata=history_channel_metadata,
-                mode=params_for_history.get("mode", "unknown"),
-            )
-        logger.info(
-            "[JiuWenSwarm] 处理流式请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
-            request.request_id, request.channel_id, session_id, self._sdk_name,
-        )
 
         rid = request.request_id
         cid = request.channel_id
@@ -4417,6 +4468,34 @@ class JiuWenSwarm:
                 session_id, rid, status=terminal_status, waiting_for_user=waiting_for_user,
                 completion=completion_receipt,
             )
+
+        if (
+            request.req_method != ReqMethod.COMMAND_GOAL
+            and _should_record_user_history(params_for_history)
+        ):
+            # Reject before history recording: a rejected message must not be
+            # restored into the model context on the next session warmup.
+            try:
+                await _check_user_input_guard(adapter, request, query)
+            except InputTooLongError:
+                _schedule_feedback_once("error")
+                raise
+            await _run_history_io(
+                append_history_record,
+                session_id=session_id,
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                role="user",
+                content=_history_user_content(params_for_history, query),
+                timestamp=time.time(),
+                extra=_history_user_extra(params_for_history),
+                channel_metadata=history_channel_metadata,
+                mode=params_for_history.get("mode", "unknown"),
+            )
+        logger.info(
+            "[JiuWenSwarm] 处理流式请求: request_id=%s channel_id=%s session_id=%s sdk=%s",
+            request.request_id, request.channel_id, session_id, self._sdk_name,
+        )
 
         try:
             inputs, memory_mode, user_turn = self._build_inputs(request)
@@ -4851,9 +4930,8 @@ class JiuWenSwarm:
         # 只有最后一个非工具轮非空 final（=推荐话术）落盘带 source/rec_id——否则刷新
         # 后 history 里每一条 chat.final 都带 rec_id，被渲染成多张推荐卡片（bug）。
         # "最后一个"要等流结束才能确定，故缓存话术轮候选、流末补落。
-        is_proactive_request = bool(
-            request.params.get("source") == "proactive_recommendation"
-        )
+        # Proactive recommendation engine removed; never inject recommendation cards.
+        is_proactive_request = False
         proactive_pending_final: dict[str, Any] | None = None
         # 自上一个 chat.final 以来是否出现过 chat.tool_call（用于识别工具轮总结 final）。
         saw_proactive_tool_call_since_final = False
@@ -6099,6 +6177,14 @@ class JiuWenSwarm:
         if unload is None:
             return
         await unload(kind, package_id)
+
+    async def _prepare_live_plugin_replacement(self, package_id: str) -> Any:
+        """Detach idle plugins and retain a rollback for all live selections."""
+        adapter = getattr(self, "_adapter", None)
+        prepare = getattr(adapter, "prepare_plugin_replacement", None)
+        if prepare is not None:
+            return await prepare(package_id)
+        return None
 
     async def compress_context(
             self,

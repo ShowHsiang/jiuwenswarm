@@ -7,6 +7,7 @@ import {
 } from './features/multiModelCollaboration/featureConfig';
 import { ApplicationConversationRuntimes } from './applicationPlugins/ApplicationConversationRuntimes';
 import { AssetPublishHost } from './components/AssetPublishDrawer';
+import { PluginReplacementDialog } from './components/ConnectorMarket/PluginReplacementDialog';
 import { isEnterprise, ENTERPRISE_HIDDEN_NAV_ITEMS, PERSONAL_HIDDEN_NAV_ITEMS } from './edition';
 import { isTeamSessionLive, retainBubblesArrivedDuringHistory } from './services/sessionLive';
 // Copyright (c) Huawei Technologies Co., Ltd. 2025-2026. All rights reserved.
@@ -45,6 +46,7 @@ import {
   markCronOptimisticProcessing,
   shouldKeepLocalCronProcessing,
 } from './features/cron/cronProcessingGuard';
+import { maySnapshotRelightProcessing } from './features/interruptSettleGuard';
 import { mergeCronRunUserSeed } from './features/cron/cronSeedMessage';
 import HeartbeatPanel from './components/HeartbeatPanel';
 import { ToolPanel } from './components/ToolPanel';
@@ -59,6 +61,7 @@ import {
   SETTINGS_MODULE_NAVIGATION_EVENT,
   requestSettingsModule,
   type SettingsModuleTarget,
+  type SettingsNavigationTarget,
 } from './features/settings/settingsNavigation';
 import { ConnectorMarketPanel } from './components/ConnectorMarket';
 import { LoginDialog } from './components/LoginDialog';
@@ -575,9 +578,7 @@ function AppContent({
   const [restartSeenDisconnect, setRestartSeenDisconnect] = useState(false);
   const [appliedWithoutRestart, setAppliedWithoutRestart] = useState(false);
   const [saveToastVisible, setSaveToastVisible] = useState(false);
-  const [proactiveToastVisible, setProactiveToastVisible] = useState(false);
   const [authToastVisible, setAuthToastVisible] = useState(false);
-  const [proactiveToastMessage, setProactiveToastMessage] = useState('');
   const [securityAlertVisible, setSecurityAlertVisible] = useState(false);
   const [securityAlertContent, setSecurityAlertContent] = useState('');
   const [externalCliInstallStatuses, setExternalCliInstallStatuses] = useState<ExternalCliInstallStatuses>({});
@@ -596,7 +597,7 @@ function AppContent({
     useState<Partial<Record<ExternalCliAgentKind, ExternalCliDetectResult>>>({});
   const [hasVisitedSkills, setHasVisitedSkills] = useState(false);
   const [hasVisitedPersonalContext, setHasVisitedPersonalContext] = useState(false);
-  const [requestedSettingsModuleId, setRequestedSettingsModuleId] = useState<SettingsModuleTarget | null>(null);
+  const [requestedSettingsNavigation, setRequestedSettingsNavigation] = useState<SettingsNavigationTarget | null>(null);
   const {
     isMobile,
     isToolPanelAutoHideViewport,
@@ -634,7 +635,8 @@ function AppContent({
     if (activeNav === 'chat') {
       const { defaultModelName, setSelectedModelName } = useSessionStore.getState();
       const runtime = useSessionStore.getState().getRuntime(sessionId);
-      if (defaultModelName && !runtime?.selectedModelName) {
+      const missingModelName = Boolean(defaultModelName && !runtime?.selectedModelName);
+      if (missingModelName && !runtime?.selectedModelSelection) {
         useSessionStore.getState().ensureRuntime(sessionId);
         setSelectedModelName(sessionId, defaultModelName);
       }
@@ -669,18 +671,18 @@ function AppContent({
   }, []);
 
   useEffect(() => {
+    if (isJiuwenMate) return;
     const handler = (event: Event) => {
-      const moduleId = (event as CustomEvent<SettingsModuleTarget>).detail;
-      setRequestedSettingsModuleId(moduleId);
+      const target = (event as CustomEvent<SettingsModuleTarget | SettingsNavigationTarget>).detail;
+      setRequestedSettingsNavigation(typeof target === 'string' ? { moduleId: target } : target);
       setActiveNav('settings');
     };
     window.addEventListener(SETTINGS_MODULE_NAVIGATION_EVENT, handler);
     return () => window.removeEventListener(SETTINGS_MODULE_NAVIGATION_EVENT, handler);
-  }, []);
+  }, [isJiuwenMate]);
 
   const restartAutoCloseTimerRef = useRef<number | null>(null);
   const saveToastTimerRef = useRef<number | null>(null);
-  const proactiveToastTimerRef = useRef<number | null>(null);
   const authToastTimerRef = useRef<number | null>(null);
   const settingsHasChangesRef = useRef(false);
   const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
@@ -709,6 +711,11 @@ function AppContent({
   }), []);
   const sessionRestoreQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sessionMetadataRequestsRef = useRef(new Map<string, Promise<Session | null>>());
+  // 断线重连后的首次元数据快照允许纠正运行态：断线期间终态事件可能已经丢失。
+  // 其余场景下快照只能把运行态拉起来，不能把正在跑的轮次压回空闲——worker 的
+  // 运行态快照会滞后于事件流，用滞后快照回落会让发送按钮和任务转圈闪回空闲
+  // （#6196 新建会话首条消息、#6154 code 模式首条消息空白、#6155 切回会话不转圈）。
+  const metadataDowngradeAllowedRef = useRef(new Set<string>());
   const sessionViewIdRef = useRef(generateUuidV4());
   const inputIntentSessionRef = useRef<string | null>(null);
   const historyLoadingSessionsRef = useRef(new Set<string>());
@@ -1284,9 +1291,6 @@ function AppContent({
   const clearTodos = useTodoStore((s) => s.clearTodos);
   const extensionReady = useHarnessStore((s) => s.runtimes[sessionId]?.extensionReady ?? null);
   const resetHarnessStore = useHarnessStore((s) => s.reset);
-  const proactiveNotificationMessage = useHarnessStore((s) => s.proactiveNotificationMessage);
-  const setProactiveNotification = useHarnessStore((s) => s.setProactiveNotification);
-
   const isElectron = Boolean(window.jiuwenDesktop?.isElectron);
   const toolPanelHasContent = useMemo(() => {
     // Electron 下工具面板始终可达（内置浏览器页签等桌面能力），但新建会话首页
@@ -2083,22 +2087,36 @@ function AppContent({
         const localProcessing = Boolean(
           useChatStore.getState().getRuntime(targetSessionId)?.isProcessing,
         );
+        // A pause/cancel ack just settled this turn; the worker snapshot can
+        // lag the teardown (bug1112: pause ack + stale snapshot re-lit the
+        // stop button in a loop). Ignore a busy snapshot until a new round
+        // starts (user send / processing_status(true) clears the marker).
+        const interruptSettled = useChatStore.getState()
+          .getRuntime(targetSessionId)?.interruptSettledEpoch != null;
         const trackedLastRun = Object.values(useCronStore.getState().lastRunSessionId).includes(
           targetSessionId,
         );
-        if (!shouldKeepLocalCronProcessing(
-          targetSessionId,
-          session.is_processing,
-          localProcessing,
-          {
+        const allowDowngrade = metadataDowngradeAllowedRef.current.delete(targetSessionId);
+        const locallyBusy = Boolean(
+          useChatStore.getState().getRuntime(targetSessionId)?.foregroundIsProcessing,
+        );
+        // 快照只能把运行态拉起来，把运行态打回空闲只认终态事件
+        // （processing_status(false) / chat.final / interrupt），或断线重连后的首次
+        // 快照（断线期间终态事件可能丢失）。worker 运行态快照会滞后于事件流，
+        // 用它回落会让新建会话首条消息和切回会话的运行态闪回空闲。
+        const metadataMaySettleProcessing = session.is_processing || allowDowngrade || !locallyBusy;
+        if (
+          metadataMaySettleProcessing
+          && maySnapshotRelightProcessing(session.is_processing, interruptSettled, allowDowngrade)
+          && !shouldKeepLocalCronProcessing(targetSessionId, session.is_processing, localProcessing, {
             // 统一会话未必 cron_ 前缀，靠 cron_id / lastRun 放行
             hasCronMetadata: Boolean(session.cron_id) || trackedLastRun,
             // 组织负责人停止是权威空闲，不能被守卫吞掉
             authoritativeIdle:
               session.organization_owner_stopped === true
               || isOrganizationOwnerStopped(targetSessionId),
-          },
-        )) {
+          })
+        ) {
           setProcessing(targetSessionId, session.is_processing);
           if (!session.is_processing) {
             setThinking(targetSessionId, false);
@@ -2303,13 +2321,6 @@ function AppContent({
     }
   }, []);
 
-  const clearProactiveToastTimer = useCallback(() => {
-    if (proactiveToastTimerRef.current != null) {
-      window.clearTimeout(proactiveToastTimerRef.current);
-      proactiveToastTimerRef.current = null;
-    }
-  }, []);
-
   const showSaveToast = useCallback(() => {
     setSaveToastVisible(true);
     clearSaveToastTimer();
@@ -2387,6 +2398,7 @@ function AppContent({
       cli_agent: ExternalCliAgentKind;
       status: "ok" | "warning" | "missing" | "unsupported" | "unavailable";
       path?: string;
+      builtin_path?: string;
       version?: string;
       reference_version?: string;
       message?: string;
@@ -2592,22 +2604,8 @@ function AppContent({
     return () => {
       clearRestartAutoCloseTimer();
       clearSaveToastTimer();
-      clearProactiveToastTimer();
     };
-  }, [clearProactiveToastTimer, clearRestartAutoCloseTimer, clearSaveToastTimer]);
-
-  useEffect(() => {
-    const message = proactiveNotificationMessage?.trim();
-    if (!message) return;
-    setProactiveToastMessage(message);
-    setProactiveToastVisible(true);
-    clearProactiveToastTimer();
-    proactiveToastTimerRef.current = window.setTimeout(() => {
-      setProactiveToastVisible(false);
-      setProactiveNotification(null);
-      proactiveToastTimerRef.current = null;
-    }, 8000);
-  }, [clearProactiveToastTimer, proactiveNotificationMessage, setProactiveNotification]);
+  }, [clearRestartAutoCloseTimer, clearSaveToastTimer]);
 
   const fetchConfigRef = useRef(fetchConfig);
   fetchConfigRef.current = fetchConfig;
@@ -2667,10 +2665,18 @@ function AppContent({
     };
   }, [initialDataLoaded, isConnected, loadProjects]);
 
+  // 记录连接状态跃迁：断线期间终态事件可能丢失，重连后允许用一次元数据快照
+  // 把残留的运行态纠正回空闲。
+  const prevConnectedRef = useRef(isConnected);
   useEffect(() => {
+    const reconnected = isConnected && prevConnectedRef.current === false;
+    prevConnectedRef.current = isConnected;
     if (!isConnected || !routeSessionId) {
       setMissingSessionId(null);
       return;
+    }
+    if (reconnected) {
+      metadataDowngradeAllowedRef.current.add(routeSessionId);
     }
     void loadSessionMetadata(routeSessionId);
   }, [isConnected, loadSessionMetadata, routeSessionId]);
@@ -4235,12 +4241,14 @@ function AppContent({
     [handleRestoreSession, mode, request],
   );
 
-  const confirmLeaveSettings = useCallback((): boolean => {
-    if (activeNav !== 'settings' || !settingsHasChangesRef.current) {
-      return true;
-    }
-    return window.confirm(t('settingsPanel.dialog.discardConfirm'));
-  }, [activeNav, t]);
+  const confirmDiscardSettings = useCallback(
+    () => !settingsHasChangesRef.current || window.confirm(t('settingsPanel.dialog.discardConfirm')),
+    [t],
+  );
+  const confirmLeaveSettings = useCallback(
+    () => activeNav !== 'settings' || confirmDiscardSettings(),
+    [activeNav, confirmDiscardSettings],
+  );
 
   const handleSelectDesignSession = useCallback((project: ProjectInfo, nextSessionId: string) => {
     if (!confirmLeaveSettings()) {
@@ -4350,7 +4358,7 @@ function AppContent({
       else closeSidebarPeek();
       // 创建对话框信号一次性消费：归零避免携带旧 nonce 重进实验页时误开对话框
       setRsiOpenCreateNonce(0);
-      if (nav !== 'settings') setRequestedSettingsModuleId(null);
+      if (nav !== 'settings') setRequestedSettingsNavigation(null);
       setActiveNav(nav);
       if (nav === 'chat') {
         if (route.kind === 'group-chat') navigate({ kind: 'chat-new' });
@@ -4361,7 +4369,7 @@ function AppContent({
         }
       }
       if (modelSetupGuideStep === 1 && nav === 'settings') {
-        setRequestedSettingsModuleId('models');
+        setRequestedSettingsNavigation({ moduleId: 'models' });
         setModelSetupGuideStep(2);
       }
       if (nav === 'agents') setHasVisitedAgents(true);
@@ -4383,7 +4391,7 @@ function AppContent({
       modelSetupGuideStep,
       setSingleAgentPanelExpanded,
       setHasVisitedPersonalContext,
-      setRequestedSettingsModuleId,
+      setRequestedSettingsNavigation,
       setTeamAreaExpanded,
       setToolPanelHidden,
     ],
@@ -4734,7 +4742,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
   useEffect(() => {
     promptSuggestionBox.setEnabled(normalizeConfigBoolean(serverConfig?.prompt_suggestion_enabled));
   }, [promptSuggestionBox.setEnabled, serverConfig?.prompt_suggestion_enabled]);
-  const renderJiuwenMateExistingPage = (nav: JiuwenMateExistingPage) => {
+  const renderJiuwenMateExistingPage = (nav: JiuwenMateExistingPage, settingsNavigation?: SettingsNavigationTarget) => {
     if (nav === 'agents') {
       return (
         <div className="app-section min-h-0">
@@ -4846,7 +4854,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
           onExternalCliPendingChoicesChange={setExternalCliPendingChoices}
           externalCliDetectResults={externalCliDetectResults}
           onExternalCliDetectResultsChange={setExternalCliDetectResults}
-          initialModuleId={requestedSettingsModuleId ?? undefined}
+          initialModuleId={settingsNavigation?.moduleId}
+          navigationTarget={settingsNavigation}
         />
       </div>
     );
@@ -4864,12 +4873,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
           onSelectGroup={(groupId) => navigate(groupId ? { kind: 'group-chat', groupId } : { kind: 'chat-new' })}
           renderExistingPage={renderJiuwenMateExistingPage}
           useInstalledExpertRef={openInstalledExpertRef}
-          confirmDiscardSettings={() => {
-            if (!settingsHasChangesRef.current) return true;
-            if (!window.confirm(t('settingsPanel.dialog.discardConfirm'))) return false;
-            setRequestedSettingsModuleId(null);
-            return true;
-          }}
+          confirmDiscardSettings={confirmDiscardSettings}
         />
         <LoginDialog />
       </>
@@ -5279,7 +5283,8 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
               onExternalCliPendingChoicesChange={setExternalCliPendingChoices}
               externalCliDetectResults={externalCliDetectResults}
               onExternalCliDetectResultsChange={setExternalCliDetectResults}
-              initialModuleId={requestedSettingsModuleId ?? undefined}
+              initialModuleId={requestedSettingsNavigation?.moduleId}
+              navigationTarget={requestedSettingsNavigation ?? undefined}
               sidebar={{
                 isActive: activeNav === 'settings',
                 collapsed: isSettingsNarrowViewport,
@@ -5370,17 +5375,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
         <div className="app-toast-wrapper app-toast-wrapper--top-center" data-testid="app-auth-toast">
           <div className="app-session-toast animate-rise" data-testid="app-auth-toast-message">
             {t('auth.huawei.loginSuccessToast')}
-          </div>
-        </div>
-      )}
-
-      {proactiveToastVisible && proactiveToastMessage && (
-        <div className="app-toast-wrapper app-toast-wrapper--top-center" data-testid="app-proactive-notification-toast">
-          <div
-            className="max-w-[640px] whitespace-pre-line bg-warn-subtle text-warn px-4 py-3 rounded-lg shadow-lg animate-rise text-sm leading-5"
-            data-testid="app-proactive-notification-toast-message"
-          >
-            {proactiveToastMessage}
           </div>
         </div>
       )}
@@ -5483,6 +5477,7 @@ function App({
         resolveSettingsRequest={resolveSettingsRequest}
       />
       <AssetPublishHost />
+      <PluginReplacementDialog />
     </ErrorBoundary>
   );
 }
