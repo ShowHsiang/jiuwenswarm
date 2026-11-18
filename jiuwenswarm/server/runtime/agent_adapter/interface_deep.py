@@ -17262,15 +17262,14 @@ class JiuWenSwarmDeepAdapter:
             raise RootPermissionQueueError("permission_dispatch_handoff_missing")
         stream = None
         try:
-            # Plain interrupt rounds finish their output before a resume starts.
+            # Ordinary and Smart interrupt answers wait for the old reader.
             # An ACK-only inject into a lease with EOF already queued can lose
-            # all resumed output. Goal readers and permission-queue callbacks
-            # remain live owners and must keep their existing injection path.
+            # all resumed output. Active Goal readers keep their live-owner
+            # injection path instead of waiting for a stream that stays open.
             previous = getattr(self, "_interaction_output_handoff", None)
             if previous is not None and previous.owner is self._instance:
                 if (
                     self._is_interrupt_resume_dispatch(request.params)
-                    and answer is None
                     and not self._goal_record_is_active()
                 ):
                     await previous.wait()
@@ -18260,9 +18259,9 @@ class JiuWenSwarmDeepAdapter:
             if refresh_warnings:
                 receipt = {**receipt, "refresh_warnings": refresh_warnings}
         return {
-            "accepted": True,
-            "resolved": True,
             **receipt,
+            "accepted": bool(receipt.get("installed")),
+            "resolved": bool(receipt.get("installed")),
         }
 
     async def handle_swarmflow_reply(self, request: AgentRequest) -> AgentResponse:
