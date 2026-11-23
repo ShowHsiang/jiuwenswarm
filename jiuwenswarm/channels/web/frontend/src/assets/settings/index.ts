@@ -6,7 +6,6 @@ import BrowserIcon from './navigation/browser.svg?react';
 import ChannelsIcon from './navigation/channels.svg?react';
 import PersonalContextIcon from './navigation/personal-context.svg?react';
 import ExperimentalIcon from './navigation/experimental.svg?react';
-import AppearanceIcon from './navigation/appearance.svg?react';
 import RefreshIcon from './actions/refresh.svg?react';
 import ConnectivityIcon from './actions/connectivity.svg?react';
 import EditIcon from './actions/edit.svg?react';
@@ -33,7 +32,6 @@ export const settingsNavigationIcons = {
   channels: ChannelsIcon,
   personalContext: PersonalContextIcon,
   experimental: ExperimentalIcon,
-  appearance: AppearanceIcon,
 } as const satisfies Record<string, SettingsNavigationIcon>;
 
 export const settingsActionIcons = {

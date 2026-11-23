@@ -649,21 +649,74 @@ def test_agent_ws_resuming_tool_interrupt_recognizes_evolution_interrupt_approva
     assert not is_interrupt_resume_payload(passive_params)
 
 
-def test_build_inputs_maps_team_plan_confirm_interrupt_answers_to_interactive_input(monkeypatch):
+@pytest.fixture(
+    params=[
+        pytest.param(
+            ("Approve", "", {"approved": True, "auto_confirm": False, "feedback": ""}),
+            id="tui-approve",
+        ),
+        pytest.param(
+            (
+                "plan_execute",
+                "",
+                {"approved": True, "auto_confirm": False, "feedback": "", "plan_execute": True},
+            ),
+            id="execute",
+        ),
+        pytest.param(
+            (
+                "plan_skip",
+                "",
+                {
+                    "approved": False,
+                    "auto_confirm": False,
+                    "feedback": "用户选择跳过本次计划审批，暂不执行，也未提出修改意见。",
+                    "plan_skip": True,
+                },
+            ),
+            id="skip",
+        ),
+        pytest.param(
+            (
+                "plan_revise",
+                "把任务拆得再细一点",
+                {
+                    "approved": False,
+                    "auto_confirm": False,
+                    "feedback": "把任务拆得再细一点",
+                    "plan_revise": True,
+                },
+            ),
+            id="revise",
+        ),
+    ],
+)
+def team_plan_approval_answer(request):
+    """Cover Web plan actions while retaining the TUI approval contract."""
+    return request.param
+
+
+@pytest.mark.parametrize("mode", ["team.work.plan", "team.code.plan"])
+def test_build_inputs_maps_team_plan_confirm_interrupt_answers_to_interactive_input(
+    monkeypatch,
+    mode,
+    team_plan_approval_answer,
+):
     from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
     from jiuwenswarm.server.runtime.agent_adapter import interface as interface_module
 
     monkeypatch.setattr(interface_module, "get_config", lambda: {"preferred_language": "zh"})
     monkeypatch.setattr(interface_module, "get_memory_mode", lambda _config: "disabled")
 
-    answers = [{"selected_options": ["Approve"], "custom_input": ""}]
+    selected_option, custom_input, expected_payload = team_plan_approval_answer
+    answers = [{"selected_options": [selected_option], "custom_input": custom_input}]
     request = AgentRequest(
         request_id="req-answer",
         channel_id="tui",
         session_id="team-session",
         params={
             "query": "",
-            "mode": "team.plan",
+            "mode": mode,
             "request_id": "exit_plan_mode_call_1",
             "answers": answers,
             "source": "confirm_interrupt",
@@ -677,16 +730,13 @@ def test_build_inputs_maps_team_plan_confirm_interrupt_answers_to_interactive_in
 
     assert isinstance(inputs["query"], InteractiveInput)
     assert inputs["query"].user_inputs == {
-        "exit_plan_mode_call_1": {
-            "approved": True,
-            "auto_confirm": False,
-            "feedback": "",
-        }
+        "exit_plan_mode_call_1": expected_payload,
     }
     assert raw_query.text is inputs["query"]
 
 
-def test_build_inputs_maps_team_plan_reject_answers_to_interactive_input(monkeypatch):
+@pytest.mark.parametrize("mode", ["team.plan", "team.work.plan", "team.code.plan"])
+def test_build_inputs_maps_team_plan_reject_answers_to_interactive_input(monkeypatch, mode):
     from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
     from jiuwenswarm.server.runtime.agent_adapter import interface as interface_module
 
@@ -699,7 +749,7 @@ def test_build_inputs_maps_team_plan_reject_answers_to_interactive_input(monkeyp
         session_id="team-session",
         params={
             "query": "",
-            "mode": "team.plan",
+            "mode": mode,
             "request_id": "exit_plan_mode_call_1",
             "answers": [{"selected_options": ["Reject"], "custom_input": "把任务拆得再细一点"}],
             "source": "confirm_interrupt",
@@ -845,7 +895,12 @@ def test_build_inputs_drops_bare_other_without_custom_input(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_answer_routes_team_plan_confirm_interrupt_to_adapter(monkeypatch):
+@pytest.mark.parametrize("mode", ["team.work.plan", "team.code.plan"])
+async def test_chat_answer_routes_team_plan_confirm_interrupt_to_adapter(
+    monkeypatch,
+    mode,
+    team_plan_approval_answer,
+):
     from jiuwenswarm.server.runtime.agent_adapter import interface as interface_module
 
     class FakeAdapter:
@@ -865,6 +920,7 @@ async def test_chat_answer_routes_team_plan_confirm_interrupt_to_adapter(monkeyp
     fake_adapter = FakeAdapter()
     monkeypatch.setattr(interface_module, "create_adapter", lambda _sdk, mode="agent": fake_adapter)
 
+    selected_option, custom_input, _expected_payload = team_plan_approval_answer
     request = AgentRequest(
         request_id="req-answer",
         req_method=ReqMethod.CHAT_ANSWER,
@@ -872,9 +928,9 @@ async def test_chat_answer_routes_team_plan_confirm_interrupt_to_adapter(monkeyp
         session_id="team-session",
         params={
             "query": "",
-            "mode": "team.plan",
+            "mode": mode,
             "request_id": "exit_plan_mode_call_1",
-            "answers": [{"selected_options": ["Approve"], "custom_input": ""}],
+            "answers": [{"selected_options": [selected_option], "custom_input": custom_input}],
             "source": "confirm_interrupt",
             "plan_approval_kind": "plan_approval",
             "plan_content": "# Team Plan",
@@ -890,8 +946,11 @@ async def test_chat_answer_routes_team_plan_confirm_interrupt_to_adapter(monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["team.work.plan", "team.code.plan"])
 async def test_process_message_stream_routes_team_plan_confirm_interrupt_as_team_follow_up(
     monkeypatch,
+    mode,
+    team_plan_approval_answer,
 ):
     from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
     from jiuwenswarm.server.runtime.agent_adapter import interface as interface_module
@@ -950,15 +1009,16 @@ async def test_process_message_stream_routes_team_plan_confirm_interrupt_as_team
         lambda _channel_id: FakeTeamManager(),
     )
 
+    selected_option, custom_input, expected_payload = team_plan_approval_answer
     request = AgentRequest(
         request_id="req-stream-answer",
         channel_id="tui",
         session_id="team-session",
         params={
             "query": "",
-            "mode": "team.plan",
+            "mode": mode,
             "request_id": "exit_plan_mode_call_1",
-            "answers": [{"selected_options": ["Approve"], "custom_input": ""}],
+            "answers": [{"selected_options": [selected_option], "custom_input": custom_input}],
             "source": "confirm_interrupt",
             "plan_approval_kind": "plan_approval",
             "plan_content": "# Team Plan",
@@ -975,7 +1035,8 @@ async def test_process_message_stream_routes_team_plan_confirm_interrupt_as_team
     assert FakeSessionManager.submit_task_calls == []
     assert len(FakeTeamManager.interact_calls) == 0
     assert isinstance(fake_adapter.seen_inputs["query"], InteractiveInput)
-    assert fake_adapter.seen_inputs["query"].user_inputs["exit_plan_mode_call_1"]["approved"] is True
+    assert fake_adapter.seen_inputs["query"].user_inputs == {"exit_plan_mode_call_1": expected_payload}
+    assert request.params["mode"] == mode
     assert chunks[0].payload == {"event_type": "chat.done"}
     assert chunks[0].is_complete is True
     assert chunks[-1].is_complete is True
@@ -2825,7 +2886,8 @@ async def test_deep_adapter_unregisters_ttse_rail_when_disabled(monkeypatch):
     assert adapter._instance.unregistered == [ttse_rail]
 
 
-def test_build_ttse_rail_uses_workspace_bank_path_and_fixed_dream(monkeypatch, tmp_path):
+@pytest.mark.parametrize("model_available", [True, False])
+def test_build_ttse_rail_uses_workspace_bank_path_and_fixed_dream(monkeypatch, tmp_path, model_available):
     captured: dict[str, object] = {}
     fake_processor = object()
     tenant_ws = tmp_path / "tenant_ws"
@@ -2852,8 +2914,9 @@ def test_build_ttse_rail_uses_workspace_bank_path_and_fixed_dream(monkeypatch, t
 
     adapter = interface_deep_module.JiuWenSwarmDeepAdapter()
     adapter._workspace_dir = str(tenant_ws)
-    adapter._model = Mock()
-    adapter._default_model_name = "test-model"
+    adapter._model = Mock(model_config=None) if model_available else None
+    adapter._model_request_config = Mock(model_name="test-model")
+    adapter._default_model_name = "model:mdl_internal"
 
     rail = adapter._build_ttse_rail(
         {
@@ -2884,6 +2947,31 @@ def test_build_ttse_rail_uses_workspace_bank_path_and_fixed_dream(monkeypatch, t
     assert induce_policy.total_budget_secs == 300.0
     assert captured["rail"]["model"] == "test-model"
     assert captured["rail"]["trajectory_span_processor"] is fake_processor
+
+
+@pytest.mark.parametrize("model_available", [True, False])
+def test_ttse_hot_reload_uses_current_client_model_name(monkeypatch, model_available):
+    adapter = interface_deep_module.JiuWenSwarmDeepAdapter()
+    adapter._ttse_rail = Mock()
+    adapter._skill_evolution_rail = None
+    adapter._skill_rail = None
+    adapter._heartbeat_rail = Mock()
+    adapter._permission_state.permission_update_in_progress = True
+    monkeypatch.setattr(adapter, "_build_skill_rail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(adapter, "_filesystem_rail_enabled_for_profile", lambda: False)
+
+    for reference, api_model in (
+        ("model:mdl_first", "pool_0024"),
+        ("model:mdl_second", "pool_0025"),
+        ("model:mdl_missing_config", "unknown"),
+    ):
+        adapter._default_model_name = reference
+        adapter._model = Mock(model_config=None) if model_available else None
+        adapter._model_request_config = Mock(model_name=api_model) if api_model != "unknown" else None
+
+        adapter._get_current_agent_rails({"model_name": "stale-model"})
+
+        adapter._ttse_rail.update_llm.assert_called_with(adapter._model, api_model)
 
 
 def test_build_ttse_rail_skips_when_trajectory_processor_unavailable(monkeypatch, tmp_path):

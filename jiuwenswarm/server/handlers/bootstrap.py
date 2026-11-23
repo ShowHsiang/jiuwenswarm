@@ -194,7 +194,6 @@ async def handle_session_create(ctx: RequestContext) -> None:
                 model_selection=params.get("model_selection"),
                 moa_enabled=params.get("moa_enabled"),
                 cron_id=str(params.get("cron_id") or "").strip(),
-                client_app=str(params.get("client_app") or "").strip(),
             )
         )
         params.pop("_work_mode_explicit", None)

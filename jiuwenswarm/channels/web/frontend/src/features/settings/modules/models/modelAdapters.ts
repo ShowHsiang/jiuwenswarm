@@ -5,6 +5,11 @@ import {
   resolveDraftContextWindowTokens,
 } from './contextWindow';
 import {
+  defaultOutputTokens,
+  normalizeOutputTokens,
+  resolveDraftOutputTokens,
+} from './outputTokens';
+import {
   isReasoningLevelSupported,
   parseReasoningCapabilities,
   parseReasoningCatalog,
@@ -29,6 +34,8 @@ export type ModelDraft = {
   api_base: string;
   reasoning_level: string;
   context_window_tokens: string;
+  max_tokens: string;
+  max_tokens_is_default: boolean;
   is_default: boolean;
 };
 
@@ -42,6 +49,8 @@ const MODEL_DRAFT_FIELDS: readonly (keyof ModelDraft)[] = [
   'api_base',
   'reasoning_level',
   'context_window_tokens',
+  'max_tokens',
+  'max_tokens_is_default',
   'is_default',
 ];
 
@@ -137,15 +146,26 @@ export function findVendorPreset(catalog: VendorPresetMap, selection: string): V
 
 /** Normalize the draft after capabilities load or the model changes; never persist it here. */
 export function reconcileModelReasoning(draft: ModelDraft, catalog: VendorPresetMap): ModelDraft {
+  if (!catalog.reasoning) return draft;
+  if (draft.vendor_selection === CUSTOM_VENDOR_SELECTION) {
+    return draft.reasoning_level ? { ...draft, reasoning_level: '' } : draft;
+  }
   const capability = resolveModelReasoning(
     catalog,
     findVendorPreset(catalog, draft.vendor_selection),
     draft.model_name,
     draft.protocol,
   );
-  return capability && !isReasoningLevelSupported(draft.reasoning_level, capability)
+  return (!capability || !isReasoningLevelSupported(draft.reasoning_level, capability))
     ? { ...draft, reasoning_level: '' }
     : draft;
+}
+
+/** Reconcile only an untouched protocol default when its selected model changes. */
+export function reconcileModelOutputTokens(draft: ModelDraft): ModelDraft {
+  if (!draft.max_tokens_is_default) return draft;
+  const maxTokens = defaultOutputTokens(draft.protocol, draft.model_name);
+  return draft.max_tokens === maxTokens ? draft : { ...draft, max_tokens: maxTokens };
 }
 
 export function normalizeModelOptions(options: readonly string[]): string[] {
@@ -159,7 +179,10 @@ export function selectProviderDefaultModel(currentModel: string, options: readon
 }
 
 /** Keep display name in sync with model_name until the user customizes it. */
-export function syncDisplayNameWithModelName(draft: ModelDraft, previousModelName: string): ModelDraft {
+export function syncDisplayNameWithModelName<T extends { alias: string; model_name: string }>(
+  draft: T,
+  previousModelName: string,
+): T {
   const nextModelName = draft.model_name.trim();
   const currentAlias = draft.alias.trim();
   const previous = previousModelName.trim();
@@ -190,6 +213,8 @@ export function createModelDraft(model: ModelEntry | undefined, catalog: VendorP
       api_base: '',
       reasoning_level: '',
       context_window_tokens: normalizeContextWindowTokens(DEFAULT_CONTEXT_WINDOW_TOKENS),
+      max_tokens: defaultOutputTokens('openai', ''),
+      max_tokens_is_default: true,
       is_default: false,
     };
   }
@@ -209,6 +234,8 @@ export function createModelDraft(model: ModelEntry | undefined, catalog: VendorP
       api_base: model.api_base,
       reasoning_level: model.reasoning_level ?? '',
       context_window_tokens: contextWindowTokens,
+      max_tokens: normalizeOutputTokens(model.max_tokens),
+      max_tokens_is_default: model.max_tokens === undefined,
       is_default: model.is_default ?? false,
     };
   }
@@ -228,8 +255,12 @@ export function createModelDraft(model: ModelEntry | undefined, catalog: VendorP
     model_input_mode: preset ? 'options' : 'manual',
     api_key: model.api_key,
     api_base: model.api_base,
-    reasoning_level: model.reasoning_level ?? '',
+    reasoning_level: vendorSelection === CUSTOM_VENDOR_SELECTION ? '' : (model.reasoning_level ?? ''),
     context_window_tokens: contextWindowTokens,
+    max_tokens: model.max_tokens === undefined
+      ? defaultOutputTokens(protocol, model.model_name)
+      : normalizeOutputTokens(model.max_tokens),
+    max_tokens_is_default: model.max_tokens === undefined,
     is_default: model.is_default ?? false,
   };
 }
@@ -255,6 +286,7 @@ export function applyVendorSelection(draft: ModelDraft, selection: string, catal
       model_input_mode: 'manual',
       api_key: '',
       api_base: '',
+      reasoning_level: '',
     };
   }
 
@@ -265,7 +297,7 @@ export function applyVendorSelection(draft: ModelDraft, selection: string, catal
     ...draft,
     protocol: anthropic ? 'anthropic' : 'openai',
     vendor_selection: selection,
-    model_name: '',
+    model_name: preset.default_model,
     model_input_mode: 'options',
     api_key: '',
     api_base: anthropic ? (preset.anthropic_base ?? '') : preset.api_base,
@@ -274,11 +306,11 @@ export function applyVendorSelection(draft: ModelDraft, selection: string, catal
 
 export function applyModelProtocol(draft: ModelDraft, protocol: ModelProtocol, catalog: VendorPresetMap): ModelDraft {
   const preset = findVendorPreset(catalog, draft.vendor_selection);
-  return {
+  return reconcileModelOutputTokens({
     ...draft,
     protocol,
     api_base: preset ? (protocol === 'anthropic' ? (preset.anthropic_base ?? '') : preset.api_base) : draft.api_base,
-  };
+  });
 }
 
 export function modelDraftToEntry(
@@ -287,6 +319,7 @@ export function modelDraftToEntry(
   catalog: VendorPresetMap,
   connectionChanged: boolean,
 ): ModelEntry {
+  const normalizedDraft = reconcileModelReasoning(draft, catalog);
   const next: ModelEntry = {
     ...existing,
     alias: draft.alias.trim(),
@@ -294,8 +327,9 @@ export function modelDraftToEntry(
     api_key: draft.api_key.trim(),
     api_base: draft.api_base.trim(),
     model_provider: existing?.model_provider ?? '',
-    reasoning_level: draft.reasoning_level,
+    reasoning_level: normalizedDraft.reasoning_level,
     context_window_tokens: resolveDraftContextWindowTokens(draft.context_window_tokens),
+    max_tokens: resolveModelMaxTokens(draft, existing),
     is_default: draft.is_default,
   };
 
@@ -336,4 +370,16 @@ export function modelDraftToEntry(
 
 export function displayModelProtocol(model: ModelEntry): ModelProtocol {
   return model.model_provider === 'Anthropic' ? 'anthropic' : 'openai';
+}
+
+function resolveModelMaxTokens(draft: ModelDraft, existing: ModelEntry | undefined): number | null | undefined {
+  const maxTokens = resolveDraftOutputTokens(draft.max_tokens);
+  const preservesLegacyAnthropicDefault =
+    existing !== undefined &&
+    existing.max_tokens === undefined &&
+    displayModelProtocol(existing) === 'anthropic' &&
+    draft.protocol === 'anthropic' &&
+    draft.model_name.trim() === existing.model_name.trim() &&
+    draft.max_tokens_is_default;
+  return preservesLegacyAnthropicDefault ? undefined : maxTokens;
 }

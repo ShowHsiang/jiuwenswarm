@@ -526,9 +526,8 @@ class SymphonyOrchestrationRail(DeepAgentRail):
         self, ctx: AgentCallbackContext, state: _SymphonyInvokeState | None,
     ) -> bool:
         """Old model-visible questions cannot create a new server-owned choice."""
-        if state is None or state.scope.capture_mode != "agent":
-            return False
-        if not state.pack_route_checked or self._tool_name(ctx.inputs) != "ask_user":
+        if (state is None or state.scope.capture_mode != "agent" or not state.pack_route_checked
+                or self._tool_name(ctx.inputs) != "ask_user"):
             return False
         args = self._tool_args(ctx.inputs)
         questions = args.get("questions")
@@ -556,9 +555,8 @@ class SymphonyOrchestrationRail(DeepAgentRail):
     ) -> bool:
         """A model retrieving a Pack is not a user's choice to execute it."""
         router = self._skillpack_router
-        if state is None or state.scope.capture_mode != "agent":
-            return False
-        if router is None or self._tool_name(ctx.inputs) != "skill_tool":
+        if (state is None or state.scope.capture_mode != "agent" or router is None
+                or self._tool_name(ctx.inputs) != "skill_tool"):
             return False
         args = self._tool_args(ctx.inputs)
         identifier = str(args.get("skill_name") or args.get("skillName") or "").strip()
@@ -567,9 +565,6 @@ class SymphonyOrchestrationRail(DeepAgentRail):
         try:
             summary = await router.unconfirmed_pack_summary(identifier, session=ctx.session)
         except Exception:
-            logger.warning(
-                "skillpack.read_guard summary_unavailable skill=%s", identifier, exc_info=True,
-            )
             summary = {
                 "success": False, "reason": "skillpack_inventory_unavailable", "retryable": False,
                 "detail": "Cannot verify the Skill type. Do not bypass this check through other file tools.",
@@ -1152,11 +1147,9 @@ class SymphonyOrchestrationRail(DeepAgentRail):
             return
         guidance = []
         state = self._active_state_for_ctx(ctx)
-        if state is not None and state.scope.capture_mode == "agent":
-            # Only a declined offer needs proactive guidance. Stale model
-            # questions receive this detail when the tool guard rejects them.
-            if state.pack_route_declined and state.pack_route is None:
-                guidance.append(_NO_PENDING_PACK_GUIDANCE)
+        if (state is not None and state.scope.capture_mode == "agent"
+                and state.pack_route_checked and state.pack_route is None):
+            guidance.append(_NO_PENDING_PACK_GUIDANCE)
         if self._has_compose_tool(ctx) and self._orchestration_enabled():
             guidance.append(self._build_orchestration_guidance(resumed=self._resume_is_pending(ctx)))
         if not guidance:

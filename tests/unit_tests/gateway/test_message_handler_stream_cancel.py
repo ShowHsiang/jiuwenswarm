@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
-from openjiuwen_protocol.e2a.agent_models import AgentResponseChunk
-from openjiuwen_protocol.e2a.gateway_normalize import e2a_from_agent_fields
-from openjiuwen_protocol.message import ReqMethod
+from e2a.agent_models import AgentResponseChunk
+from e2a.gateway_normalize import e2a_from_agent_fields
+from e2a.message import ReqMethod
 from agent_gateway.message_handler.message_handler import ChannelMode, MessageHandler
 from agent_gateway.routing.session_sharing import SubRole
 
@@ -136,6 +136,7 @@ async def test_permission_resume_releases_hold_independently_of_session_prefix(m
     monkeypatch.setattr("agent_gateway.cron.live_bus.cron_live_bus.clear_session", Mock())
     mark = Mock(wraps=scheduler.mark_permission_resume_succeeded)
     handler.set_cron_controller(SimpleNamespace(mark_permission_resume_succeeded=mark))
+    monkeypatch.setattr(handler, "_sync_agentos_cron_jobs", AsyncMock())
     monkeypatch.setattr(handler, "_apply_session_login_owner", AsyncMock())
     monkeypatch.setattr(handler, "publish_stream_chunk", AsyncMock(return_value=True))
     monkeypatch.setattr(handler, "_publish_stream_error", AsyncMock())

@@ -23,7 +23,9 @@ import {
   type NamedAsset,
 } from '../features/sessionAssets/sessionAssets';
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { registerApplicationQuestionController } from '../applicationPlugins/taskProgressStore';
 import { toast } from '../components/ui/Toast/toastStore';
+import { isSkillPackagePrompt } from '../components/InteractionSlot/promptRouting';
 import { useTranslation } from 'react-i18next';
 import {
   ConnectionAckPayload,
@@ -799,6 +801,11 @@ interface PersistMediaResponse {
 
 function isPersistedMediaItem(item: MediaItem): boolean {
   return typeof item.path === 'string' && item.path.trim().length > 0;
+}
+
+function toChatUploadItem(item: MediaItem): MediaItem {
+  // The document transport persists the original video bytes.
+  return item.type === 'video' ? { ...item, type: 'document' } : item;
 }
 
 function getMediaMimeType(item: MediaItem): string {
@@ -2111,11 +2118,19 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           const attachments: Record<string, unknown> = {};
           let query = content;
           if (mediaItems.length) {
-            const imageItems = mediaItems.filter((item) => item.type !== 'document');
-            const documentItems = mediaItems.filter((item) => item.type === 'document');
+            const persistedVideos = mediaItems.filter((item) => item.type === 'video' && isPersistedMediaItem(item));
+            const uploadItems = mediaItems
+              .filter((item) => item.type !== 'video' || !isPersistedMediaItem(item))
+              .map(toChatUploadItem);
+            const imageItems = uploadItems.filter((item) => item.type !== 'document');
+            const documentItems = uploadItems.filter((item) => item.type === 'document');
             const persisted: PersistMediaResponse = imageItems.length ? await persistMedia(content, sessionId, imageItems) : {};
             const documents: PersistMediaResponse = documentItems.length ? await persistDocuments(content, sessionId, documentItems) : {};
-            const items = [...(persisted.media_items ?? []), ...(documents.media_items ?? [])];
+            const items = [
+              ...(persisted.media_items ?? []),
+              ...(documents.media_items ?? []),
+              ...persistedVideos.map(toPersistedMediaRecord),
+            ];
             attachments.media_items = items;
             attachments.files = { ...persisted.files, ...documents.files };
             query = withUploadDocumentBlock(persisted.content ?? persisted.query ?? content, toUploadDocumentHints(documents.media_items));
@@ -2278,7 +2293,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         flushPendingStreamDelta(sessionId);
         useChatStore.getState().stopStreaming(sessionId);
       }
-      useChatStore.getState().setProcessing(sessionId, true);
+      useChatStore.getState().setProcessing(sessionId, true, { newTurn: true });
       useChatStore.getState().setThinking(sessionId, true);
       // A fresh user send starts a new turn: the previous interrupt settle
       // window no longer applies.
@@ -2306,11 +2321,12 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           const mergedItems: Record<string, unknown>[] = [];
           // 新会话的附件尚未落盘。每次只上传一项，既不触发批量数量限制，
           // 也不把多份大文件的 base64 拼进同一条 WebSocket 消息。
-          for (const item of mediaItems) {
-            if (isPersistedMediaItem(item)) {
-              mergedItems.push(toPersistedMediaRecord(item));
+          for (const mediaItem of mediaItems) {
+            if (isPersistedMediaItem(mediaItem)) {
+              mergedItems.push(toPersistedMediaRecord(mediaItem));
               continue;
             }
+            const item = toChatUploadItem(mediaItem);
             const persist = item.type === 'document' ? persistDocuments : persistMedia;
             const persisted = await persist('', sessionId, [item]);
             const stored = persisted.media_items?.[0];
@@ -2527,7 +2543,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         flushPendingStreamDelta(sessionId);
         useChatStore.getState().stopStreaming(sessionId);
       }
-      useChatStore.getState().setProcessing(sessionId, true);
+      useChatStore.getState().setProcessing(sessionId, true, { newTurn: true });
       useChatStore.getState().setThinking(sessionId, true);
       useChatStore.getState().clearInterruptSettled(sessionId);
 
@@ -2852,6 +2868,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       // 「执行」分支会在请求发出前先乐观地关掉 Plan 开关并登记补发标记，失败时要撤回。
       let planExecuteOptimistic = false;
       let pendingAgentGroupId: string | undefined;
+      const skillPackageRequest = requestId.startsWith('symphony_experience_');
       try {
         const pendingQuestion = useChatStore.getState().getRuntime(sessionId)?.pendingQuestions[0];
         const pendingMatches = pendingQuestion?.request_id === requestId;
@@ -3047,7 +3064,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           useHarnessStore.getState().setActivateInteraction(sessionId, null);
         } else {
           // 否则发送 chat.user_answer（自进化确认）
-          await request('chat.user_answer', {
+          const receipt = await request<Record<string, unknown> | undefined>('chat.user_answer', {
             session_id: sessionId,
             ...getSessionWorkContext(sessionId),
             request_id: requestId,
@@ -3056,7 +3073,25 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             ...interruptPayload,
             ...approvalSchemaPayload,
             ...evolutionMetaPayload,
-          });
+          }, skillPackageRequest ? { awaitUserAnswerResult: true, timeoutMs: 120000 } : undefined);
+          if (isSkillPackagePrompt({ request_id: requestId, questions: [], evolutionMeta }) && (
+            receipt?.accepted === false || receipt?.resolved === false ||
+            (receipt?.installed === false && receipt?.deferred !== true)
+          )) {
+            toast.open({
+              id: `skill-package-answer-${sessionId}-${requestId}`,
+              content: t(receipt?.reason === 'skill_already_exists'
+                ? 'skillPackagePrompt.nameConflict'
+                : 'skillPackagePrompt.createFailed'),
+              variant: 'error',
+              duration: 8,
+              testId: 'interaction-slot-skill-package-error',
+            });
+            return false;
+          }
+          if (skillPackageRequest && typeof receipt?.resolved !== 'boolean') {
+            throw new Error(t('skillPackagePrompt.resultUnavailable'));
+          }
         }
         if (effectiveSource === 'ask_user_interrupt') {
           // 后端快照可能仍带着这道题，恢复执行时会重新派发；登记后不再入队。
@@ -3077,12 +3112,23 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (pendingAgentGroupId) {
           clearFailedAgentGroupBinding(sessionId, pendingAgentGroupId);
         }
+        if (skillPackageRequest) {
+          toast.open({
+            id: `skill-package-answer-${sessionId}-${requestId}`,
+            content: t('skillPackagePrompt.resultUnavailable'),
+            variant: 'error',
+            duration: 8,
+            testId: 'interaction-slot-skill-package-error',
+          });
+        }
         onErrorRef.current?.(webError.message || t('network.submitAnswerFailed'));
         return false;
       }
     },
     [clearFailedAgentGroupBinding, markPendingAgentGroupBinding, reconcileAgentGroupBinding, request, t]
   );
+
+  useEffect(() => registerApplicationQuestionController(sendUserAnswer), [sendUserAnswer]);
 
   const respondActivate = useCallback(
     async (sessionId: string, interactionId: string, action: 'accept' | 'reject', feedback?: string) => {
@@ -4786,7 +4832,20 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
       // 归档相关事件：集中在此分发，刷新活跃工作区数据（项目/会话/置顶）；
       // 归档管理页自行订阅同名事件刷新归档列表。项目归档事件已随协议移除。
       // 事件可能早于响应到达，去抖合并后按当前状态幂等刷新。
-      webClient.on<ArchiveResourceEventPayload>('session.archived', () => {
+      webClient.on<ArchiveResourceEventPayload>('session.archived', ({ payload }) => {
+        const sessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
+        if (sessionId) {
+          // Archive stops a live turn in the backend without terminal wire
+          // frames. Settle the local runtime here so an undo/restore in this
+          // tab does not resume a phantom "processing" turn (GitCode #6533).
+          useChatStore.getState().settleLifecycleStoppedSession(sessionId);
+          const sessionPatch: Partial<Session> = {
+            is_processing: false,
+            updated_at: new Date().toISOString(),
+          };
+          updateSession(sessionId, sessionPatch);
+          useWorkspaceStore.getState().patchSession(sessionId, sessionPatch);
+        }
         scheduleArchiveWorkspaceRefresh(false);
       }),
       webClient.on<ArchiveResourceEventPayload>('session.unarchived', () => {
@@ -4823,6 +4882,11 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (handleTaskInputReceipt('chat.processing_status', payload)) return;
         const sessionId = resolveEventSessionId(payload);
         if (!sessionId) return;
+        const recoveryRevision = payload.runtime_recovery_revision;
+        if (
+          typeof recoveryRevision === 'number' &&
+          (useChatStore.getState().getRuntime(sessionId)?.turnRevision ?? 0) !== recoveryRevision
+        ) return;
         if (shouldDropDuplicatedEvent('chat.processing_status', payload)) return;
         // 主动推荐来源的 processing_status 不参与会话级状态机：它不该拉起/打断
         // 用户轮的 processing，更不该触发 setThinking/stopStreaming/taskQueue 自动排空。
@@ -4902,6 +4966,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
           )) {
           return;
         }
+        const localSendPending = isProcessingNow && localSendPendingRef.current.has(sessionId);
         // 后端确认 processing=true 时清除本地发送标记——新任务已由后端接管
         if (isProcessingNow) {
           localSendPendingRef.current.delete(sessionId);
@@ -4919,8 +4984,14 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
         if (!isProcessingNow) {
           flushPendingStreamDelta(sessionId);
         }
-        useChatStore.getState().setProcessing(sessionId, isProcessingNow);
         const processingRequestId = getPayloadRequestId(payload);
+        // An accepted foreground start can replace a still-busy turn. The
+        // local send has already advanced its own revision.
+        const marker = payload.runtime_event;
+        const newTurn = isProcessingNow && !localSendPending && recoveryRevision === undefined &&
+          (!isRecord(marker) || marker.replayed !== true) && processingRequestId !== undefined &&
+          processingRequestId !== processingRequestIdsRef.current.get(sessionId);
+        useChatStore.getState().setProcessing(sessionId, isProcessingNow, { newTurn });
         if (isProcessingNow && processingRequestId) {
           processingRequestIdsRef.current.set(sessionId, processingRequestId);
         }
@@ -5379,7 +5450,7 @@ export function useWebSocket(options: UseWebSocketOptions): UseWebSocketReturn {
             // 直接设置所有状态值
             if (hasActiveTask) {
               useChatStore.getState().setPaused(sessionId, false);
-              useChatStore.getState().setProcessing(sessionId, true);
+              useChatStore.getState().setProcessing(sessionId, true, { newTurn: true });
               useChatStore.getState().setThinking(sessionId, true);
             } else {
               useChatStore.getState().setPaused(sessionId, false);

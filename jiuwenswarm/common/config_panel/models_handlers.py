@@ -50,7 +50,6 @@ from jiuwenswarm.common.kv_cache_affinity_config import (
 )
 from jiuwenswarm.common.model_catalog import ModelCatalog
 from jiuwenswarm.common.model_config_validation import probe_model_connection, raise_if_invalid
-from jiuwenswarm.common.model_error_messages import user_facing_model_error
 from jiuwenswarm.common.model_errors import ModelSelectionError
 from jiuwenswarm.common.reasoning_config import (
     effective_endpoint_profile,
@@ -153,7 +152,8 @@ def resolve_model_config_obj_for_validate(
     按 ``model_name`` 或 ``alias`` 匹配 ``models.defaults`` 中的条目，
     返回该条目的 ``model_config_obj``；找不到或读取失败时 fallback 到
     空字典（让模型使用自身默认参数，避免 ``temperature=0`` 对部分
-    模型不兼容）。前端传入的 ``reasoning_level`` 可覆盖配置值。
+    模型不兼容）。前端传入的 ``reasoning_level`` 和 ``max_tokens`` 可覆盖
+    配置值；显式 ``max_tokens=null`` 表示在探测时清除已保存的输出限制。
     """
     model_config_obj: dict[str, Any] = {}
     try:
@@ -205,6 +205,11 @@ def resolve_model_config_obj_for_validate(
         )
     if "reasoning_level" in params:
         model_config_obj["reasoning_level"] = params.get("reasoning_level")
+    if "max_tokens" in params:
+        if params.get("max_tokens") is None:
+            model_config_obj.pop("max_tokens", None)
+        else:
+            model_config_obj["max_tokens"] = params.get("max_tokens")
     return model_config_obj
 
 
@@ -411,17 +416,15 @@ def _merge_models_for_replace_all(
                 new_mcc["timeout"] = item["timeout"]
             if not _values_match(item["alias"], (resolved_entry or {}).get("alias")):
                 new_entry["alias"] = item["alias"]
-            # vendor_key + plan: persist the exact provider selection identity
-            # into model_client_config (or clear it).
-            previous_vendor = str(new_mcc.get("vendor_key") or "")
-            if item.get("vendor_key"):
-                new_mcc["vendor_key"] = item["vendor_key"]
-            else:
-                new_mcc.pop("vendor_key", None)
-            if item.get("plan"):
-                new_mcc["plan"] = item["plan"]
-            else:
-                new_mcc.pop("plan", None)
+            previous_vendor = str(new_mcc.get("vendor_key") or new_entry.get("vendor_key") or "")
+            for key in ("vendor_key", "plan"):
+                if key not in item:
+                    continue
+                if item[key]:
+                    new_mcc[key] = item[key]
+                else:
+                    new_mcc.pop(key, None)
+                    new_entry.pop(key, None)
             # endpoint_profile: OpenAI 协议端点方言(deepseek/openrouter/dashscope/...)。
             # 编辑表单不暴露该字段(Anthropic 协议下 core 忽略)，payload 缺失不等于
             # 用户要求清空：仅当切到 Anthropic 协议或换用其他供应商预设时丢弃持久化
@@ -431,7 +434,7 @@ def _merge_models_for_replace_all(
                 new_mcc["endpoint_profile"] = item["endpoint_profile"]
             elif (
                 normalize_provider_value(str(item.get("model_provider") or "")) == "Anthropic"
-                or (item.get("vendor_key") or "") != previous_vendor
+                or ("vendor_key" in item and (item["vendor_key"] or "") != previous_vendor)
             ):
                 new_mcc.pop("endpoint_profile", None)
             new_entry["is_default"] = item["is_default"]
@@ -604,7 +607,7 @@ def build_models_defaults_from_frontend(raw_models: Any) -> list[dict[str, Any]]
                 )
             aliases_seen[alias] = idx
 
-        parsed.append({
+        parsed_item = {
             "model_id": item.get("model_id"),
             "model_name": model_name,
             "api_base": api_base,
@@ -620,21 +623,17 @@ def build_models_defaults_from_frontend(raw_models: Any) -> list[dict[str, Any]]
             "context_window_tokens": context_window_tokens,
             "context_window_tokens_provided": context_window_tokens_provided,
             "origin_index": origin_index,
-            # vendor_key is an opaque hint
-            # selector; not validated (the selector only ever emits keys
-            # present in gateway.common.model_vendor_registry). It is
-            # persisted so the UI can match a configured entry back to its
-            # preset for icon display / re-selection. Not required.
-            "vendor_key": vendor_key,
-            # plan is the other half of the provider-selection identity.
-            # Older entries may have vendor_key only; do not infer a plan.
-            "plan": plan,
             # endpoint_profile: OpenAI 协议端点方言(deepseek/openrouter/dashscope/...);
             # opaque passthrough, not validated. Anthropic 协议时 core 忽略此字段。
             # 前端未传时按 api_base host 推断已知自建网关方言(如 vllm)并落库,
             # 否则该类端点的思考开关只会发官方 thinking.type 而被网关忽略。
             "endpoint_profile": effective_endpoint_profile(api_base, item.get("endpoint_profile")),
-        })
+        }
+        if "vendor_key" in item:
+            parsed_item["vendor_key"] = vendor_key
+        if "plan" in item:
+            parsed_item["plan"] = plan
+        parsed.append(parsed_item)
 
     # alias 与其他条目的 model_name 冲突校验
     for i, p in enumerate(parsed):
@@ -760,6 +759,7 @@ async def config_validate_model_handler(
     # (effort-mapped or explicit), not a stale 1024 default: many wires
     # (qwen38_anthropic, dashscope_budget) no longer pin 1024, while
     # anthropic_manual maps high → 16384.
+    thinking_budget: int | None = None
     try:
         from openjiuwen.core.foundation.llm.reasoning import resolve_reasoning_plan
 
@@ -772,12 +772,38 @@ async def config_validate_model_handler(
         if isinstance(_thinking, dict):
             _budget = _thinking.get("budget_tokens")
             if isinstance(_budget, int) and _budget > 0:
+                thinking_budget = _budget
                 supremum_max_tokens = max(supremum_max_tokens, _budget + 16)
     except Exception:  # noqa: BLE001
         logger.debug(
             "[config.validate_model] skip budget floor from reasoning plan",
             exc_info=True,
         )
+    # Only a saved or draft value is a user-configured output limit. Core can
+    # derive max_tokens while constructing the request, and that inferred
+    # value must not turn a connection probe into a configuration error.
+    configured_max_tokens = model_config_obj.get("max_tokens")
+    is_anthropic_provider = model_provider.lower() == "anthropic"
+    has_configured_max_tokens = isinstance(configured_max_tokens, int) and not isinstance(
+        configured_max_tokens, bool
+    )
+    has_invalid_thinking_limit = (
+        has_configured_max_tokens
+        and thinking_budget is not None
+        and configured_max_tokens <= thinking_budget
+    )
+    if is_anthropic_provider and has_invalid_thinking_limit:
+        await channel.send_response(
+            ws,
+            req_id,
+            ok=False,
+            error=(
+                "Anthropic max_tokens must be greater than thinking.budget_tokens "
+                f"(max_tokens={configured_max_tokens}, thinking.budget_tokens={thinking_budget})."
+            ),
+            code="BAD_REQUEST",
+        )
+        return
     llm = Model(model_config=model_request_config, model_client_config=model_client_config)
 
     try:
@@ -787,12 +813,10 @@ async def config_validate_model_handler(
             log_context="config.validate_model",
         )
     except Exception as exc:  # noqa: BLE001
-        # 原始异常（[181001] ... APIStatusError ...）只留在日志里；回给用户的是
-        # 能直接照做的提示，例如账户欠费时明确提示去充值，而不是一串内部报错。
         logger.warning("[config.validate_model] LLM probe failed: %s", exc)
         await channel.send_response(
             ws, req_id, ok=False,
-            error=user_facing_model_error(exc, api_base=api_base),
+            error=str(exc).strip() or "LLM request failed",
             code="LLM_ERROR",
         )
         return
@@ -881,6 +905,9 @@ async def models_list_handler(
                     parse_positive_int(mco.get("context_window"))
                     or DEFAULT_CONTEXT_WINDOW_TOKENS
                 )
+            max_tokens = parse_positive_int(mco.get("max_tokens"))
+            if max_tokens is not None:
+                result_entry["max_tokens"] = max_tokens
             if is_login_model(entry):
                 # 登录送的模型：前端据此置灰编辑
                 result_entry.update(source=entry.get("source"), read_only=True)

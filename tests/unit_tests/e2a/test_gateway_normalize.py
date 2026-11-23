@@ -151,7 +151,7 @@ def test_message_to_e2a_or_fallback_basic():
 
 
 def test_envelope_from_dict_merges_metadata_when_channel_context_nonempty():
-    """telemetry 等先写入 channel_context 时，顶层 metadata 仍须并入，以便 AgentRequest.metadata 含 wecom_chat_id。"""
+    """Merge legacy metadata without losing existing channel context."""
     env = E2AEnvelope.from_dict(
         {
             "request_id": "r3",
@@ -160,12 +160,12 @@ def test_envelope_from_dict_merges_metadata_when_channel_context_nonempty():
             "params": {"query": "q"},
             "is_stream": True,
             "method": "chat.send",
-            "channel_context": {"traceparent": "00-abc-def-01"},
+            "channel_context": {"channel_marker": "preserved"},
             "metadata": {"wecom_chat_id": "user1"},
         }
     )
     req = e2a_to_agent_request(env)
-    assert req.metadata["traceparent"] == "00-abc-def-01"
+    assert req.metadata["channel_marker"] == "preserved"
     assert req.metadata["wecom_chat_id"] == "user1"
 
 
@@ -320,7 +320,7 @@ def test_organization_identity_survives_protocol_package_roundtrip(entrypoint, e
 
 @pytest.mark.parametrize("payload", [None, {}, {"event_type": "chat.delta", "content": "plain"}])
 def test_non_organization_normalization_keeps_protocol_behavior(payload):
-    from openjiuwen_protocol.e2a import gateway_normalize as protocol
+    from e2a import gateway_normalize as protocol
     from jiuwenswarm.common.e2a.gateway_normalize import e2a_response_from_agent_chunk
     from jiuwenswarm.common.schema.agent import AgentResponseChunk
 

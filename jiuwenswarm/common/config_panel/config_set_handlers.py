@@ -19,6 +19,7 @@ gateway 拆分：ConfigAdapter（AgentServer 进程）复用这些成熟实现�
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import importlib.util
 import inspect
@@ -92,6 +93,7 @@ from jiuwenswarm.common.recommendation_switches import (
     flatten_recommendation_for_config_panel,
     save_recommendation_switches,
 )
+from jiuwenswarm.common.config_panel.cua_permission_guide import open_macos_cua_permission_guide
 from jiuwenswarm.common.config_panel.external_cli_read import (
     EXTERNAL_CLI_AGENT_KEY_SUFFIXES,
     EXTERNAL_CLI_AGENT_KINDS,
@@ -147,6 +149,7 @@ class ConfigPanelInternalError(RuntimeError):
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",
+    "FREE_SEARCH_DDG_ENABLED", "FREE_SEARCH_BING_ENABLED",
 }
 MODEL_RELOAD_ENV_KEYS = {
     "MODEL_PROVIDER",
@@ -190,12 +193,6 @@ MULTIMODAL_RELOAD_ENV_KEYS = {
     "VISUAL_GEN_PROVIDER",
     "VISUAL_GEN_PROTOCOL",
     "VISUAL_GEN_CONTEXT_WINDOW_TOKENS",
-    "MUSIC_GEN_ENABLED",
-    "MUSIC_GEN_API_BASE",
-    "MUSIC_GEN_API_KEY",
-    "MUSIC_GEN_MODEL_NAME",
-    "MUSIC_GEN_PROVIDER",
-    "MUSIC_GEN_PROTOCOL",
 }
 ASR_ENV_KEYS = {
     "ASR_API_BASE",
@@ -274,6 +271,7 @@ class ConfigApplyResult:
     canonical_config: dict[str, str] | None = None
     pending_permission_profile: str | None = None
     pending_permission_key: str | None = None
+    cua_agent_just_enabled: bool = False
 
 
 # .env 路径（调用方可 monkeypatch 本模块属性以隔离测试）
@@ -321,13 +319,6 @@ CONFIG_SET_ENV_MAP = {
     "visual_gen_protocol": "VISUAL_GEN_PROTOCOL",
     "visual_gen_context_window_tokens": "VISUAL_GEN_CONTEXT_WINDOW_TOKENS",
     "visual_gen_enabled": "VISUAL_GEN_ENABLED",
-    # music generation - Design BGM slot.
-    "music_gen_api_base": "MUSIC_GEN_API_BASE",
-    "music_gen_api_key": "MUSIC_GEN_API_KEY",
-    "music_gen_model": "MUSIC_GEN_MODEL_NAME",
-    "music_gen_provider": "MUSIC_GEN_PROVIDER",
-    "music_gen_protocol": "MUSIC_GEN_PROTOCOL",
-    "music_gen_enabled": "MUSIC_GEN_ENABLED",
     # audio 模型
     "audio_api_base": "AUDIO_API_BASE",
     "audio_api_key": "AUDIO_API_KEY",
@@ -447,6 +438,8 @@ WEB_UI_YAML_KEYS = frozenset({
     "team_organization_ui_enabled",
     "comfyui_workflow_enabled",
     "setup_guide_enabled",
+    "design_generation_video_gen",
+    "design_generation_visual_gen",
     *RECOMMENDATION_UI_CONFIG_KEYS,
 })
 # Scopes that must reach AgentServer before config.save_all returns.
@@ -946,10 +939,14 @@ def detect_external_cli_agent(
     cli_agent: str, cli_path: str = "", use_builtin: bool = False
 ) -> dict[str, Any]:
     normalized_agent = cli_agent.strip().lower()
+    # 每次探测都携带内置（托管安装）CLI 路径：配置本地可执行文件后探测结果与
+    # PATH 扫描都不再指向内置路径，前端路径下拉框需要它作为常驻选项，
+    # 否则内置路径会从下拉框消失且会被历史清理剪掉（#6647）。
+    builtin_path = external_cli_managed_cli_path(normalized_agent)
     if normalized_agent not in EXTERNAL_CLI_AGENT_KINDS and normalized_agent in external_cli_agent_kinds():
-        return _detect_custom_agent_cli(normalized_agent, cli_path)
-    if normalized_agent not in EXTERNAL_CLI_AGENT_KINDS:
-        return {
+        result = _detect_custom_agent_cli(normalized_agent, cli_path)
+    elif normalized_agent not in EXTERNAL_CLI_AGENT_KINDS:
+        result = {
             "cli_agent": normalized_agent,
             "status": "unavailable",
             "path": "",
@@ -957,8 +954,10 @@ def detect_external_cli_agent(
             "reference_version": "",
             "message": f"unsupported cli_agent: {cli_agent}",
         }
-
-    return _detect_cli_at(normalized_agent, cli_path, use_builtin)
+    else:
+        result = _detect_cli_at(normalized_agent, cli_path, use_builtin)
+    result["builtin_path"] = builtin_path
+    return result
 
 
 def _detect_custom_agent_cli(cli_agent: str, cli_path: str) -> dict[str, Any]:
@@ -1026,6 +1025,21 @@ def _detect_cli_at(normalized_agent: str, cli_path: str, use_builtin: bool = Fal
             "version": "",
             "reference_version": reference_version,
             "message": version_error or "version command failed",
+        }
+
+    identity_patterns = {
+        "claude": r"\bClaude Code\b",
+        "codex": r"\bcodex(?:-cli)?\s+\d",
+    }
+    identity_pattern = identity_patterns.get(normalized_agent)
+    if identity_pattern and not re.search(identity_pattern, version_output, re.IGNORECASE):
+        return {
+            "cli_agent": normalized_agent,
+            "status": "unavailable",
+            "path": resolved_path,
+            "version": version,
+            "reference_version": reference_version,
+            "message": f"version output does not identify the selected program as {normalized_agent}",
         }
 
     status = "ok"
@@ -1287,34 +1301,15 @@ def build_external_cli_publish_url() -> str:
 
 
 def persist_env_updates(updates: dict[str, str]) -> None:
-    """把已更新的环境变量写回 .env（仅覆盖或追加对应 KEY=value 行）。"""
-    env_path = ENV_FILE
+    """Persist settings atomically; callers must observe disk failures."""
     if not updates:
         return
-    try:
-        lines: list[str] = []
-        if env_path.is_file():
-            with open(env_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        new_lines: list[str] = []
-        for line in lines:
-            stripped = line.strip()
-            found = False
-            for env_key, value in updates.items():
-                if stripped.startswith(env_key + "="):
-                    new_lines.append(f'{env_key}="{value}"\n' if value else f"{env_key}=\n")
-                    found = True
-                    break
-            if not found:
-                new_lines.append(line)
-        for env_key, value in updates.items():
-            if not any(s.strip().startswith(env_key + "=") for s in new_lines):
-                new_lines.append(f'{env_key}="{value}"\n' if value else f"{env_key}=\n")
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-    except OSError as e:
-        logger.warning("[config.set] 写回 .env 失败: %s", e)
+    from jiuwenswarm.common.config import config_write_lock
+    from jiuwenswarm.common.config_persistence import atomic_write, env_content
+
+    with config_write_lock(config_path=ENV_FILE.with_name("config.yaml")):
+        original = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else ""
+        atomic_write(ENV_FILE, env_content(original, updates).encode())
 
 
 def parse_config_bool(value: Any) -> bool:
@@ -1371,6 +1366,11 @@ def encrypt_config_params(params: dict[str, Any]) -> dict[str, Any]:
         if key.endswith("_context_window_tokens"):
             continue
         if "api_key" in key.lower() or "token" in key.lower():
+            # An empty value means "clear the stored credential" (e.g. the Jev
+            # delete flow). Encrypting it would persist a non-empty ciphertext,
+            # so the credential would keep looking configured and never clear.
+            if val is None or str(val).strip() == "":
+                continue
             encrypted[key] = crypto.encrypt(val)
     return encrypted
 
@@ -1456,6 +1456,7 @@ def apply_config_payload(
     params = encrypt_config_params({key: value for key, value in params.items() if key not in MOA_CONFIG_KEYS})
     env_updates: dict[str, str] = {}
     yaml_updated: list[str] = []
+    cua_agent_just_enabled = False
     codex_dependency_install: dict[str, Any] | None = None
     external_cli_dependency_installs: dict[str, dict[str, Any]] = {}
     canonical_config: dict[str, str] | None = None
@@ -1524,6 +1525,17 @@ def apply_config_payload(
             raise ConfigPanelInternalError("failed to update modes.team") from exc
 
     external_cli_agents_updated = False
+    if "design_generation_video_gen" in params or "design_generation_visual_gen" in params:
+        from jiuwenswarm.server.runtime.designer.generation_selection import (
+            DesignSelectionError,
+            apply_design_generation_config,
+        )
+
+        try:
+            yaml_updated.extend(apply_design_generation_config(params))
+        except DesignSelectionError as exc:
+            raise ConfigPanelBadRequest(str(exc)) from exc
+
     for param_key in (*CONFIG_YAML_KEYS, *custom_external_cli_config_keys()):
         if param_key not in params:
             continue
@@ -1541,7 +1553,7 @@ def apply_config_payload(
             elif param_key == "rsi_enabled":
                 update_rsi_enabled_in_config(parsed)
             elif param_key == "cua_agent_enabled":
-                update_cua_agent_enabled_in_config(None if val is None else parsed)
+                cua_agent_just_enabled = update_cua_agent_enabled_in_config(None if val is None else parsed)
             elif param_key == "enable_free_models":
                 update_enable_free_models_in_config(parsed)
             elif param_key == "memory_forbidden_enabled":
@@ -1718,10 +1730,12 @@ def apply_config_payload(
             # A crypto provider may include credentials in exception text.
             raise ConfigPanelInternalError("failed to save MoA configuration") from None
 
-    for env_key, value in env_updates.items():
-        os.environ[env_key] = value
     if env_updates:
-        persist_env_updates(env_updates)
+        try:
+            persist_env_updates(env_updates)
+        except OSError:
+            raise ConfigPanelInternalError("failed to save environment settings") from None
+        os.environ.update(env_updates)
         logger.info("[config.set] 已更新 .env: %s", list(env_updates.keys()))
     if yaml_updated:
         logger.info("[config.set] 已更新 config.yaml: %s", yaml_updated)
@@ -1751,6 +1765,7 @@ def apply_config_payload(
             if "permissions_enabled" in params
             else None
         ),
+        cua_agent_just_enabled=cua_agent_just_enabled,
     )
 
 
@@ -1907,6 +1922,9 @@ async def config_get_handler(
         resolved = get_config()
         models_cfg = resolved.get("models") or {}
         payload["enable_free_models"] = "true" if models_cfg.get("enable_free_models", False) else "false"
+        from jiuwenswarm.server.runtime.designer.generation_selection import saved_generation_config
+
+        payload.update(saved_generation_config())
     except Exception:  # noqa: BLE001
         for key, value in flatten_moa_for_config_panel({}).items():
             payload.setdefault(key, value)
@@ -1955,6 +1973,8 @@ async def config_get_handler(
         payload.setdefault("topic_recommendation_enabled", "false")
         payload.setdefault("prompt_suggestion_enabled", "false")
         payload.setdefault("enable_free_models", "false")
+        payload.setdefault("design_generation_video_gen", "")
+        payload.setdefault("design_generation_visual_gen", "")
     await channel.send_response(ws, req_id, ok=True, payload=payload)
 
 
@@ -1991,6 +2011,8 @@ async def config_set_handler(
     env_updates = apply_result.env_updates
     yaml_updated = apply_result.yaml_updated
     change_set = ConfigChangeSet(env_updates, yaml_updated)
+    if apply_result.cua_agent_just_enabled:
+        await asyncio.to_thread(open_macos_cua_permission_guide)
     try:
         applied_without_restart = await apply_config_change_set(
             change_set,
@@ -2139,6 +2161,8 @@ async def config_save_all_handler(
         commit_pending_permission_profile(apply_result)
         yaml_updated.extend(apply_result.yaml_updated)
 
+        if apply_result.cua_agent_just_enabled:
+            await asyncio.to_thread(open_macos_cua_permission_guide)
         change_set = ConfigChangeSet(
             env_updates,
             yaml_updated,

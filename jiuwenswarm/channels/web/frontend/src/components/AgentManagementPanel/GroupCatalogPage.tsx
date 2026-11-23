@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { isEnterprise } from '../../edition';
 import { useTranslation } from 'react-i18next';
 import type { AgentGroupCatalogItem, RequestStatus } from '../../features/agentManagement';
 import { CategoryTabs, EmptyState } from '../ui';
@@ -170,7 +169,7 @@ export function GroupCatalogPage({
                 : t(isMine ? 'agentManagement.group.states.mineEmpty' : 'agentManagement.group.states.catalogEmpty')
             }
           >
-            {isMine && !hasQuery && !isEnterprise() ? (
+            {isMine && !hasQuery ? (
               <button
                 type="button"
                 className="h-[28px] w-[96px] rounded-full border border-[var(--color-button-border)] bg-card text-[12px] text-text"

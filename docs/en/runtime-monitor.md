@@ -37,8 +37,15 @@ Reload reuses unchanged clients. Key rotation replaces the client while retainin
 
 ## Local integration
 
-Use `runtime-bai-adaptation` in this repository and the adjacent `../agent-core` checkout on `react-runtime-bai`. Run `scripts/use-local-agent-core.ps1` in an existing application venv, then use its Python or `uv run --no-sync`. The root uv source and dependency override select the local editable SDK instead of Gateway's transitive remote pin.
+Use the app's `runtime-bai-adaptation` branch (official `releases/0.2.9`) and an adjacent `../agent-core` checkout on `react-runtime-bai` (official `v0.1.21`). From the application repository run:
 
-The complete dependency lock remains unresolved: the latest application requires OpenTelemetry SDK `<1.42`, while the local SDK requires `>=1.45.1`. The checked-in lock follows official develop and is not a resolved lock for this local SDK combination. Do not use plain `uv sync`, `uv run` or frozen installs for this integration. Clean installation and production packaging remain unverified.
+```shell
+uv sync --locked
+uv run --locked jiuwenswarm-start
+```
+
+The app retains the release pin `openjiuwen==0.1.21` and its extra constraints. The uv source and lockfile resolve it to the adjacent editable checkout. Gateway, protocol and other packages use the release lock's versions. Restart the app after editing the SDK to load the changes.
+
+For a different checkout location, use `scripts/use-local-agent-core.ps1 -AgentCorePath <path>` in an existing environment with the matching release dependencies. The helper checks the branch and import path. Start that environment directly or use `uv run --no-sync` so the custom path takes effect.
 
 BAI emits `chat.runtime_monitor` diagnostics and stable `chat.notice` entries with `notice_type=runtime_intervention`. History restores the last state of each advice. The shared history event allowlist retains notices for JSONL index/cursor paging and legacy JSON index paging. Raw monitor snapshots stay out of chat history pages; diagnostics and notices are excluded from model context replay. No recovery checkpoints or external rollback are executed. Generic tool observations alone cannot certify business acceptance; add an EvidenceAdapter for verified domain progress.

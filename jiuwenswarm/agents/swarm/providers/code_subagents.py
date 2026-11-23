@@ -129,7 +129,6 @@ def build_code_agent(factory_kwargs: dict[str, Any], ctx: SwarmBuildContext) -> 
         model,
         rails=rails,
         workspace=str(inp.workspace_root or "./"),
-        sys_operation=parent_sys_operation(ctx),
         language=inp.language,
         max_iterations=inp.max_iterations,
     )
@@ -234,7 +233,6 @@ def build_swarm_browser_agent(factory_kwargs: dict[str, Any], ctx: SwarmBuildCon
     spec = build_browser_agent_config(
         model,
         workspace=str(inp.workspace_root or "./"),
-        sys_operation=parent_sys_operation(ctx),
         language=inp.language,
         max_iterations=inp.max_iterations,
         browser_key=browser_key,

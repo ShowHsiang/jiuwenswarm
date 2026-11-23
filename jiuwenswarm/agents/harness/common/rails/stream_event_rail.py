@@ -826,6 +826,9 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         # on conv_id naming conventions.
         if ctx.session is None:
             return
+        from jiuwenswarm.agents.harness.team.native_lifecycle import track_native_context_lifecycle
+
+        await track_native_context_lifecycle(self._deep_agent)
         # Use the real conversation_id as the session key; fall back to "default"
         # only for the pause/abort state lookup key (sid).  Do NOT store the
         # "default" sentinel as a conversation_id value — after_tool_call uses
@@ -854,12 +857,6 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         # Sub-agents inherit this from the parent's invoke since they don't
         # fire their own before_invoke (ctx.session is None → early return above).
         ctx.extra[self._SID_KEY] = sid
-        ctx.extra["_history_consumed_requests"] = set()
-        try:
-            carrier = root_decision_context_from_extra(getattr(ctx.inputs.run_context, "extra", None))
-            ctx.extra["_history_incoming_request"] = carrier.request_id
-        except (AttributeError, TypeError, ValueError):
-            ctx.extra["_history_incoming_request"] = ""
         try:
             from openjiuwen.core.sys_operation.shell_process_registry import (
                 set_shell_session_id,
@@ -1057,27 +1054,6 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         await self._save_effective_context(ctx)
         await self._emit_llm_call_signal(ctx, "llm_call_start")
 
-    async def on_user_message(self, ctx: AgentCallbackContext) -> None:
-        """Record consumed request identities, including individual steer inputs."""
-        consumed = ctx.extra.setdefault("_history_consumed_requests", set())
-        source = getattr(ctx.inputs, "source", "query")
-        if source != "steering":
-            request_id = ctx.extra.get("_history_incoming_request")
-            if request_id:
-                consumed.add(request_id)
-        for part in getattr(ctx.inputs, "parts", ()):
-            try:
-                carrier = root_decision_context_from_extra(getattr(getattr(part, "run_context", None), "extra", None))
-                consumed.add(carrier.request_id)
-            except (AttributeError, TypeError, ValueError):
-                continue
-        # ON_USER_MESSAGE means Core has drained these inputs for processing.
-        # Keep this host disposition even when a later rail intentionally drops
-        # the message, or abort persistence retains only the cleaned prefix.
-        context = getattr(ctx, "context", None)
-        if context is not None:
-            context.history_recovery_covered = set(getattr(context, "history_recovery_covered", ())) | consumed
-
     async def after_react_iteration(self, ctx: AgentCallbackContext) -> None:
         # Native Core fires this only after all tool results have been installed.
         await self._save_effective_context(ctx)
@@ -1091,8 +1067,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             return
         from jiuwenswarm.server.runtime.session.context_snapshot import save_context_snapshot
 
-        await save_context_snapshot(context_engine=react.context_engine, session=ctx.session,
-                                    consumed_request_ids=ctx.extra.get("_history_consumed_requests", set()))
+        await save_context_snapshot(context_engine=react.context_engine, session=ctx.session)
 
     @staticmethod
     def _inject_tool_call_goal_schema(ctx: AgentCallbackContext) -> None:
@@ -1193,30 +1168,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         if self._role:
             payload["role"] = self._role
         try:
-            if phase == "llm_call_start":
-                # Core rebuilds the system prompt and context window after all
-                # before_model_call rails. These inputs are only a preview.
-                prompt_preview = self._summarize_call_prompt(ctx, max_chars=2048)
-                if prompt_preview:
-                    payload["prompt"] = prompt_preview
-            elif phase == "llm_call_end":
-                from jiuwenswarm.server.runtime.session.history_artifacts import put_prompt
-                from jiuwenswarm.server.runtime.session.history_io import run_history_io
-
-                # AFTER_MODEL_CALL exposes the final messages/tools sent to the
-                # model, including injected rules and context processing.
-                if getattr(ctx.inputs, "messages", None):
-                    try:
-                        payload["payload_refs"] = {"prompt": await run_history_io(
-                            put_prompt, self._artifact_session_scope(session, self._resolve_sid(ctx, session)),
-                            getattr(ctx.inputs, "messages", None) or [],
-                            getattr(ctx.inputs, "tools", None) or [],
-                        )}
-                    except OSError:
-                        logger.warning(
-                            "[StreamEventRail] prompt artifact unavailable; emitting call end",
-                            exc_info=True,
-                        )
+            if phase == "llm_call_end":
                 response_text = self._extract_response_text(ctx)
                 if response_text:
                     payload["content"] = response_text
@@ -1275,48 +1227,6 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             if isinstance(ptext, str) and ptext.strip():
                 return ptext.strip()
         return None
-
-    @staticmethod
-    def _summarize_call_prompt(ctx: AgentCallbackContext, max_chars: int | None = None) -> str | None:
-        """Format the available input preview for ``llm_call_start``.
-
-        Core finalizes the prompt after the before-model rails. The exact input
-        is externalized separately on ``llm_call_end``. Inline base64 images
-        are replaced with ``[image]`` to keep the preview readable.
-        """
-        messages = getattr(ctx.inputs, "messages", None) or []
-        if not messages:
-            return None
-        parts: list[str] = []
-        total = 0
-        for msg in messages:
-            if isinstance(msg, dict):
-                role = str(msg.get("role") or "?")
-                content = msg.get("content")
-            else:
-                role = str(getattr(msg, "role", None) or "?")
-                content = getattr(msg, "content", None)
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = "\n".join(
-                    str(part.get("text", ""))
-                    for part in content
-                    if isinstance(part, dict) and part.get("type") == "text"
-                )
-            else:
-                text = str(content) if content else ""
-            if "data:image" in text:
-                text = "[image]"
-            if max_chars is not None:
-                text = text[:max(0, max_chars - total) + 1]
-            segment = f"<{role}>\n{text}"
-            if max_chars is not None and total + len(segment) > max_chars:
-                parts.append(segment[: max(0, max_chars - total)] + "\n… (truncated)")
-                break
-            parts.append(segment)
-            total += len(segment)
-        return "\n\n".join(parts)
 
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
         sid = self._resolve_sid(ctx, ctx.session)
@@ -1594,6 +1504,12 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                 tool_result_payload["success"] = True
             else:
                 error_state = _infer_tool_result_error(raw_output if raw_output is not None else result)
+                if tool_name == "tool_call" and error_state is not True:
+                    # The wrapper's verdict describes dispatch. The target can still report a failure.
+                    wrapper_data = getattr(result, "data", None)
+                    target_result = wrapper_data.get("result") if isinstance(wrapper_data, dict) else None
+                    if _infer_tool_result_error(target_result) is True:
+                        error_state = True
                 if error_state is not None:
                     tool_result_payload["success"] = not error_state
                     if error_state:

@@ -19,6 +19,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString, PlainScalarString
 import yaml
 import portalocker
 
+from jiuwenswarm.common.cua_config import is_cua_agent_enabled
 from jiuwenswarm.common.kv_cache_affinity_config import (
     APPLICATION_KV_CACHE_CONFIG_KEY,
     KV_CACHE_AFFINITY_ENABLED_KEY,
@@ -27,12 +28,12 @@ from jiuwenswarm.common.kv_cache_affinity_config import (
     set_default_model_provider_in_entries,
     validate_affinity_invariant,
 )
-from jiuwenswarm.common.observability_config import migrate_legacy_observability_config
 from jiuwenswarm.common.security.base_crypto import get_crypto_provider
 from jiuwenswarm.common.runtime_model_config import apply_runtime_model_config
 from jiuwenswarm.common.utils import (
     get_config_dir,
     get_config_file,
+    refresh_external_cli_state_sidecar,
 )
 
 logger = logging.getLogger(__name__)
@@ -596,6 +597,13 @@ def dump_yaml_round_trip(config_path: Path, data: Any) -> None:
         except FileNotFoundError:
             pass
         raise
+    # config.yaml 的唯一写出口：落盘后同步三方 agent 状态旁路，覆盖所有更新
+    # 路径（agents/histories/prune/teams/builtin_models/reset）。仅对主配置
+    # 文件生效——其它 yaml 落盘不含该配置节，镜像空态会覆盖旁路。
+    # 旁路刷新的首参是要读取的 config.yaml 路径，workspace 取其上两级
+    # （config/config.yaml → 数据目录），不能传数据目录本身（!10406 检视）。
+    if Path(config_path) == Path(CONFIG_YAML_PATH):
+        refresh_external_cli_state_sidecar(config_path, Path(config_path).parent.parent)
 
 
 def _atomic_replace(src: Path, dst: Path, max_attempts: int = 10) -> None:
@@ -635,6 +643,9 @@ def config_write_lock(*, lock_timeout: float = 10.0, config_path: Path | None = 
         with portalocker.Lock(
             str(_config_lock_path(config_path or CONFIG_YAML_PATH)), timeout=lock_timeout
         ):
+            from jiuwenswarm.common.config_persistence import recover_multimodal_transaction
+
+            recover_multimodal_transaction(config_path or CONFIG_YAML_PATH)
             yield
     finally:
         _CONFIG_WRITE_LOCK.release()
@@ -1060,21 +1071,27 @@ def update_rsi_enabled_in_config(value: bool) -> None:
     update_config(mutator)
 
 
-def update_cua_agent_enabled_in_config(value: bool | None) -> None:
-    """Persist an explicit desktop preference, or null to follow the release default."""
+def update_cua_agent_enabled_in_config(value: bool | None) -> bool:
+    """Persist the desktop preference and report a transition to enabled."""
     if value is not None and not isinstance(value, bool):
         raise ValueError("cua_agent.enabled must be true, false or null")
 
+    just_enabled = False
+
     def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        nonlocal just_enabled
         current = data
         for key in ("react", "subagents", "cua_agent"):
             if not isinstance(current.get(key), dict):
                 current[key] = {}
             current = current[key]
+        was_enabled = is_cua_agent_enabled(current)
         current["enabled"] = value
+        just_enabled = is_cua_agent_enabled(current) and not was_enabled
         return data
 
     update_config(mutator)
+    return just_enabled
 
 
 def update_enable_free_models_in_config(value: bool) -> None:
@@ -1904,18 +1921,12 @@ def _normalize_model_entry(entry: dict[str, Any]) -> dict[str, Any]:
         mcc["timeout"] = saved.pop("timeout")
     if "verify_ssl" in saved:
         mcc["verify_ssl"] = bool(saved.pop("verify_ssl"))
-    if "endpoint_profile" in saved:
-        val = saved.pop("endpoint_profile")
-        if val:
-            mcc["endpoint_profile"] = str(val)
-    if "vendor_key" in saved:
-        val = saved.pop("vendor_key")
-        if val:
-            mcc["vendor_key"] = str(val)
-    if "plan" in saved:
-        val = saved.pop("plan")
-        if val:
-            mcc["plan"] = str(val)
+    for key in ("endpoint_profile", "vendor_key", "plan"):
+        if key not in saved:
+            continue
+        value = saved.pop(key)
+        if value or value in (None, ""):
+            mcc[key] = str(value) if value else value
     temp = saved.pop("temperature", None)
     if temp is not None:
         mco["temperature"] = float(temp)
@@ -1998,6 +2009,11 @@ def _remove_initial_model_placeholder(models: dict[str, Any], saved: dict[str, A
 
 def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
     saved = _normalize_model_entry(entry)
+    clear_max_tokens = (
+        isinstance(entry.get("model_config_obj"), dict)
+        and "max_tokens" in entry["model_config_obj"]
+        and entry["model_config_obj"]["max_tokens"] is None
+    )
     model_config = saved.get("model_config_obj")
     if isinstance(model_config, dict) and "reasoning_level" in model_config:
         from jiuwenswarm.common.reasoning_config import normalize_reasoning_level
@@ -2009,6 +2025,8 @@ def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
         # PyYAML reads unquoted on/off as booleans; keep the editable DTO stable.
         model_config["reasoning_level"] = DoubleQuotedScalarString(level or "")
     saved.setdefault("model_id", _new_business_id("mdl"))
+    # Only an explicit empty value in the incoming payload clears a field.
+    client_update = saved.get("model_client_config") or {}
 
     def _mutate(data):
         nonlocal saved
@@ -2025,6 +2043,16 @@ def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
             defaults.append(saved)
             _remove_initial_model_placeholder(candidate, saved)
             _protect_model_key(saved, {})
+        if clear_max_tokens:
+            saved_model_config = saved.get("model_config_obj")
+            if isinstance(saved_model_config, dict):
+                # A null max_tokens is the resource API's explicit "unlimited"
+                # signal. Omission still preserves an existing user setting.
+                saved_model_config.pop("max_tokens", None)
+        for key in ("vendor_key", "plan"):
+            if key in client_update and client_update[key] in (None, ""):
+                saved.pop(key, None)
+                saved["model_client_config"].pop(key, None)
         if entry.get("is_default") is True:
             for current in candidate["defaults"]:
                 current["is_default"] = current["model_id"] == saved["model_id"]
@@ -3693,10 +3721,6 @@ def migrate_config_from_template(
         # 必须在 _deep_merge 之前执行，否则旧子节点会被静默丢弃而非迁移。
         _migrate_legacy_agent_submode_memory(user_data)
         _migrate_legacy_kv_cache_affinity_config(user_data)
-        # team_observability / agent_observability -> observability.{team,agent}
-        # 必须在 _deep_merge 之前执行：合并会先按模板塞入默认的 observability 段，
-        # 旧段里用户改过的 exporter / endpoint 等就会被模板默认值挡住。
-        legacy_observability_migrated = migrate_legacy_observability_config(user_data)
 
         # Deep merge: template provides defaults, user values preserved.
         # user_data is updated in place, which keeps comments and formatting.
@@ -3710,8 +3734,6 @@ def migrate_config_from_template(
                 # Environment-driven markers can resolve differently after a child reloads its dotenv files.
                 user_data["extensions"] = {}
         changes = _deep_merge(template_data, user_data, prune=prune)
-        if legacy_observability_migrated:
-            changes += 1
 
         # Guard against an empty result overwriting a valid user config
         if not user_data:
@@ -3779,10 +3801,36 @@ def add_or_update_model_in_config(name: str, model_config: dict[str, Any]) -> No
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def _get_agentos_model(models: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """在 models.agentos 备份模型中按 model_name/alias 查找。
+
+    仅 AgentOS 运行时生效：那类部署会把可用模型放在 models.agentos；
+    其他部署里该段只是只读备份，不参与按名校验。
+    """
+    from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+
+    if not is_agentos_runtime():
+        return None
+    agentos = models.get("agentos")
+    if not isinstance(agentos, list) or not name:
+        return None
+    for entry in agentos:
+        if not isinstance(entry, dict):
+            continue
+        mcc = entry.get("model_client_config") or {}
+        entry_name = str(resolve_env_vars(mcc.get("model_name")) or "").strip()
+        alias = str(resolve_env_vars(entry.get("alias")) or "").strip()
+        if name in (entry_name, alias):
+            return entry
+    return None
+
+
 def get_model_config(name: str, index: int | None = None) -> dict[str, Any] | None:
     """获取指定模型的原始配置（不解析环境变量）。
 
-    优先从 models.defaults 列表中按 model_name 查找。
+    优先从 models.defaults 列表中按 model_name 查找；AgentOS 运行时未命中时
+    回退到 models.agentos（该部署把可用模型放在这里，仅扫 defaults 会让 cron
+    等按名校验的调用方误报 Unknown model）。
     当存在同名模型时，可通过 index 参数指定第几个匹配项（0-based）。
     若 index 为 None，返回 is_default=True 的条目；若无则返回第一个匹配。
     """
@@ -3805,6 +3853,9 @@ def get_model_config(name: str, index: int | None = None) -> dict[str, Any] | No
                 alias = entry.get("alias", "")
                 if alias and resolve_env_vars(str(alias)) == name:
                     return entry
+            agentos_entry = _get_agentos_model(models, name)
+            if agentos_entry is not None:
+                return agentos_entry
             return models.get(name) if name in models else None
         if index is not None:
             for pos, entry in matches:
@@ -3815,6 +3866,9 @@ def get_model_config(name: str, index: int | None = None) -> dict[str, Any] | No
             if entry.get("is_default") is True:
                 return entry
         return matches[0][1]
+    agentos_entry = _get_agentos_model(models, name)
+    if agentos_entry is not None:
+        return agentos_entry
     return models.get(name) if name in models else None
 
 
@@ -3980,37 +4034,6 @@ def get_sandbox_runtime() -> dict[str, Any]:
     if "enabled" not in raw:
         raw["enabled"] = resolve_sandbox_enabled(sandbox)
     return _ensure_sandbox_runtime_shape(raw)
-
-
-def get_sandbox_team_fail_closed() -> bool:
-    """Read ``sandbox.team_fail_closed`` (default False).
-
-    When True, a distributed teammate whose local sandbox is unavailable is
-    rejected at bootstrap instead of degrading to LOCAL execution (design
-    D-20261105-1041 KD7): security-sensitive deployments refuse unsandboxed
-    remote members rather than warning.
-    """
-    cfg = get_config() or {}
-    sandbox = cfg.get("sandbox")
-    if not isinstance(sandbox, dict):
-        return False
-    return coerce_config_bool(sandbox.get("team_fail_closed"), False)
-
-
-def get_sandbox_network_mode() -> str:
-    """Read ``sandbox.network_mode`` (default empty = do not forward).
-
-    When set (e.g. ``host``), the sandbox card's client policy fragment
-    carries ``network.mode`` explicitly: jiuwenbox's append-merge only keeps
-    fields present in the fragment, so a root-policy-only network mode is
-    lost after merge and creation falls back to isolated networking — which
-    needs ``ip netns`` privileges the host may not have.
-    """
-    cfg = get_config() or {}
-    sandbox = cfg.get("sandbox")
-    if not isinstance(sandbox, dict):
-        return ""
-    return str(sandbox.get("network_mode") or "").strip().lower()
 
 
 # ``preserve_file_sharing_mode`` 当前合法取值集合 = ``{"mount"}``; 空值表示

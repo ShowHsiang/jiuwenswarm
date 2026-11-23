@@ -16,18 +16,6 @@ function evaluate(source, context, result) {
   return new Function('context', `with (context) { ${outputText}; return ${result}; }`)(context);
 }
 
-// designerEntry imports the "@" mention helpers; load the real (pure) module the same way.
-const mentionsSource = fs.readFileSync(new URL('../src/features/designer/designerMentions.ts', import.meta.url), 'utf8');
-const mentionsTree = ts.createSourceFile('designerMentions.ts', mentionsSource, ts.ScriptTarget.Latest, true);
-const mentions = evaluate(
-  mentionsTree.statements
-    .filter(node => !ts.isImportDeclaration(node))
-    .map(node => node.getText(mentionsTree).replace(/^export /, ''))
-    .join('\n'),
-  {},
-  '{ stripMentionAppendix, withMentionAppendix }',
-);
-
 function fixture() {
   const calls = { requests: [], navigations: [], errors: [], compose: [] };
   const chat = {
@@ -66,7 +54,6 @@ function fixture() {
     resolveChatModelSelection: (_models, name, fallback) => ({ model_name: name || fallback }),
     flushApplicationConversationHistory: async () => {},
     mediaItemsToBootstrapReferences: () => ({ refs: [] }), findDesignModelsProblem: async () => null,
-    ...mentions,
     designerWorkspaceClient: {
       async createSession() { return { session: { session_id: 'design-session' } }; },
       async composeSession(params) {

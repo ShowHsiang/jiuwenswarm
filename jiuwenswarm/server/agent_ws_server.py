@@ -168,6 +168,10 @@ from jiuwenswarm.runtime.session_provisioner import (
     SessionSwitchInput,
 )
 from jiuwenswarm.server.gateway_push.wire import build_server_push_wire
+from jiuwenswarm.server.heartbeat_push import (
+    merge_heartbeat_push_metadata,
+    should_skip_heartbeat_push,
+)
 from jiuwenswarm.server.middleware.chat import (
     should_trigger_before_chat_request,
     trigger_before_chat_request,
@@ -224,6 +228,7 @@ from jiuwenswarm.server.runtime.agent_manager import (
 from jiuwenswarm.server.runtime.gateway_adapter import (
     AdapterRegistry,
     ConfigAdapter,
+    MultimodalConfigAdapter,
     DesignerAdapter,
     HarmonyOSAdapter,
     MemoryAdapter,
@@ -1372,7 +1377,7 @@ class AgentWebSocketServer:
         )
         self._adapter_registry = AdapterRegistry()
         for adapter in (
-            VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt),
+            VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt, self._execution_runtime),
             SessionAdapter(),
             WorkspaceFileAdapter(),
             MemoryAdapter(),
@@ -1380,6 +1385,7 @@ class AgentWebSocketServer:
             DesignerAdapter(),
             HarmonyOSAdapter(),
             ConfigAdapter(on_config_saved=self._reload_after_config_save),
+            MultimodalConfigAdapter(on_config_saved=self._reload_after_config_save),
             self._jiuwenmate_web,
         ):
             self._adapter_registry.register(adapter)
@@ -1853,7 +1859,13 @@ class AgentWebSocketServer:
         async def _warmup_mcp_connections() -> bool:
             try:
                 from jiuwenswarm.common.mcp_config import prewarm_connected_mcps
-                return await prewarm_connected_mcps(report_status=True) is not False
+
+                return await prewarm_connected_mcps(
+                    report_status=True,
+                    # Tests start with bind_transport=True; only production
+                    # settles stale connecting records.
+                    settle_connecting=not bind_transport,
+                ) is not False
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "[AgentWebSocketServer] MCP prewarm failed "
@@ -2405,7 +2417,7 @@ class AgentWebSocketServer:
                 self._install_session_message_service()
                 self._adapter_registry = AdapterRegistry()
                 for adapter in (
-                    VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt),
+                    VoiceTaskServerAdapter(self._agent_manager.session_has_pending_interrupt, self._execution_runtime),
                     SessionAdapter(),
                     WorkspaceFileAdapter(),
                     MemoryAdapter(),
@@ -2413,6 +2425,7 @@ class AgentWebSocketServer:
                     DesignerAdapter(),
                     HarmonyOSAdapter(),
                     ConfigAdapter(on_config_saved=self._reload_after_config_save),
+                    MultimodalConfigAdapter(on_config_saved=self._reload_after_config_save),
                     self._jiuwenmate_web,
                 ):
                     self._adapter_registry.register(adapter)
@@ -3031,22 +3044,6 @@ class AgentWebSocketServer:
                 )
             return
 
-        from jiuwenswarm.server.front.protocol import unsupported_method_wire
-
-        if isinstance(data, dict):
-            method = data.get("method")
-            if method is None:
-                method = data.get("req_method")
-            error_wire = unsupported_method_wire(
-                method,
-                request_id=data.get("request_id"),
-                channel_id=data.get("channel") or data.get("channel_id"),
-            )
-            if error_wire is not None:
-                async with send_lock:
-                    await send_wire_payload(ws, error_wire)
-                return
-
         try:
             env = E2AEnvelope.from_dict(data)
         except Exception as parse_err:
@@ -3065,15 +3062,6 @@ class AgentWebSocketServer:
                 )
                 if not isinstance(legacy, dict):
                     raise ValueError("legacy_agent_request missing or not a dict")
-                error_wire = unsupported_method_wire(
-                    legacy.get("req_method"),
-                    request_id=legacy.get("request_id"),
-                    channel_id=legacy.get("channel_id"),
-                )
-                if error_wire is not None:
-                    async with send_lock:
-                        await send_wire_payload(ws, error_wire)
-                    return
                 request = _payload_to_request(legacy)
             else:
                 logger.info(
@@ -3463,6 +3451,11 @@ class AgentWebSocketServer:
                 return
 
             if await self._handle_lifecycle_request(ws, request, send_lock):
+                return
+            # A4P configuration belongs to the application. A legacy client
+            # may still provide a session ID, even for an archived session.
+            if request.req_method in {ReqMethod.A4P_CONFIG_GET, ReqMethod.A4P_CONFIG_UPDATE}:
+                await self._handle_a4p_request(ws, request, send_lock)
                 return
             from jiuwenswarm.server.runtime.session.lifecycle import (
                 LifecycleError,
@@ -4675,6 +4668,7 @@ class AgentWebSocketServer:
         channel_id = request.channel_id or "web"
         params = request.params if isinstance(request.params, dict) else {}
         prompt = str(params.get("content") or params.get("query") or "")
+        route_metadata = dict(request.metadata or {})
         await self.send_push(
             {
                 "request_id": request.request_id,
@@ -4732,6 +4726,18 @@ class AgentWebSocketServer:
                         or payload.get("message")
                         or "Runtime execution failed"
                     )
+                pushed_event_type = (
+                    str(payload.get("event_type") or "")
+                    if isinstance(payload, dict)
+                    else ""
+                )
+                # IM channels do not render runtime telemetry; forwarding it
+                # duplicates the answer that chat.final already delivered.
+                if should_skip_heartbeat_push(
+                    pushed_event_type,
+                    event.channel_id or channel_id,
+                ):
+                    continue
                 is_processing_start = (
                     isinstance(payload, dict)
                     and payload.get("event_type") == "chat.processing_status"
@@ -4752,10 +4758,8 @@ class AgentWebSocketServer:
                         "payload": payload,
                         "agent_ref": event.agent_ref,
                         "is_complete": event.is_complete,
-                        "metadata": (
-                            event.metadata
-                            if event.metadata is not None
-                            else request.metadata
+                        "metadata": merge_heartbeat_push_metadata(
+                            route_metadata, event.metadata
                         ),
                     }
                 )
@@ -6691,9 +6695,21 @@ class AgentWebSocketServer:
                 )
             elif method == "project.lifecycle" and params.get("events"):
                 # Full-directory scan of lifecycle state: keep it off the loop.
-                payload = await asyncio.to_thread(lc.events_feed)
+                payload = {"events": await asyncio.to_thread(lc.event_snapshots)}
             elif method == "project.lifecycle" and params.get("inventory"):
-                payload = await asyncio.to_thread(lc.inventory_feed)
+                from jiuwenswarm.server.runtime.session.project_store import (
+                    list_projects,
+                )
+                payload = {"projects": [dict(project_id=p.project_id,
+                            operation=lc.state("project", p.project_id).get("operation"))
+                            for p in list_projects(include_hidden=True, cache_bust=True)]}
+                known = {item["project_id"] for item in payload["projects"]}
+                directory = lc.get_agent_root_dir() / "lifecycle" / "resources"
+                for path in directory.glob("project_*.json"):
+                    operation = lc.read_json(path).get("operation") or {}
+                    project_id = operation.get("resource_id")
+                    if project_id and project_id not in known and operation.get("status") != "completed":
+                        payload["projects"].append(dict(project_id=project_id, operation=operation))
             elif method == "project.lifecycle":
                 project_id = lc.validate_id(params.get("project_id"))
 
@@ -9618,11 +9634,6 @@ class AgentWebSocketServer:
             if agent is None:
                 raise ValueError("Failed to get agent")
 
-            # command.compact_partial 同 /compact、/btw：非 chat 通道 RPC 需先
-            # ensure_instance 懒构建根 DeepAgent，否则 self._instance 为 None 时
-            # 压缩逻辑直接 noop（误报"无需压缩"）。
-            await agent.ensure_instance()
-
             result_data = await agent.compact_partial(
                 session_id=session_id,
                 turn_index=turn_index,
@@ -11144,6 +11155,7 @@ class AgentWebSocketServer:
         self, name: str, *, rollback_on_probe_failure: bool = True
     ) -> dict[str, Any]:
         """Run the shared connect flow and return a frontend payload."""
+        from jiuwenswarm.common.mcp_config import discard_probed_mcp
         from jiuwenswarm.server.runtime.mcp.registry import (
             connect_mcp,
             was_connect_cancelled,
@@ -11162,8 +11174,15 @@ class AgentWebSocketServer:
             # Required-token fields are metadata, not secrets.
             return {"type": "credentials_required", **item}
         # Confirm server-bearing MCPs are actually usable before connected.
-        probe_ok, _probe_reason = await self._agent_manager.probe_mcp_live_connection(name)
+        probe_ok, probe_reason = await self._agent_manager.probe_mcp_live_connection(name)
+        # Cancel may land while the probe is in flight; cancel_connect already
+        # rolled the record back, so a late result must not override it.
+        if was_connect_cancelled(name):
+            logger.info("[mcp] connect '%s' cancelled during probe", name)
+            await discard_probed_mcp(name)
+            return {"type": "cancelled", "name": name}
         if not probe_ok:
+            logger.warning("[mcp] probe failed for '%s': %s", name, probe_reason)
             if rollback_on_probe_failure:
                 try:
                     from jiuwenswarm.server.runtime.mcp.registry import (
@@ -11675,6 +11694,7 @@ class AgentWebSocketServer:
         self, name: str, *, max_attempts: int = 200, delay: float = 1.0
     ) -> dict[str, Any]:
         """Poll locally stored OAuth credentials until the loopback callback lands."""
+        from jiuwenswarm.common.mcp_config import discard_probed_mcp
         from jiuwenswarm.server.runtime.mcp.oauth_flow import load_oauth_credentials
         from jiuwenswarm.server.runtime.mcp.registry import (
             complete_host_oauth_auth,
@@ -11688,8 +11708,17 @@ class AgentWebSocketServer:
             credentials = await asyncio.to_thread(load_oauth_credentials, name)
             if credentials is not None:
                 item = await asyncio.to_thread(complete_host_oauth_auth, name)
-                probe_ok, _reason = await self._agent_manager.probe_mcp_live_connection(name)
+                probe_ok, probe_reason = await self._agent_manager.probe_mcp_live_connection(name)
+                # Cancel may land during auth completion or the probe;
+                # cancel_connect already rolled the record back.
+                if was_connect_cancelled(name):
+                    logger.info("[mcp] host OAuth '%s' cancelled during probe", name)
+                    await discard_probed_mcp(name)
+                    return {"type": "cancelled", "name": name}
                 if not probe_ok:
+                    logger.warning(
+                        "[mcp] host OAuth probe failed for '%s': %s", name, probe_reason,
+                    )
                     try:
                         from jiuwenswarm.server.runtime.mcp.registry import (
                             rollback_failed_connect,
@@ -13674,22 +13703,12 @@ class AgentWebSocketServer:
         async with send_lock:
             await send_wire_payload(ws, wire)
 
-    def _recommendation_active_request_ids(self) -> frozenset[str]:
-        runtime = self._execution_runtime()
-        pending = getattr(runtime, "_pending_chat_requests", None) or {}
-        return frozenset(
-            request_id
-            for bucket in pending.values()
-            for request_id in bucket
-        )
-
     def _recommendation_host_instance(self) -> Any:
         from jiuwenswarm.server.runtime.recommendation_host import RecommendationHost
 
         host = getattr(self, "_recommendation_host", None)
         if host is None:
             host = RecommendationHost()
-            host.bind_active_requests(self._recommendation_active_request_ids)
             host.bind_push(self._push_recommendation_event)
             self._recommendation_host = host
         return host
@@ -14093,7 +14112,6 @@ class AgentWebSocketServer:
                     model_selection=params.get("model_selection"),
                     moa_enabled=params.get("moa_enabled"),
                     cron_id=str(params.get("cron_id") or "").strip(),
-                    client_app=str(params.get("client_app") or "").strip(),
                 )
             )
             params.pop("_work_mode_explicit", None)

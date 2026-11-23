@@ -176,7 +176,7 @@ async def environment(tmp_path, monkeypatch, ttse_plugin_source):
     config = {
         "react": {"ttse": {"enabled": False}, "evolution": {"skill_evolution": False}},
         "modes": {"code": {"memory": {"enabled": False}}},
-        "observability": {"agent": {"enabled": False}},
+        "agent_observability": {"enabled": False},
         "progressive_tool_enabled": True,
     }
     acquired, released, saved = [], [], []
@@ -640,3 +640,53 @@ async def test_abandoned_nested_stream_releases_root_and_child_reservations():
     finally:
         await streams[0].aclose()
         loop.set_exception_handler(original_handler)
+
+
+@pytest.mark.parametrize("source", ["request", "saved", "mounted"])
+def test_turn_reservation_skips_invalid_names_without_changing_selection(monkeypatch, source):
+    adapter = object.__new__(interface_deep.JiuWenSwarmDeepAdapter)
+    names = ["", "  ", "a/b", "../x", "valid-plugin", "valid-plugin"]
+    adapter._current_plugin_names = lambda: names if source == "mounted" else []
+    saved = {"plugin_names": names if source == "saved" else []}
+    monkeypatch.setattr(session_metadata, "get_session_equipment", lambda *args, **kwargs: saved)
+    params = {"plugin_names": names} if source == "request" else {}
+    request = SimpleNamespace(params=params, session_id="test-session")
+    before = list(names)
+    assert adapter._plugin_turn_packages(request) == ["valid-plugin"]
+    assert names == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["a/b", "../x"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_turn_reservation_preserves_structured_equipment_errors(name, streaming):
+    adapter = object.__new__(interface_deep.JiuWenSwarmDeepAdapter)
+    adapter._current_plugin_names = lambda: []
+    request = SimpleNamespace(
+        params={"plugin_names": [name], "agent_template_name": ""}, session_id="",
+        request_id="invalid-plugin", channel_id="web", metadata={},
+    )
+
+    async def execute(request, inputs):
+        return await adapter._ensure_chat_extensions(request)
+
+    async def execute_stream(request, inputs):
+        response = await adapter._ensure_chat_extensions(request)
+        assert response is not None and not response.ok
+        yield interface_deep.AgentResponseChunk(
+            request_id=request.request_id, channel_id=request.channel_id,
+            payload=response.payload, is_complete=True,
+        )
+
+    if streaming:
+        adapter._process_stream_with_plugin_reservation = execute_stream
+        chunks = [chunk async for chunk in adapter.process_message_stream_impl(request, {})]
+        assert len(chunks) == 1
+        payload = chunks[0].payload
+    else:
+        adapter._process_message_with_plugin_reservation = execute
+        response = await adapter.process_message_impl(request, {})
+        assert not response.ok
+        payload = response.payload
+    assert payload["event_type"] == "chat.error"
+    assert "invalid plugin name" in payload["error"]

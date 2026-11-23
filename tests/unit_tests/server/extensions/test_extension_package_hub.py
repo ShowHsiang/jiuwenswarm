@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from jiuwenswarm.server.runtime import extension_package_manager as catalog
-from jiuwenswarm.enterprise.capabilities.experts.request_packages import bind_request_subject
+from jiuwenswarm.enterprise.capabilities.experts.allowlist import bind_request_subject
 from jiuwenswarm.server.runtime.marketplace.hub_asset_port import (
     HubAssetDetail,
     HubAssetSummary,
@@ -558,6 +558,72 @@ async def test_catalog_list_keeps_hub_card_when_same_named_local_exists(
     assert [(card["id"], card["source"], card["avatar"]) for card in cards] == [
         ("plugin-asset-uuid", "hub", "https://example.test/icon.png")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [None, False, True])
+async def test_plugin_mine_requires_an_installed_local_package(
+    extension_workspace: Path,
+    installed: bool | None,
+) -> None:
+    local = extension_workspace / "plugins" / "plugin_packages" / "local" / "css-style-editor"
+    local.mkdir(parents=True)
+    manifest = {
+        "package_type": "plugin",
+        "id": "css-style-editor",
+        "display_name": {"zh": "[TODO: 中文展示名]", "en": "[TODO: EN display name]"},
+    }
+    (local / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if installed is not None:
+        catalog.upsert_plugin_marketplace_entry(
+            "css-style-editor", installed=installed, source="local",
+        )
+    hub = FakeHubAssetPort(_item(kind="plugin"))
+
+    cards = await catalog.list_plugin_packages_with_hub({"filter": "mine"}, hub_port=hub)
+    direct_cards = catalog.list_plugin_packages({"filter": "mine"})
+    legacy_cards = await catalog.list_plugin_packages_with_hub({"filter": "local"}, hub_port=hub)
+
+    expected_ids = ["css-style-editor"] if installed else []
+    assert [card["id"] for card in cards] == expected_ids
+    assert [card["id"] for card in direct_cards] == expected_ids
+    assert [(card["id"], card["installed"]) for card in legacy_cards] == [
+        ("css-style-editor", bool(installed))
+    ]
+    assert hub.list_calls == []
+    assert json.loads((local / "manifest.json").read_text(encoding="utf-8")) == manifest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [False, True])
+async def test_plugin_mine_preserves_installed_hub_identity(
+    extension_workspace: Path,
+    installed: bool,
+) -> None:
+    local = extension_workspace / "plugins" / "plugin_packages" / "local" / "sales-plugin"
+    local.mkdir(parents=True)
+    (local / "manifest.json").write_text(
+        json.dumps({"package_type": "plugin", "id": "sales-plugin"}), encoding="utf-8",
+    )
+    catalog.upsert_plugin_marketplace_entry("sales-plugin", installed=installed, source="hub")
+    HubInstallStateStore(local.parent.parent).upsert(
+        HubInstallRecord(
+            asset_id="plugin-asset-uuid",
+            package_id="sales-plugin",
+            kind="plugin",
+            version="1.2.3",
+            checksum_sha256="a" * 64,
+            installed_at="2026-09-01T00:00:00Z",
+        ),
+    )
+    hub = FakeHubAssetPort(_item("plugin-asset-uuid", "plugin", "sales-plugin"))
+
+    cards = await catalog.list_plugin_packages_with_hub({"filter": "mine"}, hub_port=hub)
+
+    assert [(card["id"], card["packageName"], card["source"], card["installed"]) for card in cards] == (
+        [("plugin-asset-uuid", "sales-plugin", "hub", True)] if installed else []
+    )
+    assert hub.list_calls == []
 
 
 @pytest.mark.asyncio
@@ -1449,7 +1515,7 @@ class _CatalogPairHub:
 def _allow_hidden_and_sales():
     return bind_request_subject(
         {
-            "expert_packages": [
+            "package_allowlist": [
                 {"kind": "agent_template", "id": "sales-expert"},
                 {"kind": "agent_template", "id": _HIDDEN_EXPERT},
                 {"kind": "agent_group", "id": "sales-expert"},
@@ -1828,3 +1894,40 @@ async def test_replacement_restores_live_selection_after_failure(extension_works
         assert live == ["old-plugin"]
         assert marketplace.read_bytes() == original_marketplace
         assert catalog.hub_install_state_store("plugin_packages").get("plugin-asset-uuid") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcps", [None, [], [{"connector": " crm "}, {"connector": "crm"}]])
+async def test_replacement_uses_installed_manifest_connector_rules(extension_workspace, monkeypatch, mcps):
+    package = _seed_replaceable_plugin()
+    class Downloader(FakeDownloader):
+        def _manifest(self, artifact):
+            return {**super()._manifest(artifact), "mcps": mcps}
+    calls = []
+    monkeypatch.setattr(catalog, "unready_connectors", lambda names: calls.append(names) or [])
+    _, conflict = await _request_plugin_replacement()
+    ok, _ = await _request_plugin_replacement({
+        "replace_local": True, "local_fingerprint": conflict["conflict"]["local_fingerprint"],
+    }, downloader=Downloader())
+    assert ok
+    assert calls[0] == ([] if not mcps else ["crm"])
+    assert not (package / "local.txt").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mcps", ["invalid", [{"connector": " "}], [{"connector": 7}]])
+async def test_replacement_rejects_invalid_connectors_before_live_unload(extension_workspace, mcps):
+    package = _seed_replaceable_plugin()
+    before = (package / "manifest.json").read_bytes()
+    class Downloader(FakeDownloader):
+        def _manifest(self, artifact):
+            return {**super()._manifest(artifact), "mcps": mcps}
+    async def before_replace(_name):
+        pytest.fail("invalid manifest must not unload a live plugin")
+    _, conflict = await _request_plugin_replacement()
+    with pytest.raises(ValueError):
+        await _request_plugin_replacement({
+            "replace_local": True, "local_fingerprint": conflict["conflict"]["local_fingerprint"],
+        }, downloader=Downloader(), before_replace=before_replace)
+    assert (package / "manifest.json").read_bytes() == before
+    assert (package / "local.txt").read_text(encoding="utf-8") == "user changes"

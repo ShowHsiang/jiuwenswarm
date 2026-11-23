@@ -1230,9 +1230,8 @@ def _fill_mapped_path(path: str) -> str:
 
 
 def test_mapped_routes_dispatch_rpc_method(app_with_mock):
-    """Mounted table-driven routes for this edition reach dispatch with the declared rpc_method."""
+    """Every table-driven HTTP surface reaches dispatch with the declared rpc_method."""
     app, dispatch = app_with_mock
-    http_api = sys.modules["jw_web_http_api_routes_under_test"]
 
     async def _disp(*args, **kwargs):
         rid = kwargs.get("request_id") or "r"
@@ -1242,8 +1241,7 @@ def test_mapped_routes_dispatch_rpc_method(app_with_mock):
     dispatch.side_effect = _disp
     client = TestClient(app)
     failures: list[str] = []
-    mounted = web_http_routes.mapped_routes_for_edition(enterprise=http_api.is_enterprise())
-    for route in mounted:
+    for route in web_http_routes.MAPPED_ROUTES:
         url = "/api/v1" + _fill_mapped_path(route.path)
         req_kwargs: dict[str, Any] = {}
         if route.accept_body:

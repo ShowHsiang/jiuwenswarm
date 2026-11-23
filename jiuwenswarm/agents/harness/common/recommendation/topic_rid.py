@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -29,6 +30,7 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_starter import (
 from jiuwenswarm.agents.harness.common.recommendation.topic_terminal import (
     SessionSummaryArtifact,
 )
+from .topic_primitives import plain_int as _plain_int
 
 RID_SUMMARY_PAIR_MATCHER_ID = "icebreaker-specific-interest-ark-api-proxy"
 RID_SUMMARY_PAIR_MATCHER_VERSION = "icebreaker-table5-summary-pair-prompt-v1"
@@ -59,11 +61,6 @@ Use only the supplied summaries. Return MATCH only when both refer to the same \
 specific interest or subject; paraphrases are allowed. A shared generic theme such \
 as music, travel, technology, or entertainment is insufficient unless the specific \
 subject also aligns. Otherwise return NO_MATCH. Return only the required JSON object."""
-
-
-def _plain_int(value: Any) -> bool:
-    # bool is an int subclass; a JSON boolean is never a version or a count.
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _validate_config(config: ArkBackgroundConfig) -> None:
@@ -369,7 +366,8 @@ class ArkSpecificInterestMatcher:
             later,
             provider_config=self._config.safe_provenance(),
         )
-        cached = self._cached_label(
+        cached = await asyncio.to_thread(
+            self._cached_label,
             earlier,
             later,
             request_id=request_id,
@@ -377,7 +375,8 @@ class ArkSpecificInterestMatcher:
         if cached is not None:
             return cached
 
-        operation_id = self._record_attempt(
+        operation_id = await asyncio.to_thread(
+            self._record_attempt,
             earlier,
             later,
             request_id=request_id,
@@ -432,7 +431,8 @@ class ArkSpecificInterestMatcher:
             "provider_config": self._config.safe_provenance(),
             "provider_receipt": provider_receipt,
         }
-        recorded = self._store.record_event(
+        recorded = await asyncio.to_thread(
+            self._store.record_event,
             {
                 "session_id": later.session_id,
                 "slate_id": request_id,
@@ -443,10 +443,11 @@ class ArkSpecificInterestMatcher:
                 "propensity_reason": "not_applicable",
                 "payload": payload,
                 "created_at": time.time(),
-            }
+            },
         )
         if not recorded:
-            cached = self._cached_label(
+            cached = await asyncio.to_thread(
+                self._cached_label,
                 earlier,
                 later,
                 request_id=request_id,

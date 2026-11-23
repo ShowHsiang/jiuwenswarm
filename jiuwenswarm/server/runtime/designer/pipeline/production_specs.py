@@ -65,7 +65,7 @@ def _speech_table(shots: list[dict[str, Any]], characters: list[dict[str, Any]])
         for c in characters
         if isinstance(c, dict) and c.get("id")
     }
-    rows = ["| Shot | On camera | Speech (exact) | Motion |", "| --- | --- | --- | --- |"]
+    rows = ["| Shot | On camera | Speech (exact) | Motion beat |", "| --- | --- | --- | --- |"]
     for sh in shots:
         if not isinstance(sh, dict):
             continue

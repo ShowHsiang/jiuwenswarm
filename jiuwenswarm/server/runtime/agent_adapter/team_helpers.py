@@ -403,6 +403,15 @@ def _team_hide_teammate_enabled() -> bool:
     """Return whether non-leader teammate frames should be filtered out in team mode."""
     return os.environ.get(_HIDE_TEAMMATE_ENV_KEY, "").strip().lower() == "true"
 
+
+def _is_teammate_permission_card(parsed: dict[str, Any] | None) -> bool:
+    """Return whether a parsed frame is a user-visible teammate permission card."""
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("event_type") == "chat.ask_user_question"
+        and parsed.get("source") == "permission_interrupt"
+    )
+
 _INTERACT_REASON_ERROR_MAP: dict[str, str] = {
     "not_active": "Team is initializing, please try again later",
     "session_mismatch": "Session state mismatch, please refresh and retry",
@@ -1578,19 +1587,14 @@ async def _record_group_organization_plan(session_id: str, group_input: dict) ->
     """Record coordination state without changing the message or its mentions."""
     plan = None
     try:
-        from jiuwenswarm.agents.swarm.group_org_bootstrap import (
-            publish_pending_organization_card,
-            record_organization_plan,
-        )
+        from jiuwenswarm.agents.swarm.group_route import record_candidate
 
-        plan = record_organization_plan(
+        plan = await record_candidate(
             session_id,
             mentions=list(group_input["mentions"]),
             body=str(group_input.get("body") or ""),
             plan_id=str(group_input["client_message_id"]),
         )
-        if plan is not None:
-            await publish_pending_organization_card(session_id, plan)
         logger.info(
             "[TeamHelpers] group organization plan candidate session_id=%s "
             "mentions=%s recorded=%s",
@@ -2508,7 +2512,14 @@ def _is_duplicate_ask_user_question(
     parsed: dict[str, Any],
     emitted_request_ids: set[str],
 ) -> bool:
+    """Drop an immediate replay of the same ask.
+
+    Any other frame ends that burst. A permission card kept waiting after a
+    sibling runs is written again with the original tool_call_id, and that
+    refresh has to reach the client.
+    """
     if parsed.get("event_type") != "chat.ask_user_question":
+        emitted_request_ids.clear()
         return False
     request_id = str(parsed.get("request_id") or "").strip()
     if not request_id:
@@ -3765,6 +3776,9 @@ async def _process_team_message_stream(
             bootstrap_mode=team_bootstrap_mode,
             model_selection=runtime_model_selection,
         )
+        from jiuwenswarm.agents.swarm.assembly import assign_shared_sandbox_sys_operation
+
+        assign_shared_sandbox_sys_operation(team_spec, deep_agent)
         if group_input is not None:
             update_session_metadata(session_id=session_id,
                 conversation_type="group_chat",
@@ -4065,6 +4079,17 @@ async def _process_team_message_stream(
                     followup_payload,
                     run_context=run_context,
                 )
+                if not success and reason == "interrupt_already_resolved":
+                    # The in-flight round already consumed this permission card.
+                    # Closing it is the admission; a send error would be false.
+                    logger.info(
+                        "[TeamHelpers] permission answer already resolved by the in-flight round: "
+                        "channel_id=%s session_id=%s",
+                        _resolve_channel_id(channel_id),
+                        session_id,
+                    )
+                    success = True
+                    reason = None
                 if not success:
                     logger.warning(
                         "[TeamHelpers] interact failed: channel_id=%s session_id=%s reason=%s query=%s",
@@ -4925,6 +4950,9 @@ async def _consume_stream_with_query(
                     run_context=run_context,
                 )
                 if not result:
+                    # Busy and unavailable mean this answer was not admitted.
+                    # The runtime does not re-ask, so the frontend must see a
+                    # terminal error and keep the card retryable.
                     reason = str(getattr(result, "reason", None) or "interrupt_resume_rejected")
                     logger.warning(
                         "[TeamHelpers] interrupt resume interact rejected: "
@@ -4986,13 +5014,17 @@ async def _consume_stream_with_query(
                         session_id, getattr(chunk, "role", None), getattr(chunk, "type", None),
                     )
                 continue
-            # Optional: filter out all non-leader frames so the frontend only
-            # sees leader output. Leader-level control events
-            # (team.runtime_ready / team.completed) are kept because
-            # _is_leader_output returns True.
-            if _team_hide_teammate_enabled() and not is_leader:
-                continue
+            # Optional: filter out non-leader frames so the frontend only sees
+            # leader output. Parse first: a teammate permission card is the
+            # one non-leader frame that must still reach the user. Leader
+            # control events stay because _is_leader_output returns True.
             parsed = await run_stream_parser(parse_stream_chunk, chunk)
+            if (
+                _team_hide_teammate_enabled()
+                and not is_leader
+                and not _is_teammate_permission_card(parsed)
+            ):
+                continue
             if parsed is not None:
                 if (
                     parsed.get("event_type") == "chat.error"
@@ -5032,10 +5064,13 @@ async def _consume_stream_with_query(
                     continue
                 if _is_duplicate_ask_user_question(parsed, emitted_ask_user_request_ids):
                     continue
-                # Skip non-leader __interaction__ (permission ASK) — approval
-                # is routed internally via the leader; only leader
-                # interactions are forwarded to the frontend.
-                if not is_leader and parsed.get("event_type") == "chat.ask_user_question":
+                # Teammate questions stay off the frontend, except the user
+                # permission card, which keeps the member identity.
+                if (
+                    not is_leader
+                    and parsed.get("event_type") == "chat.ask_user_question"
+                    and parsed.get("source") != "permission_interrupt"
+                ):
                     continue
                 parsed["rid"] = round_id
                 # 标注来源 team，让前端能把这一帧分流到对应 team 的对话视图。

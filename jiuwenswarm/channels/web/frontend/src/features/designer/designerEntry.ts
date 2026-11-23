@@ -8,7 +8,6 @@ import { useDesignerStore } from './designerStore';
 import { useDesignerChatStore, type DesignerChatMessage } from './designerChatStore';
 import { designerWorkspaceClient } from './designerGraphClient';
 import { findDesignModelsProblem } from './designModelsReadiness';
-import { stripMentionAppendix, withMentionAppendix } from './designerMentions';
 import {
   mediaItemsToBootstrapReferences,
   type DesignerBootstrapReference,
@@ -98,7 +97,7 @@ export function seedDesignerChatHistory(sessionId: string, messages: DesignerCha
     .map((item) => ({
       id: item.id,
       role: item.role === 'user' ? 'user' : 'assistant',
-      content: item.role === 'user' ? stripMentionAppendix(item.content) : item.content,
+      content: item.content,
       timestamp: new Date(item.createdAt || Date.now()).toISOString(),
     }));
   if (history.length > 0) {
@@ -106,10 +105,7 @@ export function seedDesignerChatHistory(sessionId: string, messages: DesignerCha
   }
 }
 
-/**
- * One leader round: echo the user bubble, then ``chat.send(mode='team.design')``.
- * "@Label" mentions of canvas nodes reach the leader with their node ids appended.
- */
+/** One leader round: echo the user bubble, then ``chat.send(mode='team.design')``. */
 export async function sendDesignerLeaderMessage(params: {
   sessionId: string;
   prompt: string;
@@ -134,7 +130,7 @@ export async function sendDesignerLeaderMessage(params: {
     await flushApplicationConversationHistory(sessionId);
     await webClient.request('chat.send', {
       session_id: sessionId,
-      query: withMentionAppendix(prompt, useDesignerStore.getState().domainGraph),
+      query: prompt,
       mode: DESIGNER_TEAM_MODE,
       ...buildConversationModelPayload({
         mode: DESIGNER_TEAM_MODE,
@@ -197,8 +193,8 @@ export async function submitDesignComposer(params: {
     throw new Error('empty');
   }
   // Design landing gate (frontend-only): fail on the prompt itself when the
-  // chat / video / image models are missing or switched off, before any
-  // session or graph is created.
+  // chat model is missing or either generation modality has no multimodal
+  // model, before any session or graph is created.
   const modelProblem = await findDesignModelsProblem();
   if (modelProblem) {
     throw new Error(modelProblem);

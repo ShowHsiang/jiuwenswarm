@@ -20,6 +20,8 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmD
 def isolated_search_env(monkeypatch):
     for provider in ("bocha", "perplexity", "serper", "jina"):
         monkeypatch.setenv(f"{provider.upper()}_API_KEY", "")
+    for flag in ("FREE_SEARCH_DDG_ENABLED", "FREE_SEARCH_BING_ENABLED"):
+        monkeypatch.setenv(flag, "false")
     monkeypatch.setattr(mcp_paid_search.card, "description", mcp_paid_search.card.description)
     monkeypatch.setattr(mcp_paid_search.card, "input_params", deepcopy(mcp_paid_search.card.input_params))
     monkeypatch.setattr(mcp_toolkits, "_SEARCH_ABILITY_MANAGERS", WeakSet())
@@ -194,13 +196,22 @@ async def test_mcp_no_keys_does_not_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_existing_mcp_agent_refreshes_model_tools_on_enable_change_and_disable(monkeypatch):
+@pytest.mark.parametrize("free_search_enabled", [False, True])
+async def test_existing_mcp_agent_refreshes_model_tools_on_enable_change_and_disable(
+    monkeypatch: pytest.MonkeyPatch,
+    free_search_enabled: bool,
+) -> None:
     from openjiuwen.core.single_agent.ability_manager import AbilityManager
 
+    monkeypatch.setenv("FREE_SEARCH_DDG_ENABLED", str(free_search_enabled).lower())
     manager = AbilityManager()
     mcp_toolkits.track_mcp_search_tools(manager)
     resource_add = MagicMock()
-    monkeypatch.setattr(mcp_toolkits.Runner.resource_mgr, "add_tool", resource_add)
+    monkeypatch.setattr(
+        mcp_toolkits,
+        "Runner",
+        SimpleNamespace(resource_mgr=SimpleNamespace(add_tool=resource_add)),
+    )
     for provider in ("bocha", "serper"):
         monkeypatch.setenv("BOCHA_API_KEY", "")
         monkeypatch.setenv(f"{provider.upper()}_API_KEY", "test-key")
@@ -211,7 +222,12 @@ async def test_existing_mcp_agent_refreshes_model_tools_on_enable_change_and_dis
     mcp_toolkits.refresh_mcp_paid_search_tools()
     assert manager.get("mcp_paid_search") is None
     assert not any(item.name == "mcp_paid_search" for item in await manager.list_tool_info())
-    assert resource_add.call_count == 2
+    assert resource_add.call_args_list.count(call(mcp_paid_search, skip_if_exists=True)) == 2
+    assert resource_add.call_args_list.count(call(mcp_toolkits.mcp_free_search, skip_if_exists=True)) == (
+        3 if free_search_enabled else 0
+    )
+    assert (manager.get("mcp_free_search") is not None) == free_search_enabled
+    assert any(item.name == "mcp_free_search" for item in await manager.list_tool_info()) == free_search_enabled
 
 
 @pytest.mark.asyncio

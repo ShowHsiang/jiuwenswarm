@@ -172,10 +172,8 @@ type DesignerRoleConfig<R extends DesignerNodeRole | string> = {
   skip_llm?: boolean;
   /** The upload replaced the generated output. */
   user_replaced_output?: boolean;
-  /** Manual video or music length in whole seconds; overrides the storyboard timeline. */
+  /** Manual video length in whole seconds; overrides the storyboard timeline. */
   duration_sec?: number;
-  /** Music bed length. Kept in step with `duration_sec` when the toolbar sets it. */
-  film_duration_sec?: number;
 };
 
 export type DesignerNodeConfig =
@@ -213,7 +211,6 @@ export type DesignerNodeConfig =
       skip_llm?: boolean;
       user_replaced_output?: boolean;
       duration_sec?: number;
-      film_duration_sec?: number;
     };
 
 export const DESIGNER_EDGE_KIND_DATA = 'data' as const;
@@ -309,7 +306,7 @@ export type DesignerMediaSettingsPatch = {
 export type DesignerMediaCapabilities = {
   video: {
     configured_model: string;
-    /** Generation backend of the slot ('openrouter' for any non-native endpoint); null when no URL is set. */
+    /** Native generation backend of the slot; null on the OpenRouter-style path. */
     backend: string | null;
     model_id: string;
     provider: string;

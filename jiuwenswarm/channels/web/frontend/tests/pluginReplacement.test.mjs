@@ -24,7 +24,8 @@ globalThis.pluginReplacementTranslate = translate;
 await build({
   stdin: {
     contents: `export {usePluginPackageStore} from './src/stores/pluginPackageStore';
-      export {PluginReplacementDialog} from './src/components/ConnectorMarket/PluginReplacementDialog';`,
+      export {PluginReplacementDialog} from './src/components/ConnectorMarket/PluginReplacementDialog';
+      export {pluginPackagesApi, PluginReplacementError, PluginInstallPendingError} from './src/services/pluginPackagesApi';`,
     resolveDir: process.cwd(), loader: 'tsx',
   },
   outfile: 'node_modules/.cache/plugin-replacement.mjs',
@@ -49,7 +50,7 @@ await build({
     },
   }],
 });
-const { usePluginPackageStore: store, PluginReplacementDialog } = await import('../node_modules/.cache/plugin-replacement.mjs');
+const { usePluginPackageStore: store, PluginReplacementDialog, pluginPackagesApi, PluginInstallPendingError } = await import('../node_modules/.cache/plugin-replacement.mjs');
 const conflict = { package_id: 'ttse', local_version: '2.0', hub_version: '1.0', local_fingerprint: 'confirmed-hash' };
 const calls = [];
 const replies = [];
@@ -57,13 +58,14 @@ globalThis.pluginReplacementRequest = async (method, params) => {
   if (method !== 'plugin_packages.install') return { packages: [] };
   calls.push(params);
   const response = replies.shift();
+  if (response instanceof Error) throw response;
   if (response) throw { payload: response };
 };
 
 function reset() {
   calls.length = 0;
   replies.length = 0;
-  store.setState({ replacement: null, replacementRetries: {}, installingIds: {}, installed: {}, error: null });
+  store.setState({ replacement: null, replacementRetries: {}, installingIds: {}, installed: {}, error: null, packages: [], localPackages: [], detailCache: {}, installPendingMap: {} });
 }
 
 test('conflict does not install; cancel sends no second request', async () => {
@@ -142,5 +144,31 @@ test('dialog renders the shipped Chinese translations and version values', async
   } finally {
     await act(async () => root.unmount());
     globalThis.pluginReplacementTranslate = translate;
+  }
+});
+
+
+test('hub cards in the local list retain from_hub on installation', async () => {
+  reset();
+  store.setState({ localPackages: [{ id: 'asset-ttse', source: 'hub' }] });
+  await store.getState().install('asset-ttse');
+  assert.equal(calls[0].from_hub, true);
+});
+
+test('unrelated plugin errors preserve the original error', async () => {
+  reset();
+  const original = Object.assign(new Error('Original plugin validation failed'), {
+    payload: { error_code: 'PLUGIN_VALIDATION_FAILED' },
+  });
+  replies.push(original);
+  await assert.rejects(pluginPackagesApi.install('asset-ttse'), (error) => error === original);
+});
+
+test('pending connectors take precedence over replacement error codes', async () => {
+  for (const code of ['PLUGIN_LOCAL_CONFLICT', 'PLUGIN_REPLACEMENT_BUSY', 'PLUGIN_VALIDATION_FAILED']) {
+    reset();
+    replies.push({ error_code: code, pending_connectors: ['crm'], conflict });
+    await assert.rejects(pluginPackagesApi.install('asset-ttse'), (error) =>
+      error instanceof PluginInstallPendingError && error.pendingConnectors[0] === 'crm');
   }
 });

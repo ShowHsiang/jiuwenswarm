@@ -190,15 +190,8 @@ class GroupChatRepository(SQLiteStore):
                 "visible_from=excluded.visible_from,verified_at=excluded.verified_at,source_ref=excluded.source_ref, "
                 "revision=agent_group_access.revision+1 WHERE agent_group_access.status!='active' "
                 "AND excluded.verified_at>=agent_group_access.verified_at",
-                (
-                    namespace_id,
-                    agent_id,
-                    group_id,
-                    app_id,
-                    utc_time(visible_from or message_time or observed_at).isoformat(),
-                    stamp,
-                    source_ref,
-                ),
+                (namespace_id, agent_id, group_id, app_id,
+                 utc_time(visible_from or message_time or observed_at).isoformat(), stamp, source_ref),
             )
 
     def update_membership(self, namespace_id: str, agent_id: str, group_id: str, app_id: str,

@@ -35,6 +35,7 @@ await build({
   },
   outfile: 'node_modules/.cache/jev-settings-dialog.mjs',
   bundle: true, platform: 'node', format: 'esm', packages: 'external',
+  define: { 'import.meta.env.DEV': 'false' },
   loader: { '.css': 'empty', '.svg': 'dataurl', '.png': 'dataurl' },
   plugins: [{
     name: 'settings-boundaries',
@@ -46,7 +47,9 @@ await build({
       }));
       builder.onLoad({ filter: /.*/, namespace: 'boundary' }, ({ path }) => ({
         contents: path === 'react-i18next'
-          ? 'const t = key => key; export const useTranslation = () => ({ t });'
+          ? `const t = key => key;
+             export const useTranslation = () => ({ t });
+             export const initReactI18next = { type: '3rdParty', init() {} };`
           : path.endsWith('assets/settings')
             ? `import { createElement } from 'react';
                export const settingsActionIcons = { edit: () => createElement('svg'), delete: () => createElement('svg') };

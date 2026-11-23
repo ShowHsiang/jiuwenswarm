@@ -81,8 +81,9 @@ async def handle_local_conflict(
             raise ValueError("Hub plugin identity changed during replacement")
         staged = staging / package_id
         staged_manifest = catalog.read_package_manifest(staged) or {}
-        connectors = [item["connector"] for item in staged_manifest.get("mcps", [])
-                      if isinstance(item, dict) and isinstance(item.get("connector"), str)]
+        connectors = catalog.parse_manifest_connector_names(
+            staged_manifest, kind_label="plugin", package_name=package_id,
+        )
         pending = catalog.unready_connectors(connectors)
         if pending:
             return False, {"error": "Plugin connectors are not ready", "pending_connectors": pending}

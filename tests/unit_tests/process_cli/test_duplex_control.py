@@ -857,6 +857,28 @@ async def test_cancel_preserves_primary_reason_when_one_pump_close_fails(
 
 
 @pytest.mark.asyncio
+async def test_answer_close_failure_does_not_block_public_cancel_or_lose_cleanup_error(run_factory):
+    run = run_factory()
+    run.client.original.emit(_card())
+    run.start()
+    _, answer = await run.answer(await run.card())
+    answer.close_error = RuntimeError("answer close failed")
+    original_cancel = run.client.cancel
+
+    async def cancel(request):
+        assert answer.closed and answer.consumer.done()
+        assert not run.client.original.closed
+        return await original_cancel(request)
+
+    run.client.cancel = cancel
+    run.cancel()
+    result = await run.finish()
+    assert result.error.code == "CANCELLED" and result.exit_code == 130
+    assert result.error.details["cleanup_errors"] == ("control_streams",)
+    assert run.client.calls[-2:] == ["cleanup_session", "close"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["harness.activate_interaction", "missing-locator"])
 async def test_unsupported_interaction_never_uses_legacy_harness_or_auto_answer(
     kind: str, run_factory
@@ -1015,7 +1037,9 @@ async def test_full_output_queue_does_not_block_runtime_cancel_draining_producer
             else:
                 # Runtime cancellation can itself await the stream consumer
                 # draining a final burst; it need not cancel the adapter task.
-                for _ in range(1000):
+                # Exceed the output capacity so forwarding tail events would
+                # still deadlock, without making this a throughput benchmark.
+                for _ in range(2 * output_queues[0].maxsize + 1):
                     self.original.emit(_event("chat.delta", delta="shutdown tail"))
                 self.original.emit(_event("chat.final", content="shutdown tail"))
                 self.original.emit(None)

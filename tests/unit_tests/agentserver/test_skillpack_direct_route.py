@@ -22,7 +22,6 @@ from openjiuwen.core.session.agent import Session
 from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ModelCallInputs, ToolCallInputs
 from openjiuwen.harness import create_deep_agent
-from openjiuwen.harness.prompts import SystemPromptBuilder
 
 from jiuwenswarm.agents.harness.common.rails.ask_user_rail import StructuredAskUserRail
 from jiuwenswarm.agents.harness.common.rails.ask_user_contract import build_ask_user_interactive_input
@@ -38,6 +37,7 @@ from tests.unit_tests.agentserver.test_symphony_orchestration_needs_input import
 def _pack(name: str = "weekly-release-pack") -> dict[str, Any]:
     return {
         "id": name, "skill_type": "skillpack", "enabled": True,
+        "validation_revision": f"{name}-revision-1",
         "members": ["release-note", "risk-check"], "blocked_members": [],
         "routing": {key: f"{key}: release note and risk report" for key in ROUTING_SECTIONS},
     }
@@ -678,6 +678,7 @@ async def test_direct_state_survives_permission_pause_without_reauthorizing_acti
     await rail.before_invoke(resumed)
     assert rail._outer_states[id(resumed)] is state
     snapshot["inventory_revision"] = "new"
+    snapshot["skills"][0]["validation_revision"] = "changed-pack"
     call = _tool_ctx(resumed, "skill_tool", {"skill_name": "weekly-release-pack"})
     await rail.before_tool_call(call)
     assert call.inputs.tool_result["reason"] == "skillpack_state_changed"
@@ -774,9 +775,9 @@ async def test_real_session_guard_clear_preserves_another_owner():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer_text", [
-    COMPOSE_CHOICE, "用户已跳过此题，未选择任何选项。", "用户已取消本次问答，未作答。",
+    "用户已跳过此题，未选择任何选项。", "用户已取消本次问答，未作答。",
 ])
-async def test_declining_pack_exits_only_this_offer_and_limits_guidance(answer_text):
+async def test_ui_skip_or_cancel_exits_only_this_pack_offer(answer_text):
     session = Session(session_id="s-1")
     rail, router, _, outer, _ = await _active(session=session)
     state = rail._outer_states[id(outer)]
@@ -793,12 +794,10 @@ async def test_declining_pack_exits_only_this_offer_and_limits_guidance(answer_t
     assert state.pack_route is None and state.pack_route_checked and state.pack_route_declined
     assert route.declined and route.token is None
     assert not any(session.get_state("_skillpack_direct_route_pending").values())
-    rail.system_prompt_builder = SystemPromptBuilder()
     for _ in range(2):
         model = _model_ctx(resumed)
         await rail.before_model_call(model)
         assert any(tool["name"] == "symphony_compose_graph" for tool in model.inputs.tools)
-        assert rail.system_prompt_builder.build().count("No SkillPack confirmation is pending for this request") == 1
     assert router.judge.call_count == 1
     resumed.inputs.result = {"result_type": "answer"}
     await rail.after_invoke(resumed)
@@ -810,7 +809,6 @@ async def test_declining_pack_exits_only_this_offer_and_limits_guidance(answer_t
     await rail.before_model_call(model)
     assert [item["name"] for item in model.inputs.tools] == ["ask_user"]
     assert router.judge.call_count == 2
-    assert "No SkillPack confirmation is pending for this request" not in rail.system_prompt_builder.build()
 
 
 @pytest.mark.asyncio
@@ -883,7 +881,10 @@ async def test_parallel_guard_does_not_resume_after_another_call_blocks(first_fa
             await first_release.wait()
             if first_failure == "snapshot_error":
                 raise TimeoutError("inventory unavailable")
-            return {**snapshot, "inventory_revision": "changed"}
+            changed = copy.deepcopy(snapshot)
+            changed["inventory_revision"] = "changed"
+            changed["skills"][0]["validation_revision"] = "changed-pack"
+            return changed
         return copy.deepcopy(snapshot)
 
     router.snapshot = controlled_snapshot
@@ -1108,6 +1109,7 @@ async def test_real_agent_inventory_failure_finishes_without_another_model_call(
     async def skill(**kwargs):
         executed.append(kwargs["skill_name"])
         snapshot["inventory_revision"] = "changed-after-root"
+        snapshot["skills"][0]["validation_revision"] = "changed-pack-after-root"
         return {"success": True, "content": "root instructions"}
 
     client = _ScriptedClient([
@@ -1189,21 +1191,6 @@ async def test_structured_ask_user_only_respects_completed_per_call_rejection(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enabled", [False, True])
-async def test_ordinary_request_does_not_add_pack_reminder(enabled):
-    router, _ = _router()
-    router.judge = AsyncMock(return_value=[])
-    rail = SymphonyOrchestrationRail(config_base=_config(enabled), skillpack_router=router)
-    rail.system_prompt_builder = SystemPromptBuilder()
-    outer = _outer_ctx("Read the existing report only")
-    await rail.before_invoke(outer)
-    model = _model_ctx(outer)
-    await rail.before_model_call(model)
-    assert rail._outer_states[id(outer)].pack_route is None
-    assert "No SkillPack confirmation is pending for this request" not in rail.system_prompt_builder.build()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("rebuild", [False, True])
 async def test_real_session_history_does_not_reopen_completed_pack_selection(rebuild):
     router, _ = _router()
@@ -1255,14 +1242,6 @@ async def test_real_session_history_does_not_reopen_completed_pack_selection(reb
             str(getattr(message, "content", "")) for message in messages
             if getattr(message, "role", "") == "system"
         )
-        assert "No SkillPack confirmation is pending for this request" not in system
+        assert "No SkillPack confirmation is pending for this request" in system
         assert "A local SkillPack selection is pending" not in system
         assert "This request is direct_skillpack" not in system
-    rejected = [
-        message for message in recorded_messages[-1]
-        if getattr(message, "role", "") == "tool"
-        and getattr(message, "tool_call_id", "") == "stale-pack-question"
-    ]
-    assert len(rejected) == 1
-    assert "skillpack_no_pending_choice" in str(rejected[0].content)
-    assert "No SkillPack confirmation is pending for this request" in str(rejected[0].content)

@@ -8,6 +8,9 @@ import {
   PanelLeftOpen,
   Pin,
   PinOff,
+  Play,
+  Pause,
+  History,
   PencilLine,
   Plus,
   SquarePlus,
@@ -18,9 +21,11 @@ import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } f
 import { useTranslation } from 'react-i18next';
 import { MarkdownRenderer } from '../../../components/MarkdownRenderer';
 import { FilePreview } from '../../../components/ArtifactsPanel/FilePreview';
+import { formatTimestamp } from '../../../utils';
 import documentIcon from '../../../assets/jiuwenmate/icons/document.svg';
 import scheduleEmpty from '../../../assets/jiuwenmate/illustrations/schedule-empty.png';
-import { ActionMenu } from '../components/ActionMenu';
+import { ActionMenu, type JiuwenMateMenuItem } from '../components/ActionMenu';
+import { JiuwenMateDialog } from '../components/JiuwenMateDialog';
 import { GroupConversationRecord } from '../components/GroupConversationRecord';
 import { GroupChatWorkspace } from '../../groupChat/GroupChatWorkspace';
 import type { GroupDirectory } from '../../groupChat/useGroupDirectory';
@@ -47,7 +52,8 @@ import {
 } from '../jiuwenmateApi';
 import { ScheduleBoard } from '../schedules/ScheduleBoard';
 import { ScheduleDialog } from '../schedules/ScheduleDialog';
-import { scheduleSummary } from '../schedules/state';
+import { canEnableSchedule, scheduleDisplayStatus, scheduleSummary } from '../schedules/state';
+import { ScheduleHistory } from '../schedules/ScheduleHistory';
 import type { ScheduleDraft, ScheduleRun } from '../schedules/types';
 import type {
   JiuwenMateChannel,
@@ -84,6 +90,7 @@ import {
   clearManagementChannel,
   createWorkspaceState,
   openChannelTrace,
+  openManagementChannelTrace,
   selectChannel,
   selectManagementChannel,
   selectRecordTab,
@@ -103,6 +110,13 @@ function LiveReply({ text, animate, streaming }: { text: string; animate: boolea
   const content = useProgressiveText(text, animate);
   return <MarkdownRenderer content={content} isStreaming={streaming || content !== text}
     className="chat-text chat-markdown jiuwenmate-chat-markdown" />;
+}
+
+/** Match task timestamps and omit empty or invalid values. */
+function chatTimeText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : formatTimestamp(value);
 }
 
 
@@ -165,7 +179,7 @@ export interface JiuwenMateChannelApi {
 function initialState(colleague: JiuwenMateColleague, intent?: JiuwenMateWorkspaceIntent | null): JiuwenMateWorkspaceState {
   let state = createWorkspaceState(colleague.id, intent?.channelId ?? null);
   if (intent) state = selectRecordTab(state, intent.recordTab);
-  if (intent?.trace && intent.channelId) state = openChannelTrace(state);
+  if (intent?.trace && intent.channelId) state = openManagementChannelTrace(state, intent.channelId);
   if (compactWorkspace()) state = setRecordsCollapsed(state, true);
   return state;
 }
@@ -220,7 +234,7 @@ export function ColleagueWorkspacePage({
   const [state, setState] = useState(() => initialState(colleague, intent));
   const channelId = state.managementChannelId ?? state.selectedChannelId;
   const [board, setBoard] = useState(false);
-  const [rightPanel, setRightPanel] = useState<RightPanel>(null);
+  const [rightPanel, setRightPanel] = useState<RightPanel>(() => (intent?.trace && intent.channelId ? 'management' : null));
   const [recordsWidth, setRecordsWidth] = useState(368);
   const [panelWidth, setPanelWidth] = useState(400);
   const resizeDragRef = useRef<{ pointerId: number; side: 'records' | 'panel'; startX: number; startWidth: number } | null>(null);
@@ -262,6 +276,57 @@ export function ColleagueWorkspacePage({
   const [selectedArtifact, setSelectedArtifact] = useState<JiuwenMateSharedFile | null>(null);
   const [scheduleId, setScheduleId] = useState<string | null>(null);
   const [scheduleEditor, setScheduleEditor] = useState<JiuwenMateSchedule | undefined>(undefined);
+  const [scheduleHistory, setScheduleHistory] = useState<{ plan: JiuwenMateSchedule; runs: ScheduleRun[] } | null>(null);
+  const [scheduleActionError, setScheduleActionError] = useState('');
+  const [scheduleActionPending, setScheduleActionPending] = useState(false);
+  const scheduleActionRef = useRef(false);
+  const scheduleActionAgentRef = useRef(colleagueId);
+  scheduleActionAgentRef.current = colleagueId;
+  useEffect(() => {
+    setScheduleHistory(null);
+    setScheduleActionError('');
+  }, [colleagueId]);
+  const scheduleAction = (action: () => void | Promise<unknown>) => {
+    if (scheduleActionRef.current) return;
+    scheduleActionRef.current = true;
+    const actionAgentId = colleagueId;
+    setScheduleActionPending(true);
+    setScheduleActionError('');
+    void Promise.resolve().then(action)
+      .catch((failure: unknown) => {
+        if (scheduleActionAgentRef.current === actionAgentId) setScheduleActionError(errorMessage(failure));
+      })
+      .finally(() => { scheduleActionRef.current = false; setScheduleActionPending(false); });
+  };
+  const scheduleMenuItems = (plan: JiuwenMateSchedule): JiuwenMateMenuItem[] => [
+    { key: 'toggle', label: t(plan.enabled ? 'jiuwenmate.schedule.pause'
+      : canEnableSchedule(plan) ? 'jiuwenmate.schedule.resume' : 'jiuwenmate.schedule.resumeExpired'),
+      icon: plan.enabled ? Pause : Play,
+      disabled: scheduleActionPending || !onSetScheduleEnabled || (!plan.enabled && !canEnableSchedule(plan)),
+      onSelect: () => scheduleAction(() => onSetScheduleEnabled?.(plan.id, !plan.enabled)) },
+    { key: 'run', label: t('jiuwenmate.schedule.runNow'), icon: Play, disabled: scheduleActionPending,
+      onSelect: () => scheduleAction(() => onRunSchedule(plan.id)) },
+    { key: 'edit', label: t('jiuwenmate.schedule.editTask'), icon: PencilLine, disabled: scheduleActionPending,
+      onSelect: () => setScheduleEditor(plan) },
+    { key: 'history', label: t('jiuwenmate.schedule.history'), icon: History,
+      disabled: scheduleActionPending || !onLoadScheduleHistory,
+      onSelect: () => scheduleAction(async () => {
+        if (onLoadScheduleHistory) {
+          const history = await onLoadScheduleHistory(plan.id);
+          if (scheduleActionAgentRef.current === plan.agentId) setScheduleHistory(history);
+        }
+      }) },
+    { key: 'delete', label: t('jiuwenmate.schedule.delete'), icon: Trash2,
+      disabled: scheduleActionPending || !onDeleteSchedule,
+      onSelect: () => scheduleAction(() => onDeleteSchedule?.(plan.id)) },
+  ];
+  const scheduleStatus = (plan: JiuwenMateSchedule) => (
+    <small className="jiuwenmate-schedule-status" data-tone={scheduleDisplayStatus(plan)}
+      data-testid="jiuwenmate-workspace-schedule-status">
+      {t(`jiuwenmate.schedule.status.${scheduleDisplayStatus(plan)}`)}
+    </small>
+  );
+
   const [draft, setDraft] = useState('');
   // A conversation id not used yet; it becomes a listed conversation when its first message is sent.
   const [freshId, setFreshId] = useState(newId);
@@ -775,9 +840,17 @@ export function ColleagueWorkspacePage({
               : null
             : t(`jiuwenmate.chat.status.${phase}`);
     const draft = isPending(request) && request.draft?.text ? request.draft.text : null;
+    const sentTime = chatTimeText(request.receivedAt);
+    const replyTime = !isPending(request) && (request.replies.length > 0 || request.files.length > 0)
+      ? chatTimeText(request.updatedAt)
+      : null;
     return (
       <li key={request.requestId} data-testid="jiuwenmate-chat-request" data-phase={phase}>
         <p className="jiuwenmate-chat-message jiuwenmate-chat-message--user">{request.text}</p>
+        {sentTime ? (
+          <time className="jiuwenmate-chat-time jiuwenmate-chat-time--sent" dateTime={request.receivedAt}
+            data-testid="jiuwenmate-chat-message-time">{sentTime}</time>
+        ) : null}
         {approval ? (
           <article className="jiuwenmate-chat-approval" data-testid="jiuwenmate-chat-permission-approval" data-status={approval.status}>
             <strong>{t('jiuwenmate.chat.approval.title')}</strong>
@@ -846,6 +919,10 @@ export function ColleagueWorkspacePage({
             {renderSharedFile(file)}
           </article>
         ))}
+        {replyTime ? (
+          <time className="jiuwenmate-chat-time jiuwenmate-chat-time--reply" dateTime={request.updatedAt}
+            data-testid="jiuwenmate-chat-reply-time">{replyTime}</time>
+        ) : null}
         {note ? (
           <small className="jiuwenmate-chat-status" data-phase={phase}>
             {request.reason ? `${note}：${request.reason}` : note}
@@ -1132,17 +1209,18 @@ export function ColleagueWorkspacePage({
           <p className="jiuwenmate-records__empty jiuwenmate-records__empty--start">{t('jiuwenmate.workspace.noSchedules')}</p>
         ) : (
           colleaguePlans.map((plan) => (
-            <div key={plan.id} className="jiuwenmate-records__item" aria-current={plan.id === activePlan?.id ? 'true' : undefined}>
+            <div key={plan.id} className="jiuwenmate-records__item" aria-current={plan.id === activePlan?.id ? 'true' : undefined}
+              data-testid="jiuwenmate-workspace-schedule-item" data-variant={plan.id}>
               <button type="button" onClick={() => {
                 setScheduleId(plan.id);
                 if (compactWorkspace()) setState((current) => setRecordsCollapsed(current, true));
               }}>{plan.name}</button>
+              {scheduleStatus(plan)}
               <ActionMenu
                 label={t('jiuwenmate.workspace.more')}
-                items={[
-                  { key: 'edit', label: t('jiuwenmate.schedule.editTask'), icon: PencilLine, onSelect: () => setScheduleEditor(plan) },
-                  { key: 'delete', label: t('jiuwenmate.schedule.delete'), icon: Trash2, onSelect: () => void onDeleteSchedule?.(plan.id) },
-                ]}
+                floating
+                testId="jiuwenmate-workspace-schedule-menu"
+                items={scheduleMenuItems(plan)}
               />
             </div>
           ))
@@ -1432,6 +1510,19 @@ export function ColleagueWorkspacePage({
             onBack={() => groupChat.onSelectGroup()} />
         ) : renderMain()}
       </main>
+      {scheduleHistory ? (
+        <JiuwenMateDialog title={t('jiuwenmate.schedule.history')} width={780}
+          onClose={() => setScheduleHistory(null)} testId="jiuwenmate-workspace-schedule-history-dialog">
+          <ScheduleHistory plan={scheduleHistory.plan} runs={scheduleHistory.runs}
+            executor={colleague} onBack={() => setScheduleHistory(null)} />
+        </JiuwenMateDialog>
+      ) : null}
+      {scheduleActionError ? (
+        <JiuwenMateDialog title={t('jiuwenmate.schedule.actionFailed')}
+          onClose={() => setScheduleActionError('')} testId="jiuwenmate-workspace-schedule-error-dialog">
+          <p role="alert">{scheduleActionError}</p>
+        </JiuwenMateDialog>
+      ) : null}
       {scheduleEditor && onUpdateSchedule ? (
         <ScheduleDialog
           key={scheduleEditor.id}
@@ -1441,6 +1532,10 @@ export function ColleagueWorkspacePage({
           saving={savingSchedule}
           onClose={() => setScheduleEditor(undefined)}
           onSubmit={(_executor, draft) => onUpdateSchedule(scheduleEditor.id, draft)}
+          onSubmitAndEnable={onSetScheduleEnabled ? async (_executor, draft) => {
+            await onUpdateSchedule(scheduleEditor.id, draft);
+            await onSetScheduleEnabled(scheduleEditor.id, true);
+          } : undefined}
         />
       ) : null}
       {!board && !activeGroupId && rightPanel ? (
@@ -1525,14 +1620,15 @@ export function ColleagueWorkspacePage({
                       </p>
                     ) : null}
                     {visibleManagementPlans.map((plan) => (
-                      <div key={plan.id} className="jiuwenmate-side-panel__schedule-item">
+                      <div key={plan.id} className="jiuwenmate-side-panel__schedule-item"
+                        data-testid="jiuwenmate-management-schedule-item" data-variant={plan.id}>
                         <span className="jiuwenmate-side-panel__schedule-name">{plan.name}</span>
+                        {scheduleStatus(plan)}
                         <ActionMenu
                           label={t('jiuwenmate.workspace.more')}
-                          items={[
-                            { key: 'edit', label: t('jiuwenmate.schedule.editTask'), icon: PencilLine, onSelect: () => setScheduleEditor(plan) },
-                            { key: 'delete', label: t('jiuwenmate.schedule.delete'), icon: Trash2, onSelect: () => void onDeleteSchedule?.(plan.id) },
-                          ]}
+                          floating
+                          testId="jiuwenmate-workspace-schedule-menu"
+                          items={scheduleMenuItems(plan)}
                         />
                       </div>
                     ))}

@@ -4,13 +4,16 @@
 
 ## 本地双仓联调
 
-- 应用分支：`runtime-bai-adaptation`。
-- SDK：相邻目录 `../agent-core` 的 `react-runtime-bai` 分支，editable 安装；直接使用该分支当前工作区代码。
-- `pyproject.toml` 的 `[tool.uv.sources].openjiuwen` 指向本地路径；`override-dependencies` 同时覆盖新拆分的 agent-gateway 所携带的远端 SDK 钉。harmony 仅保留版本下限。
-- 在已有应用 `.venv` 中执行 `./scripts/use-local-agent-core.ps1`。脚本核对分支，再替换 SDK，最后验证实际导入路径；不会切分支。目录不相邻时传 `-AgentCorePath <路径>`。
-- 启动用已有 `.venv/Scripts/python.exe`、`.venv` 中的入口程序，或 `uv run --no-sync jiuwenswarm-start`。SDK Python 代码改动直接生效，已有进程需要重启才会重新导入。
+在相邻目录放置两个 checkout。应用使用 `runtime-bai-adaptation`（官方 `releases/0.2.9`），`../agent-core` 使用 `react-runtime-bai`（官方 `v0.1.21`）。在应用仓根目录执行：
 
-**当前依赖限制：** 最新官方应用要求 `opentelemetry-sdk>=1.28.0,<1.42`，本地 SDK 要求 `>=1.45.1`，完整 `uv lock` 仍失败。`uv.lock` 已随官方 develop 更新，但没有生成适用于本地 SDK 的完整新锁。联调脚本以 `--no-deps --no-build-isolation --editable` 仅替换 SDK；不能使用普通 `uv sync`、`uv run` 或 `--frozen` 声称这组完整依赖已闭环。当前联调 venv 已按官方锁定版本补入 agent-gateway、openjiuwen-protocol、openjiuwen-runtime-foundation、openjiuwen-computeruse、JiuwenMemory；干净环境与生产打包仍需解决依赖约束冲突。
+```powershell
+uv sync --locked
+uv run --locked jiuwenswarm-start
+```
+
+应用沿用发布版 `openjiuwen==0.1.21` 及其 extras 约束。`[tool.uv.sources]` 和 `uv.lock` 将该版本解析为 `../agent-core` 的 editable 安装，Gateway、协议与其他包使用发布锁中的版本。切换 SDK 源码后重启应用即可加载改动。
+
+若 SDK 在其他目录，先准备好同发行版本的应用环境，再运行 `./scripts/use-local-agent-core.ps1 -AgentCorePath <路径>`。脚本校验 SDK 分支、替换已有环境的 editable 安装并核对实际导入路径。这种自定义目录用 `.venv/Scripts/python.exe` 或 `uv run --no-sync` 启动，避免同步时恢复锁中的相邻目录。
 
 ## 配置
 
@@ -86,4 +89,4 @@ flowchart LR
 后续按顺序推进：为主要业务工具补可信证据/验收适配；用代表性轨迹在 observe 模式标注误触发与延迟；校准后逐步开启 active。恢复层以后通过独立接口对接，当前 BACKTRACK 不调用任何恢复动作。详细 SDK 算法见相邻仓库的 [运行监控说明](../../agent-core/docs/runtime_monitor.md)。
 
 
-2026-11-13 官方 develop 同步与共享配置验证记录见 `.agents/agent-docs/features/F_20261113_1109_runtime-bai-shared-jev.md`；英文用法见 [Runtime monitor](en/runtime-monitor.md)。
+发布基线、共享配置与验证记录见[应用实施记录](../.agents/agent-docs/features/F_20261113_1109_runtime-bai-shared-jev.md)；英文用法见 [Runtime monitor](en/runtime-monitor.md)。

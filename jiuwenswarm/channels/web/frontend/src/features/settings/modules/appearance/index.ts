@@ -1,1 +1,0 @@
-export { appearanceModule } from './definition';

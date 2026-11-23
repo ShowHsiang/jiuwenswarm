@@ -16,7 +16,7 @@ def verify_gateway_extensions() -> None:
     """Exercise the package's file-based loader without starting extensions."""
     package = import_module("agent_gateway")
     import_module("agent_gateway.app_gateway")
-    version("agent-gateway")
+    version("openjiuwen-agent-gateway")
     extension_loader = import_module("agent_gateway.extensions.loader").ExtensionLoader
 
     class VerificationLoader(extension_loader):
@@ -69,11 +69,11 @@ def run_isolated(executable: Path) -> int:
     script = Path(__file__).resolve()
     with TemporaryDirectory(prefix="gateway-bundle-check-") as directory:
         root = Path(directory).resolve()
-        (root / "infra/config").mkdir(parents=True)
+        (root / "config").mkdir()
         env = os.environ.copy()
         env["JIUWENSWARM_DATA_DIR"] = str(root)
         env["JIUWENSWARM_HOME"] = str(root)
-        env["AGENTOS_GATEWAY_LOG_DIR"] = str(root / "infra/logs/agent")
+        env["AGENTOS_GATEWAY_LOG_DIR"] = str(root / "logs")
         env.pop("JIUWENSWARM_RUNTIME_WORKSPACE_READY", None)
         result = subprocess.run(
             [str(executable), str(script)],

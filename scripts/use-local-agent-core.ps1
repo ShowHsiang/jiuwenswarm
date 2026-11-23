@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 $null = Get-Command uv -ErrorAction Stop
 & uv pip install --python $python --no-deps --no-build-isolation --editable $sdkRoot
 if ($LASTEXITCODE -ne 0) { throw 'Local SDK installation failed.' }
-# Use the venv directly so uv does not replace the editable package from an older lockfile.
+# Run the import probe in the selected venv so a custom checkout can be verified directly.
 & $python -c 'import pathlib, sys; import openjiuwen.core.single_agent.runtime_monitor.monitor as m; source = pathlib.Path(m.__file__).resolve(); root = pathlib.Path(sys.argv[1]).resolve(); assert source.is_relative_to(root), source; print("SDK source:", source)' $sdkRoot
 if ($LASTEXITCODE -ne 0) { throw 'Local SDK import verification failed.' }
 Write-Host "SDK branch: $expectedBranch"

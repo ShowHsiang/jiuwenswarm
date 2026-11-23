@@ -33,31 +33,37 @@ import json
 import os
 import re
 import sys
+import uuid
 import datetime
 import shutil
 import socket
 import stat
+import threading
 import time
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional
 import logging
-from logging.handlers import BaseRotatingHandler
+from logging.handlers import BaseRotatingHandler, RotatingFileHandler
 import portalocker
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
-from openjiuwen_protocol.logging_config import (
+from e2a.logging_config import (
     LOGGING_LEVEL_FIELDS,
     LOG_CONFIG_OP_DELETE,
     LOG_CONFIG_OP_FIELD,
 )
 from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+from jiuwenswarm.common.log_exception import format_log_exception
 from jiuwenswarm.common.runtime_log_filter import install_runtime_log_filter
 from jiuwenswarm.enterprise import is_enterprise
 
 _LOG_FILE_MAX_BYTES = 20 * 1024 * 1024
 _LOG_FILE_BACKUP_COUNT = 20
+_JSONL_LOG_LOCK = threading.Lock()
+
 
 # gateway 支持独立的日志目录（与其余组件日志分离），轮转归档文件同样落在该目录下。
 # 默认不启用（gateway.log 与其它日志同目录），由环境变量 AGENTOS_GATEWAY_LOG_DIR 指定，
@@ -564,6 +570,18 @@ def _resolve_preferred_language(
         except Exception as e:
             logger.error(f"Failed to load config.yaml: {e}")
     return "zh"
+
+
+def _uses_jiuwen_memory(config_path: Path) -> bool:
+    """Read the builtin memory provider during workspace bootstrap."""
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open(encoding="utf-8") as config_file:
+            config = YAML(typ="safe").load(config_file) or {}
+        return str(config["memory"]["builtin"]["provider"]).strip() == "jiuwen"
+    except (KeyError, TypeError, ValueError, OSError, YAMLError):
+        return False
 
 
 def _is_interactive() -> bool:
@@ -1091,6 +1109,227 @@ def cleanup_stale_openjiuwen_descs() -> None:
                 ) from exc
 
 
+def _read_previous_external_cli_state(config_path: Path) -> dict[str, Any]:
+    """读取 config.yaml 里用户的三方 agent 配置。
+
+    返回 external_cli_agents 列表、路径历史与 external_transport 节点。
+    文件缺失（全新数据目录）返回不含 agent 的空态；**读取/解析失败抛异常**，
+    由调用方区分"读取失败"与"确认无启用 agent"——旁路刷新不得把读取失败
+    当成空态覆盖唯一的恢复备份（!10406 第五轮检视）。
+    """
+    if not config_path.exists():
+        return {"agents": [], "histories": {}, "transport": None}
+    import yaml
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    team = ((data.get("modes") or {}).get("team") or {}).get("jiuwen_team") or {}
+    agents = team.get("external_cli_agents")
+    histories = team.get("external_cli_path_histories")
+    if not isinstance(agents, list) or not agents:
+        return {"agents": [], "histories": {}, "transport": team.get("external_transport")}
+    return {
+        "agents": agents,
+        "histories": histories if isinstance(histories, dict) else {},
+        "transport": team.get("external_transport"),
+    }
+
+
+def _restore_previous_external_cli_state(config_path: Path, state: dict[str, Any]) -> None:
+    """把覆盖前的三方 agent 配置写回新 config.yaml（ruamel round-trip 保格式）。
+
+    直接对被覆盖的目标文件做节点级更新——不能用全局 CONFIG_YAML_PATH 的更新
+    函数：prepare_workspace 可能带着与默认数据目录不同的 workspace_dir 被调用。
+    条目按当前允许清单过滤：旧配置里已不被支持的 agent 若原样回写，会在后续
+    配置归一化时抛 ValueError 导致保存失败。任一失败仅记录告警并保留模板
+    默认值，不阻塞 init。
+    """
+    try:
+        from ruamel.yaml import YAML
+        from jiuwenswarm.common.config import _allowed_external_cli_agents
+
+        allowed = set(_allowed_external_cli_agents())
+
+        def _allowed_entry(item: Any) -> bool:
+            if isinstance(item, dict):
+                name = str(item.get("cli_agent") or "").strip()
+            elif isinstance(item, str):
+                name = item.strip()
+            else:
+                return False
+            return bool(name) and name in allowed
+
+        agents = [item for item in state["agents"] if _allowed_entry(item)]
+        if not agents:
+            logger.info("覆盖前没有仍受支持的三方 agent 配置可保留")
+            return
+        yaml_rt = YAML()
+        yaml_rt.preserve_quotes = True
+        with config_path.open("r", encoding="utf-8") as handle:
+            data = yaml_rt.load(handle) or {}
+        modes = data.setdefault("modes", {})
+        team = modes.setdefault("team", {})
+        jiuwen_team = team.setdefault("jiuwen_team", {})
+        jiuwen_team["external_cli_agents"] = agents
+        histories = state.get("histories") or {}
+        if histories:
+            jiuwen_team["external_cli_path_histories"] = histories
+        # 跨进程 transport 不变式随 agents 一起恢复：agents 需要跨进程而
+        # transport 节点缺失时，后续配置归一化会直接抛错（!10406 第五轮）。
+        transport = state.get("transport")
+        if transport is not None:
+            jiuwen_team["external_transport"] = transport
+        # 原子写回：恢复写一半崩溃会留下半截 config.yaml，启动直接失败
+        # （!10406 检视），与 config.py 的落盘出口保持同样的原子语义。
+        tmp = config_path.with_name(f"{config_path.stem}.{uuid.uuid4().hex}.yaml.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                yaml_rt.dump(data, handle)
+            os.replace(tmp, config_path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        logger.info("已保留覆盖前的三方 agent 配置与路径历史")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"保留覆盖前的三方 agent 配置失败: {exc}")
+
+
+def external_cli_state_sidecar_path(workspace_dir: Path) -> Path:
+    """三方 agent 启用状态的旁路文件路径（位于 .jiuwenswarm 数据目录之外）。
+
+    数据目录被整体删除（重装/重置）后 config.yaml 不复存在，启用态无处
+    保留；旁路文件落在用户级应用数据目录，重装不会清除，init 时用于恢复
+    三方 agent 的启用配置。文件名按 workspace_dir 的摘要区分——项目支持
+    多工作区/多实例（JIUWENSWARM_DATA_DIR），旁路不能互相串台。
+    """
+    try:
+        from jiuwenswarm.common._build_config import DISPLAY_NAME
+    except Exception:  # noqa: BLE001
+        DISPLAY_NAME = "WorkSwarm"
+    if workspace_dir is None:
+        workspace_dir = get_user_workspace_dir()
+    identity = hashlib.sha1(str(Path(workspace_dir).resolve()).encode("utf-8")).hexdigest()[:10]
+    if os.name == "nt":
+        local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        return local_app_data / DISPLAY_NAME / f"external_cli_state-{identity}.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / DISPLAY_NAME / f"external_cli_state-{identity}.json"
+    return Path.home() / ".config" / DISPLAY_NAME / f"external_cli_state-{identity}.json"
+
+
+def refresh_external_cli_state_sidecar(config_path: Path, workspace_dir: Path) -> None:
+    """把 config.yaml 里的三方 agent 配置镜像到数据目录之外的旁路文件。
+
+    配置里没有启用中的 agent 时写入空态，init 依据空态不做恢复。
+    **读取失败与空态语义不同**：读取/解析失败时跳过刷新并保留既有旁路，
+    避免瞬时读失败把唯一的恢复备份覆盖成空态（!10406 第五轮检视）；旁路
+    本身用临时文件 + os.replace 原子写回，避免写一半截断恢复数据。
+    """
+    try:
+        state = _read_previous_external_cli_state(config_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"读取三方 agent 配置失败，跳过旁路刷新（保留既有旁路）: {exc}")
+        return
+    payload = state or {"agents": [], "histories": {}, "transport": None}
+    sidecar = external_cli_state_sidecar_path(workspace_dir)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sidecar.with_name(f"{sidecar.stem}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(tmp, sidecar)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_external_cli_state_sidecar(workspace_dir: Path) -> Optional[dict[str, Any]]:
+    """读取状态旁路文件；缺失/解析失败/无启用 agent 时返回 None。"""
+    try:
+        sidecar = external_cli_state_sidecar_path(workspace_dir)
+        if not sidecar.exists():
+            return None
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        agents = payload.get("agents") if isinstance(payload, dict) else None
+        if not isinstance(agents, list) or not agents:
+            return None
+        histories = payload.get("histories")
+        return {
+            "agents": agents,
+            "histories": histories if isinstance(histories, dict) else {},
+            "transport": payload.get("transport"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"读取三方 agent 状态旁路文件失败: {exc}")
+        return None
+
+
+def _filter_restorable_external_cli_state(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """按 cli_path 存在性校验旁路恢复条目（AI 检视 !10636）。
+
+    - 字符串形式条目（配置层支持的合法形状）与 cli_path 为空（内置托管
+      模式）的条目保留。
+    - cli_path 指向的文件存在（含 expanduser 与 Windows 升级 preserved
+      路径翻译）→ 保留。
+    - 路径根不可达（盘符/共享离线）→ 视为暂时不可用，保留不剔除。
+    - 路径根可达且文件确实不存在 → 丢弃（init -f 重置后不会出现
+      "agent 已开启但路径不存在"）。全部条目被丢弃时返回 None（落回模板默认）。
+    剔除结果不回写旁路：旁路保留原始恢复备份。
+    """
+    from jiuwenswarm.common.windows_cli_paths import resolve_preserved_cli_path
+
+    agents = state.get("agents") if isinstance(state, dict) else None
+    if not isinstance(agents, list):
+        return None
+    kept = []
+    dropped = []
+    for item in agents:
+        if isinstance(item, str):
+            if item.strip():
+                kept.append(item)
+            else:
+                dropped.append(item)
+            continue
+        if not isinstance(item, dict):
+            dropped.append(item)
+            continue
+        cli_path = str(item.get("cli_path") or "").strip()
+        if not cli_path:
+            kept.append(item)
+            continue
+        expanded = Path(cli_path).expanduser()
+        translated = resolve_preserved_cli_path(str(expanded))
+        candidate = Path(translated) if translated else expanded
+        anchor = candidate.anchor
+        if anchor and not Path(anchor).exists():
+            # 盘符/共享暂不可达：视为暂时不可用，不剔除。
+            kept.append(item)
+            continue
+        if candidate.is_file():
+            kept.append(item)
+        else:
+            dropped.append(item)
+    if dropped:
+        # 剔除不静默：init 输出/日志明确列出被剔除的条目（AI 检视 !10636）。
+        logger.warning(
+            "init 恢复：剔除 cli_path 已失效的三方 agent 条目（旁路保留原始备份）: %s",
+            [
+                (str(d.get("cli_agent") or d), str(d.get("cli_path") or ""))
+                for d in dropped
+                if isinstance(d, dict)
+            ],
+        )
+    if not kept:
+        return None
+    return {**state, "agents": kept}
+
+
 def prepare_workspace(
     overwrite: bool = True,
     preferred_language: Optional[str] = None,
@@ -1123,6 +1362,18 @@ def prepare_workspace(
 
     config_initialized = overwrite or not config_yaml_dest.exists()
     if config_initialized:
+        # init/重新部署用模板覆盖 config.yaml——三方 agent 的启用配置不取自被
+        # 覆盖的旧文件，而是从数据目录之外的状态旁路恢复（旁路在每次保存/清理
+        # 时镜像，见 dump_yaml_round_trip 的挂接点）。无论强制重置（init -f /
+        # overwrite）还是全新初始化，都从旁路恢复三方 agent 状态且保留旁路文件
+        # （2026-11-19 语义调整：init 后保持已安装/已开启状态；旁路缺失或为空
+        # 时自然落到模板默认；要彻底重置三方 agent，在 UI 里关闭对应 agent 并
+        # 保存，旁路即同步为空态，后续 init 恢复为空）。
+        pre_restore_state = _read_external_cli_state_sidecar(workspace_dir)
+        if pre_restore_state is not None:
+            # 强制重置/全新初始化都校验恢复条目：cli_path 已删除的安装被丢弃，
+            # 避免 init -f 后"agent 已开启但路径不存在"（AI 检视 !10636）。
+            pre_restore_state = _filter_restorable_external_cli_state(pre_restore_state)
         with TrackCopyDiff(
             dest=config_yaml_dest,
             is_file=True,
@@ -1130,6 +1381,8 @@ def prepare_workspace(
             overwrite=overwrite,
         ):
             shutil.copy2(config_yaml_src, config_yaml_dest)
+        if pre_restore_state is not None:
+            _restore_previous_external_cli_state(config_yaml_dest, pre_restore_state)
 
     resolved_lang = _resolve_preferred_language(config_yaml_dest, preferred_language)
 
@@ -1243,8 +1496,9 @@ def prepare_workspace(
         (f"AGENT{suffix}.md", "AGENT.md"),
         (f"IDENTITY{suffix}.md", "IDENTITY.md"),
         (f"SOUL{suffix}.md", "SOUL.md"),
-        (f"memory/MEMORY{suffix}.md", "memory/MEMORY.md"),
     ]
+    if not _uses_jiuwen_memory(config_yaml_dest):
+        multilang_files.append((f"memory/MEMORY{suffix}.md", "memory/MEMORY.md"))
     for src_name, dst_name in multilang_files:
         src_path = template_agent_workspace / src_name
         dst_path = deepagent_workspace / dst_name
@@ -1663,6 +1917,10 @@ def init_user_workspace(
                 f"entire {workspace_dir} will be deleted for clean initialization."
             )
             print("[jiuwenswarm-init] WARNING: This will delete all historical configuration and memory information.")
+            print(
+                "[jiuwenswarm-init] NOTE: External CLI agent state is restored from the state sidecar; "
+                "entries whose CLI path no longer exists are dropped."
+            )
             print("[jiuwenswarm-init] This action cannot be undone.")
             if _is_interactive():
                 confirmation = input(
@@ -1837,17 +2095,6 @@ def get_default_project_session_workspace_dir(session_id: str | None = None) -> 
     return workspace
 
 
-def get_domain_data_dir() -> Path:
-    """Get the root directory that hosts user-owned business data.
-
-    Sessions, agent workspaces, tenant data and runtime-state snapshots are
-    derived from this root, so it is the parent of :func:`get_agent_root_dir`.
-    Personal edition resolves to the user workspace, enterprise edition to the
-    tenant workspace currently bound in ``TenantContext``.
-    """
-    return get_agent_root_dir().parent
-
-
 def get_agent_root_dir(tenant_key: str | None = None) -> Path:
     """Get the agent root directory path.
 
@@ -1870,6 +2117,11 @@ def get_agent_root_dir(tenant_key: str | None = None) -> Path:
                 "tenant_context unavailable for agent root bind", exc_info=True
             )
     return get_multi_tenant_user_workspace_dir(tenant_key) / "agent"
+
+
+def get_package_avatar_cache_dir() -> Path:
+    """Return the tenant-scoped cache for HTTP-served package avatars."""
+    return get_agent_workspace_dir() / ".cache" / "package-avatars"
 
 
 def get_agent_home_dir() -> Path:
@@ -2484,6 +2736,35 @@ def get_logs_dir() -> Path:
     return get_agent_root_dir() / ".logs"
 
 
+def append_jsonl_log(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    max_bytes: int = _LOG_FILE_MAX_BYTES,
+    backup_count: int = _LOG_FILE_BACKUP_COUNT,
+) -> None:
+    """Append one JSON record with bounded backups and cross-process rotation.
+
+    Use the same numbered rotation as Worker logs. Open and close the handler
+    under the file lock so other processes cannot retain a rotated file handle.
+    A single oversized record is kept intact and rotated on the next append.
+    """
+    line = json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _JSONL_LOG_LOCK, portalocker.Lock(str(path) + ".lock", mode="a", timeout=1):
+        handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        try:
+            size = path.stat().st_size
+            added_bytes = len(line.encode("utf-8")) + len(os.linesep) - 1
+            rotation_enabled = max_bytes > 0 and backup_count > 0
+            if rotation_enabled and size and size + added_bytes > max_bytes:
+                handler.doRollover()
+            handler.stream.write(line)
+            handler.flush()
+        finally:
+            handler.close()
+
+
 def get_gateway_log_dir() -> Optional[Path]:
     """获取 gateway 独立日志目录；未配置时返回 ``None``（与其它日志同目录）。
 
@@ -2894,47 +3175,41 @@ def mask_sensitive(text: Any) -> str:
     return _sanitize_log_text(str(text))
 
 
+def _sanitize_log_record(record: logging.LogRecord) -> bool:
+    """Replace failed diagnostics with safe summaries and release raw inputs."""
+    successful = True
+    try:
+        record.msg = _sanitize_record_text(record.getMessage())
+    except Exception:
+        record.msg = "[log message omitted: redaction failed]"
+        successful = False
+    finally:
+        record.args = ()
+
+    try:
+        if record.exc_info or record.exc_text:
+            text = record.exc_text or format_log_exception(record.exc_info)
+            text = _sanitize_record_text(text)
+            if _record_text_exceeds_limit(text):
+                text = "[exception diagnostics omitted: redacted output exceeds UTF-8 byte limit]"
+            record.exc_text = text
+    except Exception:
+        record.exc_text = "[exception diagnostics omitted: formatting or redaction failed]"
+        successful = False
+    finally:
+        # A handler must never retry formatting a raw exception after failure,
+        # or retain its locals while a background sink is blocked.
+        record.exc_info = None
+    record.jiuwen_sensitive_sanitized = True
+    return successful
+
+
 class SensitiveDataFilter(logging.Filter):
     """Mask sensitive data in all log messages and tracebacks."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if getattr(record, "jiuwen_sensitive_sanitized", False):
-            return True
-
-        sanitized = True
-        try:
-            message = record.getMessage()
-            record.msg = _sanitize_record_text(message)
-            record.args = ()
-        except Exception:
-            # Never block logging because of desensitization failure.
-            sanitized = False
-
-        # Traceback 由 Formatter.formatException() 在 record.exc_text 中单独渲染，
-        # 不经过 record.getMessage()，因此 message 脱敏覆盖不到。这里提前把
-        # traceback 文本脱敏写入 record.exc_text 并清空 record.exc_info，
-        # 使 logger.exception()/exc_info=True 的异常栈也不会泄露 api_key 等。
-        try:
-            exc_info = record.exc_info
-            if exc_info and not record.exc_text:
-                import traceback as _traceback
-
-                # exc_info 是 (type, value, tb) 三元组。Python 3.10+ 的
-                # traceback.format_exception 新签名只接受单个异常实例：
-                # format_exception(exc, /, limit=None, chain=True)。
-                # 旧的 format_exception(*exc_info)（拆包成 3 个位置参数）依赖
-                # 兼容层，未来版本可能移除；改用 exc_info[1]（异常实例）是
-                # 官方推荐写法，面向未来且行为等价（None 时输出 "NoneType: None"）。
-                formatted = "".join(_traceback.format_exception(exc_info[1]))
-                record.exc_text = _sanitize_record_text(formatted)
-                record.exc_info = None
-            elif record.exc_text:
-                record.exc_text = _sanitize_record_text(record.exc_text)
-        except Exception:
-            # 同样不因脱敏失败而阻断日志输出。
-            sanitized = False
-        if sanitized:
-            record.jiuwen_sensitive_sanitized = True
+        if not getattr(record, "jiuwen_sensitive_sanitized", False):
+            _sanitize_log_record(record)
         return True
 
 
@@ -2960,6 +3235,9 @@ def install_source_record_masking() -> None:
     根 logger），在 LogRecord **创建瞬间**就被脱敏 message 与 traceback，
     保证任何来源的 api_key 都不明文落盘。
 
+    异常诊断只读取内存中的栈位置、异常链/组与备注，不查找源码行或捕获局部变量，
+    避免业务线程在 handler 接收日志前触发 linecache / 文件系统 IO。
+
     覆盖场景：
     - ``app_agentserver.py`` 用 ``logging.getLogger("openjiuwen.harness.security")``
       等 openjiuwen 命名空间 logger；
@@ -2978,37 +3256,11 @@ def install_source_record_masking() -> None:
 
     def _sanitizing_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = old_factory(*args, **kwargs)
-        try:
-            # message 脱敏（含 %s/format 格式化后的最终文本）。
-            msg = record.getMessage()
-            record.msg = _sanitize_record_text(msg)
-            record.args = ()
-            # traceback 脱敏：traceback 由 Formatter.formatException 从
-            # record.exc_text 单独渲染，getMessage 覆盖不到。此处提前渲染并脱敏，
-            # 清空 exc_info 使 Formatter 复用已脱敏的 exc_text。
-            exc_info = record.exc_info
-            if exc_info and not record.exc_text:
-                import traceback as _tb
-
-                formatted = "".join(_tb.format_exception(exc_info[1]))
-                record.exc_text = _sanitize_record_text(formatted)
-                record.exc_info = None
-            elif record.exc_text:
-                record.exc_text = _sanitize_record_text(record.exc_text)
-            record.jiuwen_sensitive_sanitized = True
-        except Exception:
-            # 永不因脱敏失败而阻断日志输出。但记录失败（计数 + 首次 stderr 提示），
-            # 避免静默吞掉异常导致 api_key 在无感知下明文泄露。
+        if not _sanitize_log_record(record):
             global _source_masking_failures
             _source_masking_failures += 1
-            if _source_masking_failures == 1:
-                # 仅首次打 stderr（不用 logging，避免自循环），提示运维脱敏失效。
-                # 后续仅靠计数器累积，避免高频失败刷屏。
-                print(
-                    "[jiuwenswarm] source record masking failed — secrets may be "
-                    "exposed in logs; check _source_masking_failures counter",
-                    file=sys.stderr,
-                )
+            # The record already carries fixed safe summaries. Do not retry
+            # raw formatting or perform synchronous diagnostic IO here.
         return record
 
     logging.setLogRecordFactory(_sanitizing_record_factory)
@@ -3016,6 +3268,12 @@ def install_source_record_masking() -> None:
 
 
 _RECORD_BYTE_LIMIT = 64 * 1024
+
+
+def _record_text_exceeds_limit(text: str) -> bool:
+    return len(text) > _RECORD_BYTE_LIMIT or (
+        not text.isascii() and len(text.encode("utf-8", errors="replace")) > _RECORD_BYTE_LIMIT
+    )
 
 
 def _sanitize_record_text(text: str) -> str:
@@ -3027,9 +3285,7 @@ def _sanitize_record_text(text: str) -> str:
     its full-text behavior.
     """
     # Short-circuit on characters to avoid encoding unbounded input.
-    if len(text) > _RECORD_BYTE_LIMIT or (
-        not text.isascii() and len(text.encode("utf-8", errors="replace")) > _RECORD_BYTE_LIMIT
-    ):
+    if _record_text_exceeds_limit(text):
         if text.lstrip().startswith(("{", "[")):
             return json.dumps({
                 "log_payload_omitted": True,

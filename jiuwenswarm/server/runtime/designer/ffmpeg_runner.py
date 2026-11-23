@@ -76,12 +76,11 @@ def _kill(proc: subprocess.Popen[str]) -> None:
         pass
 
 
-def run_ffmpeg(cmd: list[str], *, timeout: float, binary: bool = False) -> subprocess.CompletedProcess[Any]:
+def run_ffmpeg(cmd: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
     """Run one ffmpeg command to completion, killing it after ``timeout`` seconds.
 
     Blocking; call it from a :func:`run_off_loop` thread, never on the event loop.
-    stdin is closed so ffmpeg never waits for interactive keys. ``binary`` keeps
-    stdout / stderr as bytes (raw PCM piped to ``-``).
+    stdin is closed so ffmpeg never waits for interactive keys.
 
     Raises:
         RuntimeError: ffmpeg did not finish within ``timeout``.
@@ -94,12 +93,13 @@ def run_ffmpeg(cmd: list[str], *, timeout: float, binary: bool = False) -> subpr
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
-    if not binary:
-        kwargs.update(text=True, encoding="utf-8", errors="replace")
     if os.name == "nt":
         kwargs["creationflags"] = _CREATE_NO_WINDOW
-    proc: subprocess.Popen[Any] = subprocess.Popen(cmd, **kwargs)
+    proc: subprocess.Popen[str] = subprocess.Popen(cmd, **kwargs)
     if scope is not None and not scope.register(proc):
         _kill(proc)
         proc.communicate()

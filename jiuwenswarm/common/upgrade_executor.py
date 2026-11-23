@@ -14,6 +14,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from jiuwenswarm.common.version import __version__
+from jiuwenswarm.common.version_source import (
+    is_prerelease_version,
+    normalize_pypi_index_url,
+)
 from jiuwenswarm.common.utils import get_user_workspace_dir
 
 
@@ -247,15 +251,13 @@ class PipExecutor(UpgradeExecutor):
         try:
             if uv_cmd:
                 result = subprocess.run(
-                    [uv_cmd, "pip", "show", package],
+                    [uv_cmd, "pip", "show", "--format", "json", package],
                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                 )
                 if result.returncode == 0:
-                    if any(
-                        line.startswith("Editable project location:")
-                        and line.partition(":")[2].strip()
-                        for line in result.stdout.splitlines()
-                    ):
+                    import json as _json
+                    data = _json.loads(result.stdout)
+                    if isinstance(data, dict) and data.get("editable"):
                         return (
                             f"'{package}' is installed as an editable package. "
                             "Use 'git pull && uv sync' to update instead."
@@ -324,11 +326,21 @@ class PipExecutor(UpgradeExecutor):
         return PipExecutor._find_uv_binary()
 
     def _build_install_args(self, package: str, timeout: int) -> list[str]:
-        pypi_mirror = self._config.get("pypi_mirror", "").strip()
+        # Migrate the legacy Aliyun mirror base (issue 6288) at the final pip
+        # boundary, so configs saved by older builds still upgrade correctly.
+        pypi_mirror = normalize_pypi_index_url(self._config.get("pypi_mirror", ""))
+        # The check can resolve a pre-release target (beta channel); pip and uv
+        # skip pre-releases by default, which silently no-ops the upgrade. Only
+        # opt in when the offered release is a pre-release.
+        allow_prerelease = is_prerelease_version(
+            str(self._config.get("latest_version") or "")
+        )
 
         uv_cmd = self._resolve_uv_command()
         if uv_cmd:
             args = [uv_cmd, "pip", "install", "--upgrade", package]
+            if allow_prerelease:
+                args.extend(["--prerelease", "allow"])
             if pypi_mirror:
                 args.extend(["--index-url", pypi_mirror])
             return args
@@ -338,6 +350,8 @@ class PipExecutor(UpgradeExecutor):
             "--timeout", str(timeout),
             package,
         ]
+        if allow_prerelease:
+            args.append("--pre")
         if pypi_mirror:
             args.extend(["-i", pypi_mirror])
         return args

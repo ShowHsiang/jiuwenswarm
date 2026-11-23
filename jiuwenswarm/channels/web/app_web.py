@@ -8,6 +8,7 @@ Supports ``--dotenv <path>`` for multi-instance isolation.
 from __future__ import annotations
 
 import argparse
+import codecs
 import errno
 import hmac
 import http.client
@@ -157,6 +158,105 @@ def _parse_single_byte_range(
     if start >= file_size or end < start:
         return None
     return start, min(end, file_size - 1)
+
+
+_TEXTUAL_MIME_TYPES = frozenset(
+    {
+        "application/javascript",
+        "application/json",
+        "application/xhtml+xml",
+        "application/xml",
+        "application/x-ndjson",
+    }
+)
+_TEXTUAL_EXTENSION_MIME_TYPES = {
+    ".conf": "text/plain",
+    ".csv": "text/csv",
+    ".htm": "text/html",
+    ".html": "text/html",
+    ".ini": "text/plain",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".jsonl": "application/x-ndjson",
+    ".log": "text/plain",
+    ".markdown": "text/markdown",
+    ".md": "text/markdown",
+    ".mdx": "text/markdown",
+    ".mjs": "text/javascript",
+    ".ndjson": "application/x-ndjson",
+    ".py": "text/plain",
+    ".text": "text/plain",
+    ".ts": "text/plain",
+    ".tsx": "text/plain",
+    ".txt": "text/plain",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+}
+_TEXT_CHARSET_READ_BYTES = 65536
+
+
+def _is_textual_mime_type(mime_type: str) -> bool:
+    """Return whether a browser decodes this payload with a text charset."""
+    normalized = mime_type.split(";", 1)[0].strip().lower()
+    return (
+        normalized.startswith("text/")
+        or normalized in _TEXTUAL_MIME_TYPES
+        or normalized.endswith(("+json", "+xml"))
+    )
+
+
+def _guess_text_charset(file_path: Path) -> str:
+    """Sniff a text artifact's charset from its BOM or complete UTF-8 bytes.
+
+    Artifacts are written as UTF-8, but a workspace can still hold legacy GBK
+    files. ``gb18030`` is a superset of GBK/GB2312, so one fallback decodes
+    both. The UTF-8 check is incremental so large files stay bounded in memory;
+    scanning the complete file avoids treating an ASCII-only prefix as evidence
+    that the rest of a legacy file is UTF-8. An incomplete UTF-8 sequence at EOF
+    is tolerated because an artifact may still be in the process of being written.
+    """
+    try:
+        with file_path.open("rb") as file_obj:
+            prefix = file_obj.read(4)
+            if prefix.startswith(codecs.BOM_UTF8):
+                return "utf-8"
+            if prefix.startswith(codecs.BOM_UTF16_LE):
+                return "utf-16le"
+            if prefix.startswith(codecs.BOM_UTF16_BE):
+                return "utf-16be"
+
+            file_obj.seek(0)
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            while True:
+                chunk = file_obj.read(_TEXT_CHARSET_READ_BYTES)
+                if not chunk:
+                    break
+                decoder.decode(chunk, final=False)
+            # Keep a partial trailing character buffered: it must not change
+            # the charset of an otherwise valid UTF-8 document.
+    except OSError:
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "gb18030"
+    return "utf-8"
+
+
+def _text_content_type(
+    mime_type: str, file_path: Path, file_name: str | None = None,
+) -> str:
+    """Declare the charset of a text artifact served to a browser.
+
+    ``/file-api/download`` and ``/file-api/raw-file`` are navigated directly by
+    the desktop built-in browser and by artifact HTML preview iframes.  A text
+    response without ``charset`` is decoded with the browser default instead of
+    the artifact's own encoding, so Chinese artifacts render as mojibake.
+    """
+    normalized_mime_type = _TEXTUAL_EXTENSION_MIME_TYPES.get(
+        Path(file_name or file_path.name).suffix.lower(), mime_type
+    )
+    if not _is_textual_mime_type(normalized_mime_type):
+        return mime_type
+    return f"{normalized_mime_type}; charset={_guess_text_charset(file_path)}"
 
 
 def _get_agent_teams_root(project_root: Path) -> Path:
@@ -375,6 +475,11 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     _WS_CONNECT_TIMEOUT = 10
     _WS_HANDSHAKE_TIMEOUT = 10
     _WS_SELECT_TIMEOUT = 60
+    # 隧道向浏览器回写时的最长等待。浏览器在渲染大段历史时会短暂停止读取
+    # socket（远程访问尤其明显），内核发送缓冲满后 send 返回 EAGAIN；这只是
+    # 接收端背压，不是对端已死。1 秒即判死会把正在回放的历史和 config.get
+    # 响应一起丢掉，因此这里给足 30 秒，只有持续无法写入才关闭隧道。
+    _WS_WRITE_STALL_TIMEOUT = 30.0
     _WS_RECV_BUFFER = 65536
     _WS_HANDSHAKE_MAX_SIZE = 65536
     _WS_HANDSHAKE_RECV_SIZE = 4096
@@ -634,15 +739,12 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _proxy_http(
-        self, *, target: str | None = None, path: str | None = None,
-        stream_sse: bool = False, login_surface: str | None = None,
-    ) -> None:
+    def _proxy_http(self) -> None:
         outer_host = self._clean_outer_host()
         if outer_host is None:
             self._write_proxy_error(400, "invalid Host header")
             return
-        parsed = urlparse(target or self.api_target)
+        parsed = urlparse(self.api_target)
         if parsed.scheme == "https":
             ssl_ctx = None if _get_ssl_verify() else _get_insecure_ssl_context()
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
@@ -671,43 +773,22 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                     continue
                 if normalized_key == "host":
                     continue
-                if login_surface and normalized_key == "x-jiuwen-web-surface":
-                    continue
                 if normalized_key in self._UNTRUSTED_FORWARDED_HOST_HEADERS:
                     continue
                 forward_headers[key] = value
             forward_headers["Host"] = outer_host
 
-            if login_surface:
-                forward_headers["X-Jiuwen-Web-Surface"] = login_surface
-            conn.request(self.command, path or self.path, body=body, headers=forward_headers)
+            conn.request(self.command, self.path, body=body, headers=forward_headers)
             resp = conn.getresponse()
-            streaming = (
-                stream_sse
-                and self.command != "HEAD"
-                and resp.getheader("Content-Type", "").startswith("text/event-stream")
-            )
-            resp_body = b"" if streaming else resp.read()
+            resp_body = resp.read()
 
             self.send_response(resp.status, resp.reason)
             for key, value in resp.getheaders():
                 if key.lower() in self._HOP_BY_HOP_HEADERS:
                     continue
                 self.send_header(key, value)
-            if streaming:
-                self.close_connection = True
-                self.send_header("Connection", "close")
             self.end_headers()
-            if streaming:
-                try:
-                    chunk = resp.read1(65536)
-                    while chunk:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                        chunk = resp.read1(65536)
-                except (OSError, http.client.HTTPException):
-                    return
-            elif self.command != "HEAD":
+            if self.command != "HEAD":
                 self.wfile.write(resp_body)
         except Exception as exc:  # noqa: BLE001
             self.log_error("proxy http error: %s", exc)
@@ -715,8 +796,8 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _proxy_websocket_tunnel(self, *, target: str | None = None) -> None:
-        parsed = urlparse(target or self.ws_target)
+    def _proxy_websocket_tunnel(self) -> None:
+        parsed = urlparse(self.ws_target)
         if parsed.scheme not in ("ws", "wss", "http", "https"):
             self.send_error(500, "ws proxy target must be ws/wss/http/https")
             return
@@ -907,9 +988,11 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                             )
                             if not would_block:
                                 raise
-                            _, writable, _ = select.select([], [target], [], 1.0)
+                            _, writable, _ = select.select(
+                                [], [target], [], self._WS_WRITE_STALL_TIMEOUT
+                            )
                             if not writable:
-                                # 长时间不可写，对端疑似卡死，关闭隧道避免空转
+                                # 持续无法写入，对端疑似卡死，关闭隧道避免空转
                                 self.log_error(
                                     "proxy ws write stalled, closing tunnel: %s",
                                     _format_ws_diagnostics(
@@ -1020,89 +1103,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             return False
 
         self._send_desktop_forbidden()
-        return True
-
-    def _resolve_enterprise_upstream(self) -> tuple[str, str] | None:
-        target = os.getenv("USER_WEB_MANAGER_TARGET", "").rstrip("/")
-        if not target:
-            self._write_proxy_error(503, "user authorization is unavailable")
-            return None
-        authorization = self.headers.get("Authorization")
-        if not authorization:
-            token = self._get_auth_cookie("openjiuwen_user_access_token")
-            if not token:
-                self._write_proxy_error(401, "not authenticated")
-                return None
-            authorization = f"Bearer {token}"
-
-        import httpx
-
-        try:
-            response = httpx.get(
-                f"{target}/api/v1/user-console/user-face-upstream",
-                headers={
-                    "Authorization": authorization,
-                    "Cookie": self.headers.get("Cookie", ""),
-                },
-                timeout=5,
-                trust_env=False,
-            )
-        except httpx.HTTPError:
-            self._write_proxy_error(503, "user authorization is unavailable")
-            return None
-        if response.status_code in (401, 403):
-            self._write_proxy_error(response.status_code, "user access denied")
-            return None
-        if response.status_code != 200:
-            self._write_proxy_error(503, "user authorization is unavailable")
-            return None
-        http_target = response.headers.get("X-Gateway-Http-Upstream")
-        ws_target = response.headers.get("X-Gateway-Ws-Upstream")
-        if not http_target or not ws_target:
-            self._write_proxy_error(502, "incomplete user upstream")
-            return None
-        return http_target, ws_target
-
-    def _dispatch_enterprise(self) -> bool:
-        from jiuwenswarm.enterprise import is_enterprise
-
-        if not is_enterprise():
-            return False
-        path = urlparse(self.path).path
-        if path.startswith("/idp/"):
-            target = os.getenv("USER_WEB_IDP_TARGET", "")
-            if target:
-                self._proxy_http(target=target, path=self.path.removeprefix("/idp"), login_surface="user")
-            else:
-                self._write_proxy_error(503, "identity service is unavailable")
-            return True
-        if path == "/manager-api" or path.startswith("/manager-api/"):
-            if not path.startswith("/manager-api/v1/user-console/"):
-                self._write_proxy_error(404, "not found")
-                return True
-            target = os.getenv("USER_WEB_MANAGER_TARGET", "")
-            if target:
-                self._proxy_http(target=target, path=self.path.replace("/manager-api", "/api", 1))
-            else:
-                self._write_proxy_error(503, "manager service is unavailable")
-            return True
-        gateway_api = path == "/gateway-api" or path.startswith("/gateway-api/")
-        ws = self._is_ws_route()
-        if not (gateway_api or ws or self._is_api_route() or self._is_file_api_route()
-                or self._is_share_api_route()):
-            return False
-        upstream = self._resolve_enterprise_upstream()
-        if upstream is None:
-            return True
-        http_target, ws_target = upstream
-        if ws:
-            if self._is_websocket_upgrade():
-                self._proxy_websocket_tunnel(target=ws_target)
-            else:
-                self.send_error(400, "expected websocket upgrade")
-        else:
-            forward_path = self.path.replace("/gateway-api", "/api", 1) if gateway_api else self.path
-            self._proxy_http(target=http_target, path=forward_path, stream_sse=True)
         return True
 
     def _dispatch_proxy(self) -> bool:
@@ -1633,7 +1633,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             start, end = byte_range or (0, max(file_size - 1, 0))
             content_length = 0 if file_size == 0 else end - start + 1
             self.send_response(206 if byte_range is not None else 200)
-            self.send_header("Content-Type", mime_type or "application/octet-stream")
+            self.send_header(
+                "Content-Type",
+                _text_content_type(mime_type or "application/octet-stream", full_path),
+            )
             self.send_header("Content-Length", str(content_length))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Cache-Control", "no-store")
@@ -1889,7 +1892,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             start, end = byte_range or (0, max(0, file_size - 1))
             content_length = 0 if file_size == 0 else end - start + 1
             self.send_response(206 if byte_range is not None else 200)
-            self.send_header("Content-Type", mime_type)
+            self.send_header(
+                "Content-Type",
+                _text_content_type(mime_type, Path(file_path), file_name),
+            )
             self.send_header("Content-Length", str(content_length))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header(
@@ -2421,8 +2427,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         self._write_json(status, payload)
 
     def do_GET(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         parsed = urlparse(self.path)
         if parsed.path == "/oauth/hub/callback":
             from jiuwenswarm.channels.web.hub_oauth import complete
@@ -2465,8 +2469,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         parsed = urlparse(self.path)
         if parsed.path in {"/marketplace-oauth/hub/start", "/marketplace-oauth/hub/result"}:
             from jiuwenswarm.channels.web.hub_oauth import result, start
@@ -2512,36 +2514,26 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         self.send_error(405, "method not allowed")
 
     def do_PUT(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         if self._dispatch_proxy():
             return
         self.send_error(405, "method not allowed")
 
     def do_PATCH(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         if self._dispatch_proxy():
             return
         self.send_error(405, "method not allowed")
 
     def do_DELETE(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         if self._dispatch_proxy():
             return
         self.send_error(405, "method not allowed")
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         if self._dispatch_proxy():
             return
         self.send_error(405, "method not allowed")
 
     def do_HEAD(self) -> None:  # noqa: N802
-        if self._dispatch_enterprise():
-            return
         parsed = urlparse(self.path)
         if self._is_share_api_route():
             self._handle_share_api_get(parsed)

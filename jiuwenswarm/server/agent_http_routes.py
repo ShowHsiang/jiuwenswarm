@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import sys
-import uuid
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -28,7 +27,6 @@ from jiuwenswarm.common.log_context import (
     current_log_session_id,
     unbind_log_session,
 )
-from jiuwenswarm.common.request_ext import METADATA_KEY
 from jiuwenswarm.common.schema.agent import AgentRequest
 from jiuwenswarm.common.schema.message import ReqMethod
 from jiuwenswarm.server import http_chat
@@ -407,11 +405,6 @@ def _header(request: Request, name: str, default: str) -> str:
     return text or default
 
 
-def _default_request_id() -> str:
-    """缺省 request_id 一次一个：同会话并发聊天不再登记同一条 push 路由。"""
-    return f"http-{uuid.uuid4().hex[:12]}"
-
-
 def _client_json(body: dict[str, Any]) -> dict[str, Any]:
     """收成 runtime 客户端认识的 ``{ok, data, error}``。"""
     ok = bool(body.get("ok"))
@@ -435,9 +428,8 @@ def _rebuild_identity_from_headers(request: Request) -> tuple[str, dict[str, Any
     """从 Gateway 透传的 ``X-*`` 头重建 ``user_id`` 和 ``metadata``。
 
     Gateway 的 REST 正文只有业务参数。身份在头里：``X-User-Id``、路由三维、
-    企业租户三字段，以及内部扩展头。定时任务推送真渠道在 ``X-Cron-Targets``，
-    重建为顶层 ``metadata["targets"]``。企业版的专家包名单在
-    ``X-Jiuwenswarm-Expert-Packages``。没有 ``X-User-Id`` 时 ``user_id`` 为空，
+    企业租户三字段，以及内部扩展头。企业版的专家包允许名单在
+    ``X-Jiuwenswarm-Package-Allowlist``。没有 ``X-User-Id`` 时 ``user_id`` 为空，
     表示这次请求按匿名处理，和 WebSocket 入口缺省身份时一样。
     """
     from jiuwenswarm.common.request_identity import (
@@ -462,11 +454,9 @@ def _rebuild_identity_from_headers(request: Request) -> tuple[str, dict[str, Any
         value = _header(request, header_name, "")
         if value:
             metadata[field] = value
-    cron_targets = _header(request, "x-cron-targets", "")
-    if cron_targets:
-        metadata["targets"] = cron_targets
     from jiuwenswarm.common.request_ext import (
         INTERNAL_HEADER_NAME,
+        METADATA_KEY,
         RequestExtCodecError,
         decode_internal_header,
     )
@@ -486,13 +476,13 @@ def _rebuild_identity_from_headers(request: Request) -> tuple[str, dict[str, Any
     from jiuwenswarm.enterprise.edition import is_enterprise
 
     if is_enterprise():
-        from jiuwenswarm.common.schema.expert_packages import (
-            HEADER_NAME,
-            METADATA_KEY as GRANT_METADATA_KEY,
-            decode_expert_packages_header,
+        from e2a.package_allowlist import (
+            PACKAGE_ALLOWLIST_HEADER_NAME as HEADER_NAME,
+            PACKAGE_ALLOWLIST_METADATA_KEY as GRANT_METADATA_KEY,
+            decode_package_allowlist_header,
         )
 
-        metadata[GRANT_METADATA_KEY] = decode_expert_packages_header(
+        metadata[GRANT_METADATA_KEY] = decode_package_allowlist_header(
             request.headers.get(HEADER_NAME)
         )
     user_id = str(identity.get("user_id") or "").strip()
@@ -513,7 +503,7 @@ def _context_from_runtime(
         session_id = str(body.get("session_id") or "").strip()
     user_id, metadata = _rebuild_identity_from_headers(request)
     agent_request = AgentRequest(
-        request_id=_header(request, "x-request-id", "") or _default_request_id(),
+        request_id=_header(request, "x-request-id", "http"),
         channel_id=_header(request, "x-channel-id", "http"),
         session_id=session_id or None,
         req_method=req_method,
@@ -566,20 +556,14 @@ def _context_from_mapping(
     is_stream: bool,
 ) -> RequestContext:
     params = body.get("params")
-    metadata = body.get("metadata")
-    if isinstance(metadata, dict):
-        # Request-scoped credentials must not come from client-supplied metadata.
-        metadata = {key: value for key, value in metadata.items() if key != METADATA_KEY}
-    else:
-        metadata = None
     agent_request = AgentRequest(
-        request_id=str(body.get("request_id") or "") or _default_request_id(),
+        request_id=str(body.get("request_id") or "http"),
         channel_id=str(body.get("channel_id") or "http"),
         session_id=str(body.get("session_id") or "") or None,
         req_method=req_method,
         params=params if isinstance(params, dict) else {},
         is_stream=is_stream,
-        metadata=metadata,
+        metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else None,
         user_id=str(body.get("user_id") or "").strip(),
     )
     return RequestContext(

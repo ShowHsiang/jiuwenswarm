@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ class PluginPackageBusy(RuntimeError):
     """A plugin is executing or being replaced."""
 
 
+_reservation_lock = threading.Lock()
 _users: Counter[str] = Counter()
 _writers: set[str] = set()
 _owner_streams: dict[asyncio.Task, list[Callable[[], Awaitable[None]]]] = {}
@@ -70,20 +72,22 @@ def use_plugins(
 ) -> Iterator[None]:
     """Reserve package readers for an entire turn, including stream cleanup."""
     names = list(dict.fromkeys(_package_key(name) for name in names))
-    if any(name in _writers for name in names):
-        raise PluginPackageBusy("Plugin replacement is in progress; retry after it completes")
-    _users.update(names)
+    with _reservation_lock:
+        if any(name in _writers for name in names):
+            raise PluginPackageBusy("Plugin replacement is in progress; retry after it completes")
+        _users.update(names)
     released = False
 
     def release() -> None:
         nonlocal released
-        if released:
-            return
-        released = True
-        _users.subtract(names)
-        for name in names:
-            if not _users[name]:
-                del _users[name]
+        with _reservation_lock:
+            if released:
+                return
+            released = True
+            _users.subtract(names)
+            for name in names:
+                if not _users[name]:
+                    del _users[name]
 
     async def close_abandoned_stream() -> None:
         # Keep readers reserved until the stream's resource cleanup finishes.
@@ -115,10 +119,12 @@ def use_plugins(
 def replace_plugin(name: str) -> Iterator[None]:
     """Acquire an exclusive, non-waiting replacement reservation."""
     name = _package_key(name)
-    if _users[name] or name in _writers:
-        raise PluginPackageBusy("Plugin is executing or closing; retry when idle")
-    _writers.add(name)
+    with _reservation_lock:
+        if _users[name] or name in _writers:
+            raise PluginPackageBusy("Plugin is executing or closing; retry when idle")
+        _writers.add(name)
     try:
         yield
     finally:
-        _writers.remove(name)
+        with _reservation_lock:
+            _writers.remove(name)

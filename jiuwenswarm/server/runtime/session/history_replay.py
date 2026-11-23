@@ -74,6 +74,21 @@ def _identity(stat: os.stat_result) -> tuple[int, int, int, int, int]:
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
+def _open_file_matches(opened: os.stat_result, named: os.stat_result) -> bool:
+    """Whether an open handle still names the same durable file bytes.
+
+    Compare only device, inode and size. On Windows, ``os.fstat`` and
+    ``Path.stat`` disagree on ``st_ctime_ns`` for the same path, so a full
+    identity equality falsely reports HISTORY_RESTORE_CHANGED on every read.
+    """
+
+    return (
+        opened.st_dev == named.st_dev
+        and opened.st_ino == named.st_ino
+        and opened.st_size == named.st_size
+    )
+
+
 def _is_voice(record: dict[str, Any]) -> bool:
     return record.get("channel_id") == "video_duplex"
 
@@ -171,6 +186,33 @@ def read_history_replay(
         raise HistoryReplayError("Insufficient memory for history restore", code="HISTORY_RESTORE_RESOURCE") from exc
     except (OSError, ValueError, TypeError, RecursionError) as exc:
         raise HistoryReplayError(f"History could not be read ({type(exc).__name__})") from exc
+    finally:
+        _READ_SLOTS.release()
+
+
+def try_prefetch_history_prefix(
+    session_id: str, before_request_id: str, eligible: Callable[[Path, int, dict[str, Any]], bool],
+) -> HistoryReplayBatch | None:
+    """Read an optional prefix only if both the reader slot and lifecycle fence are available now."""
+    from jiuwenswarm.server.runtime.session.session_history import get_read_history_path
+
+    if not _READ_SLOTS.acquire(blocking=False):
+        return None
+    try:
+        with lc.resource_lock("session", session_id, blocking=False):
+            lc.guard(session_id)
+            state = lc.state("session", session_id)
+            path = get_read_history_path(session_id)
+            if not path.exists():
+                return None
+            identity = _identity(path.stat())
+            if not eligible(path, identity[2], state):
+                return None
+            batch = _read_prefix(path, int(state.get("generation", 0)), identity, 0,
+                                 is_context_record, before_request_id, HistoryReplayLimits())
+            return batch if get_read_history_path(session_id) == path else None
+    except BlockingIOError:
+        return None
     finally:
         _READ_SLOTS.release()
 
@@ -302,7 +344,12 @@ def _read_prefix(
                 keep(record, len(raw), offset)
                 if _is_voice(record):
                     voice_end = source.tell()
-        if _identity(os.fstat(source.fileno())) != identity or _identity(path.stat()) != identity:
+        named = path.stat()
+        opened = os.fstat(source.fileno())
+        # Named-path identity catches append/rewrite/touch during the read.
+        # Open-handle matching is intentionally weaker than full identity:
+        # Windows fstat/path.stat ctime diverge for an unchanged file.
+        if _identity(named) != identity or not _open_file_matches(opened, named):
             raise HistoryReplayError("History changed during restore", code="HISTORY_RESTORE_CHANGED")
     if voice_end is not None and path.suffix.lower() == ".jsonl":
         _remember(path, _HistoryHead(identity, voice_end))

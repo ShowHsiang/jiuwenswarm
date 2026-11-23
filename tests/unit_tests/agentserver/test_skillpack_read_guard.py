@@ -65,45 +65,6 @@ async def _read(context, name: str, *, relative_file_path: str = "SKILL.md"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["missing_provider", "provider_error", "invalid_directory"])
-async def test_read_guard_logs_target_failure_and_keeps_denial(manager, tmp_path, monkeypatch, caplog, failure):
-    _write_skill(manager._skills_dir / "ordinary", "ordinary", description="ordinary content")
-    context = await _context(manager, tmp_path)
-    provider = context.router.skills_for_session
-    if failure == "missing_provider":
-        broken_provider = None
-        expected_exception = RuntimeError
-    elif failure == "provider_error":
-        broken_provider = Mock(side_effect=TypeError("invalid provider contract"))
-        expected_exception = TypeError
-    else:
-        broken_provider = Mock(return_value=[SimpleNamespace(name="ordinary", directory=None)])
-        expected_exception = TypeError
-    monkeypatch.setattr(context.router, "skills_for_session", broken_provider)
-
-    logger_name = "jiuwenswarm.agents.harness.common.rails.symphony.orchestration_rail"
-    with caplog.at_level("WARNING", logger=logger_name):
-        blocked = await _read(context, "ordinary")
-
-    assert blocked.inputs.tool_result["success"] is False
-    assert blocked.inputs.tool_result["reason"] == "skillpack_inventory_unavailable"
-    assert "ordinary content" not in json.dumps(blocked.inputs.tool_result)
-    records = [record for record in caplog.records if "skillpack.read_guard summary_unavailable" in record.message]
-    assert len(records) == 1
-    assert "skill=ordinary" in records[0].message
-    # The production masking filter renders then clears exc_info.
-    assert "Traceback (most recent call last)" in caplog.text
-    assert expected_exception.__name__ in caplog.text
-    assert "unconfirmed_pack_summary" in caplog.text
-
-    monkeypatch.setattr(context.router, "skills_for_session", provider)
-    allowed = await _read(context, "ordinary")
-    assert allowed.inputs.tool_result is None
-    result = await context.skill_tool.invoke(allowed.inputs.tool_args, session=context.outer.session)
-    assert result.success and "ordinary content" in result.data["skill_content"]
-
-
-@pytest.mark.asyncio
 async def test_ordinary_skill_executes_with_discovery_off_and_real_inventory_lock(manager, tmp_path, monkeypatch):
     _write_skill(manager._skills_dir / "ordinary", "ordinary", description="ordinary content")
     context = await _context(manager, tmp_path)

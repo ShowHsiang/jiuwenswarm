@@ -30,6 +30,8 @@ export type ModelValidationPayload = {
   model: string;
   model_provider: string;
   reasoning_level: string | undefined;
+  /** Output limit from the unsaved draft; null explicitly tests the unlimited setting. */
+  max_tokens?: number | null;
   endpoint_profile?: string;
   /** 供应商预设标识（与模型条目同源，仅透传）。缺失表示自定义供应商；
    *  后端据此判断探测是否应回退持久化 endpoint_profile（与保存合并同口径）。 */
@@ -133,13 +135,6 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   envField('visual_gen_protocol', 'agent', 'text', 'VISUAL_GEN_PROTOCOL'),
   envField('visual_gen_context_window_tokens', 'agent', 'text', 'VISUAL_GEN_CONTEXT_WINDOW_TOKENS'),
   envField('visual_gen_enabled', 'agent', 'boolean', 'VISUAL_GEN_ENABLED'),
-  // Music generation - Design mode BGM slot (call_music_model).
-  envField('music_gen_api_base', 'experimental', 'text', 'MUSIC_GEN_API_BASE'),
-  envField('music_gen_api_key', 'experimental', 'text', 'MUSIC_GEN_API_KEY'),
-  envField('music_gen_model', 'experimental', 'text', 'MUSIC_GEN_MODEL_NAME'),
-  envField('music_gen_provider', 'experimental', 'text', 'MUSIC_GEN_PROVIDER'),
-  envField('music_gen_protocol', 'experimental', 'text', 'MUSIC_GEN_PROTOCOL'),
-  envField('music_gen_enabled', 'experimental', 'boolean', 'MUSIC_GEN_ENABLED'),
 
   yamlField('permissions_enabled', 'security', 'boolean', 'permissions.enabled'),
 
@@ -267,6 +262,12 @@ export const OPENAI_ACCOUNT_RPC = {
 } as const;
 
 export const OPEN_SOURCE_SETTINGS_REQUEST_METHODS = [
+  'multimodal.models.list',
+  'multimodal.models.get',
+  'multimodal.models.upsert',
+  'multimodal.models.delete',
+  'multimodal.tools.update',
+  'multimodal.config.apply',
   'config.get',
   'config.save_all',
   'config.validate_model',
@@ -360,6 +361,7 @@ export function buildModelValidationPayload(model: ModelEntry): ModelValidationP
     model_provider: model.model_provider,
     reasoning_level: model.reasoning_level,
   };
+  if (model.max_tokens !== undefined) payload.max_tokens = model.max_tokens;
   if (model.endpoint_profile) payload.endpoint_profile = model.endpoint_profile;
   if (model.vendor_key) payload.vendor_key = model.vendor_key;
   return payload;

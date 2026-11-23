@@ -120,7 +120,7 @@ def atomic_json(path: Path, value: dict) -> None:
 
 
 @contextmanager
-def resource_lock(kind: str, resource_id: str) -> Iterator[None]:
+def resource_lock(kind: str, resource_id: str, *, blocking: bool = True) -> Iterator[None]:
     path = resource_path(kind, resource_id)
     held = getattr(_HELD_LOCKS, "paths", None)
     if held is None:
@@ -128,7 +128,7 @@ def resource_lock(kind: str, resource_id: str) -> Iterator[None]:
     if path in held:
         yield
         return
-    with file_lock(path):
+    with file_lock(path, blocking=blocking):
         held.add(path)
         try:
             yield
@@ -255,6 +255,7 @@ def renew_operation(
 
 
 def update(kind: str, resource_id: str, **changes: Any) -> dict:
+    """Update and return the lifecycle state's operation record."""
     with resource_lock(kind, resource_id):
         value = state(kind, resource_id)
         operation = value["operation"]
@@ -642,7 +643,7 @@ def _proc_start_ticks(pid: int, *, proc_root: Path = Path("/proc")) -> int | Non
     closing_paren = text.rfind(")")
     if closing_paren < 0:
         return None
-    fields = text[closing_paren + 2:].split()
+    fields = text[closing_paren + 2 :].split()
     # The slice starts at field 3 (state); field 22 is starttime, index 19.
     if len(fields) <= 19:
         return None
@@ -700,7 +701,6 @@ def runtime_owner_alive(owner: dict) -> bool:
     try:
         process = psutil.Process(owner["pid"])
         owner_start_ticks = owner.get("start_ticks")
-        owner_started_at = owner.get("started_at")
         if owner_start_ticks is not None:
             current_start_ticks = _proc_start_ticks(owner["pid"])
             if current_start_ticks is None:
@@ -710,18 +710,18 @@ def runtime_owner_alive(owner: dict) -> bool:
                 )
             if int(current_start_ticks) != int(owner_start_ticks):
                 return False
-        if owner_started_at is not None:
-            try:
-                if abs(process.create_time() - owner_started_at) >= 0.01:
-                    return False
-            except psutil.AccessDenied:
-                if owner_start_ticks is None:
-                    raise
-        if owner_start_ticks is not None or owner_started_at is not None:
-            return True
-        raise LifecycleError(
-            "OPERATION_IN_PROGRESS", "cannot verify the previous runtime owner"
-        )
+        elif "started_at" in owner:
+            if abs(process.create_time() - owner["started_at"]) >= 0.01:
+                return False
+        else:
+            raise LifecycleError(
+                "OPERATION_IN_PROGRESS", "cannot verify the previous runtime owner"
+            )
+        status = process.status()
+        if status == psutil.STATUS_ZOMBIE:
+            # A zombie group leader may still have threads owning writers.
+            return process.num_threads() > 1
+        return status != psutil.STATUS_DEAD
     except psutil.NoSuchProcess:
         return False
     except psutil.AccessDenied as exc:
@@ -888,37 +888,3 @@ def event_snapshots() -> list[dict]:
             )
         )
     return result
-
-
-def events_feed() -> dict:
-    """Gateway 后台轮询：全量 lifecycle 事件（不需要 project_id）。"""
-    return {"events": event_snapshots()}
-
-
-def inventory_feed() -> dict:
-    """Gateway/运维：项目名单 + 未完成的 lifecycle 残片。"""
-    from jiuwenswarm.server.runtime.session.project_store import list_projects
-
-    payload = {
-        "projects": [
-            dict(
-                project_id=p.project_id,
-                operation=state("project", p.project_id).get("operation"),
-            )
-            for p in list_projects(include_hidden=True, cache_bust=True)
-        ]
-    }
-    known = {item["project_id"] for item in payload["projects"]}
-    directory = get_agent_root_dir() / "lifecycle" / "resources"
-    for path in directory.glob("project_*.json") if directory.exists() else ():
-        operation = read_json(path).get("operation") or {}
-        project_id = operation.get("resource_id")
-        if (
-            project_id
-            and project_id not in known
-            and operation.get("status") != "completed"
-        ):
-            payload["projects"].append(
-                dict(project_id=project_id, operation=operation)
-            )
-    return payload

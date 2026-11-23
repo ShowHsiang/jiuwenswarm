@@ -180,6 +180,7 @@ export interface JiuwenMateChatRequest {
   messageId: string;
   text: string;
   receivedAt: string;
+  updatedAt: string;
   status: 'queued' | 'dispatched' | 'ended';
   outcome: string | null;
   running: boolean;
@@ -631,6 +632,7 @@ export function toChatRequest(value: unknown): JiuwenMateChatRequest {
     messageId: text(wire.message_id),
     text: text(wire.text),
     receivedAt: text(wire.received_at),
+    updatedAt: text(wire.updated_at),
     status: status === 'queued' || status === 'ended' ? status : 'dispatched',
     outcome: typeof wire.outcome === 'string' ? wire.outcome : null,
     running: wire.running === true,
@@ -827,6 +829,7 @@ function toActivityDay(value: unknown): JiuwenMateActivityDay | null {
     tasks: count(row.tasks),
     ...(row.finished_tasks !== undefined ? { finishedTasks: count(row.finished_tasks) } : {}),
     ...(row.failures !== undefined ? { failures: count(row.failures) } : {}),
+    ...(row.replies !== undefined ? { replies: count(row.replies) } : {}),
     minutes: count(row.minutes),
     calls: count(row.calls),
     tokens: count(row.tokens),
@@ -1104,9 +1107,10 @@ export function createJiuwenMateApi(request: JiuwenMateRequest, subscribe?: Jiuw
     /** Removes the IM app; its agent keeps its data and returns if the same app is bound again. */
     async unbindConnection(connection: JiuwenMateConnection): Promise<void> {
       if (connection.channel === 'web') return;
+      const idKey = connection.channel === 'dingtalk' ? 'client_id' : 'app_id';
       await request(
         `channel.${connection.channel}.unbind_agent`,
-        connection.channel === 'dingtalk' ? { client_id: connection.connectionKey } : { app_id: connection.connectionKey },
+        { [idKey]: connection.connectionKey, persistent_agent_id: connection.agentId },
       );
     },
     async listModels(): Promise<JiuwenMateModelCatalog> {

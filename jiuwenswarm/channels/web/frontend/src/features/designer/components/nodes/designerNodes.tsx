@@ -41,7 +41,6 @@ import { DesignerStoryboardTable } from '../../DesignerStoryboardTable';
 import { DesignerActivityPeek } from '../DesignerActivityPeek';
 import { DesignerNodeActionBar } from '../controls/DesignerNodeActionBar';
 import { DesignerNodeToolbar } from '../controls/DesignerNodeToolbar';
-import { DesignerAudioPreview } from './DesignerAudioPreview';
 import { DesignerNodePortControl } from './DesignerNodePortControl';
 
 type DesignerNodeData = DesignerReactFlowNode['data'];
@@ -183,7 +182,6 @@ function DesignerNodeShell({
     <div
       className={`designer-node${media ? ' designer-node--media' : ''}${showMediaFill ? ' designer-node--media-filled' : ''}${generatingShimmer ? ' is-generating-shimmer' : ''}${selected ? ' is-selected' : ''}${statusClass} group`}
       data-testid="designer-node"
-      data-node-type={nodeType}
       data-selected={selected ? 'true' : 'false'}
       data-status={status}
     >
@@ -230,7 +228,7 @@ function DesignerNodeShell({
           </p>
         ) : null}
         <DesignerNodePortControl nodeId={nodeId} side="successor" />
-        {nodeType === DESIGNER_NODE_TYPE_AUDIO ? null : <DesignerNodeResizeHandle nodeId={nodeId} />}
+        <DesignerNodeResizeHandle nodeId={nodeId} />
       </div>
       {toolbar}
     </div>
@@ -484,7 +482,14 @@ export function DesignerMediaNode({ id, data, selected }: NodeProps<DesignerFlow
       />
     );
   } else if (hasPreview && nodeType === DESIGNER_NODE_TYPE_AUDIO) {
-    inner = <DesignerAudioPreview src={previewSrc || ''} />;
+    inner = (
+      <audio
+        className="designer-node__audio-preview"
+        src={previewSrc || ''}
+        controls
+        data-testid="designer-node-uploaded-audio"
+      />
+    );
   }
 
   const generatingShimmer =

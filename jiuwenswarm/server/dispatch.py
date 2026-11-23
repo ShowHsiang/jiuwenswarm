@@ -126,6 +126,12 @@ from jiuwenswarm.server.handlers.team import (
 Handler = Callable[[RequestContext], Awaitable[None]]
 
 HANDLERS: dict[ReqMethod, Handler] = {
+    ReqMethod.MULTIMODAL_MODELS_LIST: handle_gateway_adapter,
+    ReqMethod.MULTIMODAL_MODELS_GET: handle_gateway_adapter,
+    ReqMethod.MULTIMODAL_MODELS_UPSERT: handle_gateway_adapter,
+    ReqMethod.MULTIMODAL_MODELS_DELETE: handle_gateway_adapter,
+    ReqMethod.MULTIMODAL_TOOLS_UPDATE: handle_gateway_adapter,
+    ReqMethod.MULTIMODAL_CONFIG_APPLY: handle_gateway_adapter,
     ReqMethod.AGENTS_LIST: handle_agents_list,
     ReqMethod.AGENTS_GET: handle_agents_get,
     ReqMethod.AGENTS_CREATE: handle_agents_create,
@@ -304,6 +310,8 @@ HANDLERS: dict[ReqMethod, Handler] = {
     ReqMethod.SKILLS_SKILLNET_SEARCH: handle_skills_request,
     ReqMethod.SKILLS_SKILLNET_INSTALL: handle_skills_request,
     ReqMethod.SKILLS_SKILLNET_INSTALL_STATUS: handle_skills_request,
+    ReqMethod.SKILLS_REBUILD: handle_skills_request,
+    ReqMethod.SKILLS_REBUILD_STATUS: handle_skills_request,
     ReqMethod.SKILLS_SKILLNET_EVALUATE: handle_skills_request,
     ReqMethod.SKILLS_CLAWHUB_GET_TOKEN: handle_skills_request,
     ReqMethod.SKILLS_CLAWHUB_SET_TOKEN: handle_skills_request,

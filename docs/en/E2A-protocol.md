@@ -32,6 +32,8 @@ MoA configuration. A successful response contains `configured` and, when ready,
 AgentServer client is absent or not ready, the Gateway returns
 `SERVICE_UNAVAILABLE` instead of evaluating configuration in its own directory.
 
+AgentServer preserves the Gateway-injected top-level `traceparent` in request metadata across Worker IPC. A truthy top-level value takes precedence over a channel-context value; when the top-level value is absent, the channel-context value is preserved (compatibility with channel-context-only writers). The Worker binds a valid W3C parent context only in the request execution task and restores the previous context on completion, failure, or cancellation. Missing or invalid input keeps the existing SDK context behavior; tracing enablement and exporter settings retain their existing precedence.
+
 ---
 
 ## 2. Pitfall: two meanings of `method` (required reading)
@@ -72,6 +74,7 @@ The same field **`method`** means different things by origin. It is **not** two 
 | `session_id` | string / null | Session |
 | `message_id` | string / null | Platform or A2A message id; do not conflate with `request_id` |
 | `is_stream` | boolean | Streamed response or not |
+| `traceparent` | string / null | Gateway-injected W3C parent context; AgentServer normalizes it into request metadata. A truthy top-level value overrides a `channel_context` value; when absent, the channel value is preserved |
 
 ### 4.2 `provenance` (`E2AProvenance`)
 
@@ -102,8 +105,6 @@ Hand-built defaults use `source_protocol` = `e2a`. Legacy `binding` migrates to 
 | `ext_method` | Real name when `method == "ext"` |
 | `session_update_kind` | For ACP `session/update` bridge; values match `constants.ACP_SESSION_UPDATE_KINDS` |
 | `expected_output_modes` | A2A `acceptedOutputModes` |
-
-At the Gateway-facing WebSocket ingress, AgentServer converts an explicitly supplied method to its own `ReqMethod`. Unknown or non-string methods receive a final error response with `payload.code` set to `METHOD_NOT_FOUND`. Internal requests without a method retain their existing path.
 
 **Common `params` keys** (extend as needed; names below cooperate with ACP bridging):
 
@@ -495,14 +496,16 @@ The management response remains `{code: 200, message: "success", data: {items: [
 error: ""}}`. An unavailable Server, transport failure or Hub lookup failure produces
 empty `items` and an error message, without a local Gateway fallback. Existing Server
 cold-cache and background-refresh semantics remain in place. The pinned
-`openjiuwen-protocol` package defines `hub.expert_packages.catalog`; no application-side
+`openjiuwen-e2a` package defines `hub.expert_packages.catalog`; no application-side
 enum registration is required.
 
 ## History payload references and chunk retrieval
 
-Large tool results retain a short preview and may include `payload_refs`. For the main agent, `chat.llm_call_start` carries a pre-call preview; `chat.llm_call_end.payload_refs.prompt` references the complete model input (messages and tools) after Core finalizes prompt injection and context processing. Subagents captured by model-input callbacks may still reference their complete input in `chat.llm_call_start`. Each reference contains `sha256`, `bytes`, `media_type`, and a host path. Clients retrieve content by session and digest rather than opening the host path.
+Large tool results retain a short preview and may include `payload_refs`. Each reference contains `sha256`, `bytes`, `media_type`, and a host path. Clients retrieve content by session and digest. Previously stored prompt references remain readable through the same interface.
 
-`text/plain` identifies an original string; `application/json` identifies the complete structured value. `raw_output_truncated=true` means the inline preview was reduced; a corresponding `payload_refs` entry provides the complete artifact. If artifact storage fails, model/tool events still carry bounded previews without unavailable references, and the failure is logged. Existing small results and inline history keep their semantics.
+When `tool_call` dispatches a target that reports an explicit failure in its result object, the tool result event carries `success: false`, `status: "error"`, and `is_error: true`. Clients display the call as failed even if dispatch succeeded.
+
+`text/plain` identifies an original string; `application/json` identifies the complete structured value. `raw_output_truncated=true` means the inline preview was reduced; a corresponding `payload_refs` entry provides the complete artifact. If artifact storage fails, tool events still carry bounded previews without unavailable references, and the failure is logged. Existing small results and inline history keep their semantics.
 
 Use a unary `history.get` request with these `params`:
 
@@ -522,12 +525,38 @@ Legacy page reads preserve `event_payload`, `usage`, and `session_usage` for too
 
 Each page uses a committed byte-length boundary. Concurrent appends become visible to later page requests; file replacement or truncation returns a history-change error. Page scans allow history writes to continue, and both unary and streamed history queries keep the Front event loop responsive.
 
-For each model call, `chat.usage_metadata.metadata.usage_metadata.payload_refs.prompt` carries the prompt reference emitted by that call's `llm_call_end`. When the SDK emits usage first, the adapter retains at most one usage event until call-end. Missing call-end events drain at the next call, answer, or stream completion. A new `llm_call_start` clears references from the previous call.
+When the SDK emits usage first, the adapter retains at most one usage event until call-end. Missing call-end events drain at the next call, answer, or stream completion.
 
-When an output consumer is cancelled or closed, pending usage is saved to the session audit without yielding into the closed stream. Normally delivered usage still follows the existing history writer. Call-end references remain available if cancellation occurs while the end marker is being delivered.
+When an output consumer is cancelled or closed, pending usage is saved to the session audit. Normally delivered usage follows the existing history writer.
 
 Externalized tool results retain known rich-display fields (`skill_tree`, `beam_search`, `planned_graph`, `graph_status`, and `graph_build`) within the existing 1 MiB raw-output budget; MCP Apps keep their existing projection. Complete originals remain in `payload_refs`. Live delivery and history replay preserve these references in the current product session, including forked sessions.
 
 For Gateway routes that forward history cursors, clients may request `history.get` with `cursor: "history-artifact:v1:<sha256>:<offset>"` and `limit: 1`. The response contains one `history.artifact` record with the same chunk fields as unary artifact retrieval, followed by the normal history done frame. Each cursor request reads at most 8 KiB on a UTF-8 boundary. Invalid or missing artifacts return `HISTORY_ARTIFACT_FAILED`; no arbitrary file path is accepted. Ordinary history subscribers ignore these artifact cursors. The unary `artifact_sha256` interface remains available.
 
 Web loads originals only on request, retains one window of at most 64 KiB locally, and offers previous/next parts. Closing the view or changing its session/reference aborts pending reads and releases the displayed original; full originals are not copied into the chat store.
+
+## Model call status and incremental history
+
+`chat.llm_call_start` and `chat.llm_call_end` record the model call lifecycle with
+member and role attribution. Start events are durable even with empty content.
+Each call start assigns `llm_start_ts` to associate its start and usage events.
+
+Session history appends new messages and events. Main-agent and sub-agent call
+events omit the input prompt and its artifact reference. User messages, tool calls,
+tool results and replies are persisted through their respective events. Clients must
+accept an absent `prompt` and degrade the full-input details view accordingly.
+
+`chat.usage_metadata` continues to report input, output and cache tokens, costs and
+latencies. Context occupancy uses `context.usage`, and cumulative usage uses the
+existing session usage snapshot. Readers continue to accept older records with
+`prompt` fields.
+
+## Automatic recovery of session snapshots and model lists
+
+`session.get_metadata` queries runtime snapshots over the shared Worker IPC connection. If the send wait times out or connection retirement cancels the send, the metadata request still returns `runtime.recovery_pending=true`, with `recovery_reason` set to `snapshot_transport_timeout` or `snapshot_transport_cancelled`, respectively. Such responses preserve the persisted `is_processing` and `status` metadata; an unavailable snapshot does not imply an idle session. An observer timeout does not cancel the shared pipe write. Connection retirement remains responsible for cancelling and cleaning up the send task.
+
+A new chat sent while a replacement Worker is starting waits for its IPC handshake. If this wait expires, the request returns `RUNTIME_WARMING` before dispatch. A cold session can return `HISTORY_RESTORE_BUSY` when recovery capacity is exhausted or its queue deadline expires. Clients may retry after either error. A `HISTORY_RESTORE_LIMIT` during history migration indicates that a recovery budget was exceeded. Repeating the same request against unchanged history can reach the same limit.
+
+If history recovery rejects a Team chat before dispatch and no other Team work is active, the client receives `chat.processing_status` with `is_processing=false` and `is_complete=true` before the request error. The error carries the recovery code. If other Team work is active, the request returns the same error and the session keeps its processing state.
+
+While connected and active, the model settings page automatically retries `models.list` after `WORKER_CLOSED`, `WORKER_UNSTABLE`, `RUNTIME_WARMING`, `RUNTIME_FAILED`, or `SERVICE_UNAVAILABLE`: after 1, 2, and 4 seconds, then every 10 seconds. `RUNTIME_FAILED` may also represent a backend waiting for automatic recovery, so this code alone does not stop observation. Success refreshes the list, clears the temporary error, and enables the add button. Disconnecting or leaving the page clears the retry timer. This recovery flow requires no manual reload control.

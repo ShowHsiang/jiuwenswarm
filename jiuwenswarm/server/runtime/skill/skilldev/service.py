@@ -286,12 +286,10 @@ class SkillDevService:
             )
 
         workspace = self._deps.workspace_provider.get_local_path(task_id)
-        skill_dir = (workspace / "skill").resolve()
+        skill_dir = workspace / "skill"
         full_path = (skill_dir / file_path).resolve()
 
-        # is_relative_to 做前缀比较：裸 startswith 会被 skill_backup 这类
-        # 同级 skill* 目录绕过，符号链接逃逸也能在此拦下。
-        if not full_path.is_relative_to(skill_dir):
+        if not str(full_path).startswith(str(skill_dir.resolve())):
             return self._error_chunk(
                 request_id, channel_id, "路径非法：不能访问工作区外的文件"
             )

@@ -25,7 +25,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
-from agent_gateway.enterprise.team.quota_policy import OwnerIdentity
 from jiuwenswarm.common.utils import get_user_workspace_dir
 
 # ---------------------------------------------------------------------------
@@ -95,6 +94,27 @@ class TeamControlStoreError(ValueError):
 # ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OwnerIdentity:
+    """Routing identity of the user who created the team.
+
+    ``group_id`` / ``bot_id`` are the enterprise routing scope; together with
+    ``user_id`` they are what the gateway derives ``service_id`` / ``agent_id`` /
+    ``workspace_key`` from. Personal edition leaves group/bot empty.
+    """
+
+    user_id: str = ""
+    group_id: str = ""
+    bot_id: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return {"user_id": self.user_id, "group_id": self.group_id, "bot_id": self.bot_id}
+
+    def same_scope(self, other: "OwnerIdentity") -> bool:
+        """Phase-1 "same tenant" check: same routing scope (group + bot)."""
+        return self.group_id == other.group_id and self.bot_id == other.bot_id
 
 
 @dataclass(frozen=True)
@@ -785,14 +805,14 @@ def get_team_control_store() -> TeamControlStore:
     if _DEFAULT_STORE is None:
         with _DEFAULT_STORE_LOCK:
             if _DEFAULT_STORE is None:
-                from jiuwenswarm.infrastructure.db.team_store_actor import use_shared_team_store
+                from jiuwenswarm.infrastructure.db.team_mysql_actor import use_team_mysql
 
-                if use_shared_team_store():
-                    from jiuwenswarm.enterprise.team.control_shared import (
-                        SharedTeamControlStore,
+                if use_team_mysql():
+                    from jiuwenswarm.enterprise.team.control_mysql import (
+                        MysqlTeamControlStore,
                     )
 
-                    _DEFAULT_STORE = SharedTeamControlStore()
+                    _DEFAULT_STORE = MysqlTeamControlStore()
                 else:
                     _DEFAULT_STORE = SqliteTeamControlStore()
     return _DEFAULT_STORE

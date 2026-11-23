@@ -117,10 +117,8 @@ interface RawPluginPackageDetail extends RawPluginPackageSummary {
   mcps: PluginCapabilityRef[];
   // v2 §3.2：仅 show 有，未就绪的待连 MCP 名单。
   pending_connectors?: string[];
-  // 2026-08-21 后端新增（extension_package_manager.py _build_show_card）：manifest 的
-  // quick_inputs 双语示例问法，字段名后端已经是驼峰 quickInputs，不用像 connection_state 那样
-  // 转写。
-  quickInputs?: LocalizedText[];
+  // Hub metadata can supply plain prompts; package manifests supply localized prompts.
+  quickInputs?: (string | LocalizedText)[];
 }
 
 function fromRawDetail(raw: RawPluginPackageDetail): PluginPackageDetail {
@@ -134,7 +132,9 @@ function fromRawDetail(raw: RawPluginPackageDetail): PluginPackageDetail {
     rails: raw.rails ?? [],
     mcps: raw.mcps ?? [],
     pendingConnectors: raw.pending_connectors,
-    quickInputs: raw.quickInputs ?? [],
+    quickInputs: (raw.quickInputs ?? []).map((item) =>
+      typeof item === 'string' ? { zh: item, en: item } : item,
+    ),
   };
 }
 
@@ -182,12 +182,15 @@ export const pluginPackagesApi = {
     } catch (error) {
       const payload = (error as WebError | undefined)?.payload as
         { error_code?: string; conflict?: PluginReplacementConflict } | undefined;
-      if (payload?.error_code?.startsWith('PLUGIN_')) {
-        throw new PluginReplacementError(payload.error_code, payload.conflict);
-      }
       const pendingConnectors = extractPendingConnectors(error);
       if (pendingConnectors) {
         throw new PluginInstallPendingError(error instanceof Error ? error.message : String(error), pendingConnectors);
+      }
+      if (
+        payload?.error_code &&
+        ['PLUGIN_LOCAL_CONFLICT', 'PLUGIN_REPLACEMENT_BUSY', 'PLUGIN_REPLACEMENT_STALE'].includes(payload.error_code)
+      ) {
+        throw new PluginReplacementError(payload.error_code, payload.conflict);
       }
       throw error;
     }

@@ -193,9 +193,8 @@ function getVisibleCount(state: WorkspaceState, projectId: string): number {
 }
 
 function normalizeActivityTime(value: number | undefined): number | null {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
-  const milliseconds = value < 1e11 ? value * 1000 : value;
-  return Number.isFinite(milliseconds) && milliseconds > 0 ? milliseconds : null;
+  if (typeof value !== 'number') return null;
+  return value < 1e11 ? value * 1000 : value;
 }
 
 function getSessionActivityAt(session: Pick<Session, 'last_user_message_at' | 'last_message_at' | 'updated_at' | 'created_at'>): number {

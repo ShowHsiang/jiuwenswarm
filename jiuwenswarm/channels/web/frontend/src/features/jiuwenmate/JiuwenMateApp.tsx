@@ -17,6 +17,7 @@ import {
   finishColleagueAuthorization,
   openColleagueAuthorization,
   openColleagueCreation,
+  clearWorkspaceIntent,
   openColleagueMessages,
   openColleagueProfile,
   openColleagueWorkspace,
@@ -89,6 +90,8 @@ import './jiuwenmate.css';
 export interface JiuwenMateAppProps {
   onExit: () => void;
   renderExistingPage: (nav: JiuwenMateExistingPage) => ReactNode;
+  /** Reused pages whose feature is switched off; they leave the rail and close if open. */
+  hiddenExistingPages?: readonly JiuwenMateExistingPage[];
   confirmDiscardSettings?: () => boolean;
   /** Plaza "use" on an installed expert opens the employee creation page for that package. */
   useInstalledExpertRef?: MutableRefObject<(packageName: string) => void>;
@@ -103,6 +106,7 @@ type PendingConfirm =
 type LoadStatus = 'loading' | 'ready' | 'failed';
 
 const EMPTY_MODEL_CATALOG: JiuwenMateModelCatalog = { models: [], defaultModelId: '', defaultModelLabel: '' };
+const NO_HIDDEN_PAGES: readonly JiuwenMateExistingPage[] = [];
 const SCHEDULE_REFRESH_INTERVAL_MS = 5_000;
 const EMPTY_MISSING_CAPABILITIES: MutableColleagueCapabilitySelections = {
   skills: [],
@@ -129,6 +133,7 @@ interface SkillInstallReply {
 export function JiuwenMateApp({
   onExit,
   renderExistingPage,
+  hiddenExistingPages = NO_HIDDEN_PAGES,
   confirmDiscardSettings,
   useInstalledExpertRef,
   groupId,
@@ -294,9 +299,15 @@ export function JiuwenMateApp({
     void loadColleagues();
   }, [loadColleagues, modelRefreshStatus]);
 
-  // A group route always lands in the chat view, where group chats live.
+  const activatedGroupIdRef = useRef<string | undefined>(undefined);
+  // Activate chat on group entry, without stealing navigation after a background refresh.
   useEffect(() => {
-    if (!groupId || loadStatus !== 'ready') return;
+    if (!groupId) {
+      activatedGroupIdRef.current = undefined;
+      return;
+    }
+    if (loadStatus !== 'ready' || activatedGroupIdRef.current === groupId) return;
+    activatedGroupIdRef.current = groupId;
     setExistingPage(null);
     setPublicLabel(null);
     setActiveRailView('messages');
@@ -423,6 +434,7 @@ export function JiuwenMateApp({
 
   const handleRailViewChange = (view: JiuwenMateRailView) => {
     if (view === 'office' && groupId) onSelectGroup();
+    if (view === 'messages') setWorkspaceIntent(clearWorkspaceIntent);
     showFeature(view, view === 'office' ? openOffice : openColleagueMessages);
   };
 
@@ -431,6 +443,13 @@ export function JiuwenMateApp({
     setExistingPage(nav);
     setPublicLabel(labelKey);
   };
+
+  useEffect(() => {
+    if (existingPage && hiddenExistingPages.includes(existingPage)) {
+      setExistingPage(null);
+      setPublicLabel(null);
+    }
+  }, [existingPage, hiddenExistingPages]);
 
   const openPlaza = () => handleOpenExistingPage('agents', 'jiuwenmate.nav.plaza');
   const startCreation = () => {
@@ -1043,6 +1062,7 @@ export function JiuwenMateApp({
       <JiuwenMateRail
         activeView={activeRailView}
         activePublicLabel={publicLabel}
+        hiddenPages={hiddenExistingPages}
         onViewChange={handleRailViewChange}
         onOpenExistingPage={handleOpenExistingPage}
         onExit={onExit}

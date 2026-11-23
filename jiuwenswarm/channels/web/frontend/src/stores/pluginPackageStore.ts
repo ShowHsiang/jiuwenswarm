@@ -287,7 +287,9 @@ export const usePluginPackageStore = create<PluginPackageState>((set, get) => ({
   install: async (id: string, options: PluginInstallOptions = {}) => {
     if (get().installingIds[id]) return;
     options = get().replacementRetries[id] ?? options;
-    const card = get().packages.find((item) => item.id === id) ?? get().detailCache[id];
+    const card = get().packages.find((item) => item.id === id)
+      ?? get().localPackages.find((item) => item.id === id)
+      ?? get().detailCache[id];
     if (card?.source === 'hub') options = { ...options, from_hub: true };
     set((state) => ({
       installingIds: { ...state.installingIds, [id]: true },

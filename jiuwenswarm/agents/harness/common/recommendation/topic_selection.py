@@ -17,6 +17,7 @@ from jiuwenswarm.agents.harness.common.recommendation.topic_model import (
 from jiuwenswarm.agents.harness.common.recommendation.topic_terminal import (
     LearnedComponentReceipt,
 )
+from .topic_primitives import nonempty as _nonempty, plain_int as _plain_int
 
 UTILITY_COMPONENT_ID = "interaction_utility_scorer"
 # Where a fixed condition on a card comes from, as the utility scorer lists it.
@@ -33,7 +34,7 @@ PREFERENCE_PAIR_VERSION = "topic-starter-v6-preference-pair-v1"
 
 FIRST_SCREEN_CARD_TARGET = 4
 """Cards one screen shows at once."""
-GLOBAL_POOL_TARGET_SIZE = 7
+GLOBAL_POOL_TARGET_SIZE = 6
 """Cards a global round prepares: one screen, then the cards that replace opened or dismissed ones."""
 
 _GLOBAL_SCOPE = "global_new_chat"
@@ -47,15 +48,6 @@ _PROJECT_QUOTAS = {
     "project_continuation": 3,
     "project_domain_progress": 1,
 }
-
-
-def _plain_int(value: Any) -> bool:
-    # bool is an int subclass; a JSON boolean is never a version or a count.
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _nonempty(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
 
 
 def _nullable_score(value: Any, *, field_name: str) -> float | None:
@@ -79,7 +71,6 @@ class SelectionCandidate:
     stable_rank: int
     evidence_eligible: bool
     freshness_eligible: bool
-    negative_preference_hit: bool
     interest_summary_id: str | None
     identity_anchor: str | None
     source_memory_unit_ids: tuple[str, ...]
@@ -96,7 +87,6 @@ class SelectionCandidate:
         _value_items = (
             self.evidence_eligible,
             self.freshness_eligible,
-            self.negative_preference_hit,
         )
         if any(
             not isinstance(value, bool)
@@ -222,7 +212,7 @@ class ListSearchConstraints:
 
     @property
     def target_size(self) -> int:
-        """D10: the global pool holds up to seven cards whatever the mix, a leading card included."""
+        """D10: the global pool holds up to six cards whatever the mix, a leading card included."""
 
         return (
             GLOBAL_POOL_TARGET_SIZE - self.leading_cards
@@ -772,8 +762,6 @@ def _candidate_hard_reasons(
         reasons.append("evidence_ineligible")
     if not candidate.freshness_eligible:
         reasons.append("freshness_ineligible")
-    if candidate.negative_preference_hit:
-        reasons.append("negative_preference")
     if constraints.context_scope == _GLOBAL_SCOPE:
         if not _nonempty(candidate.interest_summary_id):
             reasons.append("missing_personalized_interest")

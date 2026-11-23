@@ -1027,7 +1027,7 @@ class AgentRuntime:
             target.mode,
             work_mode=target.work_mode,
         ):
-            raise ValueError(f"target session is not Work/Code Normal: {target_id}")
+            raise ValueError(f"target session is not a Work/Code Session: {target_id}")
         if source.user_id != target.user_id:
             raise PermissionError("source and target sessions have different owners")
         from jiuwenswarm.common.schema.agent import AgentRequest
@@ -1278,20 +1278,13 @@ class AgentRuntime:
         work_mode: object = None,
     ) -> bool:
         """Return whether a mode uses the single-Agent Session Runtime."""
-        from agent_gateway.common.mode_matrix import (
-            NEW_AGENT_CODE_NORMAL,
-            NEW_AGENT_WORK_NORMAL,
-        )
         from jiuwenswarm.runtime.request import resolve_agent_request_mode
 
         _mode, _sub_mode, canonical = resolve_agent_request_mode(
             mode,
             work_mode=work_mode,
         )
-        return deprecate_mode(canonical) in {
-            NEW_AGENT_WORK_NORMAL,
-            NEW_AGENT_CODE_NORMAL,
-        }
+        return is_single_agent_mode(deprecate_mode(canonical))
 
     async def _prepare_chat_turn(
         self,
@@ -1545,8 +1538,8 @@ class AgentRuntime:
             )
             return
 
-        # Business waiters have exited. The retained observation subscription
-        # owns delivery, with the Team manager's existing waiter-less fallback.
+        # Business waiters have exited, and the Gateway may close observers
+        # independently. The lifecycle adapter publishes outside those streams.
         try:
             await self._team_lifecycle().publish_pause_completed(
                 request.session_id,
@@ -1868,6 +1861,7 @@ class AgentRuntime:
         admission_started = False
         events: list[RuntimeEvent] = []
         agent: Any = None
+        plan_state_ready = False
         execution_error: Exception | None = None
         cancellation: asyncio.CancelledError | None = None
         readonly_goal_get = self._is_readonly_goal_get_request(request)
@@ -1915,6 +1909,7 @@ class AgentRuntime:
                         sub_mode,
                         agent,
                     )
+                    plan_state_ready = True
                     await self._emit_control_events(
                         request,
                         plan_result.events,
@@ -1956,7 +1951,7 @@ class AgentRuntime:
             admission_error: BaseException | None = None
             end_error: BaseException | None = None
             try:
-                if agent is not None and not stateless and not readonly_goal_get:
+                if plan_state_ready:
                     await self._emit_control_events(
                         request,
                         await self._plan_controller.check_post_process_exit(
@@ -2598,6 +2593,7 @@ class AgentRuntime:
         error: Exception | None = None
         cancellation: asyncio.CancelledError | None = None
         generator_exit: GeneratorExit | None = None
+        plan_state_ready = False
         supersede_attempted = False
         mailbox_turn = background and isinstance(
             (request.params or {}).get(SESSION_MESSAGE_INTERNAL_KEY), dict
@@ -2652,6 +2648,7 @@ class AgentRuntime:
                         sub_mode,
                         agent,
                     )
+                    plan_state_ready = True
                     control_events = self._control_events(request, plan_result.events)
                     if on_control_event is not None:
                         for event in control_events:
@@ -2739,11 +2736,8 @@ class AgentRuntime:
             plan_error: BaseException | None = None
             admission_error: BaseException | None = None
             end_error: BaseException | None = None
-            should_check_plan_exit = (
-                agent is not None and not stateless and not readonly_goal_get
-            )
             try:
-                if should_check_plan_exit:
+                if plan_state_ready:
                     control_events = self._control_events(
                         request,
                         await self._plan_controller.check_post_process_exit(

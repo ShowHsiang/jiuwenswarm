@@ -79,3 +79,11 @@ python -m pytest tests/unit_tests/agentserver/test_runtime_monitor.py tests/unit
 扩展读取链检视发现原适配只覆盖历史落盘，chat.notice 被共享的历史查询事件白名单过滤。JSONL 回归先重现查询结果为空；将 chat.notice 纳入共享白名单，使 Web/Control/旧 session handler 一致支持提示还原。真实历史 writer 加 index/cursor 分页验证同一建议 applied → improved 的稳定 ID、状态与顺序，旧 JSON 存储按既有契约验证 index 分页。chat.runtime_monitor 仍仅保留在诊断历史，原始诊断和提示均不作为主模型上下文恢复输入。已同步 S_01 与中英文接入说明。
 
 在最终集成候选上运行上面的扩展命令，**500 passed，退出码 0**，包括 14 个原范围及 history_replay、history_index_paging、history_review_regressions、history_get_stream_split。SDK 207 与前端 128 的证据仍对应未变的相关代码。只读复查确认三个历史查询入口共用该事件集合；未新增 JEV 调用、成本预测或恢复动作。全量依赖锁限制保持不变。
+
+## 2026-11-23 正式发布基线
+
+用户选择以正式发布线为准并保留特性开发历史。应用使用官方 `releases/0.2.9` 的 `fdaec9d182fe2869dee9a37fec7893d13c1f2dee`，包含 `v0.2.9` 标签提交 `453dce3054babf7f3a7000c8e57e068de01d8d2e` 及其后的修复。依据此前 `9f403d1ca` 与特性分支 `23cbf6916` 的差异，将共享决策模型、原生主 Agent monitor、消息与历史、前端及回归用例三方移植至发布代码。原特性提交和发布提交作为合并双亲。测试清理沿用发布版日志句柄释放流程，在释放前停止后台日志。设置页 Node 夹具按发布组件的导入契约提供 i18n 初始化插件及 Vite DEV 值。
+
+SDK 对应 `v0.1.21`（`102e69254`）。应用保留发布版 `openjiuwen==0.1.21`、extras 及其余依赖约束，在 `[tool.uv.sources]` 将 SDK 指向 `../agent-core`。`uv lock` 解析 336 个包，相对官方锁的包名和版本集合一致。`uv lock --check`、已有 `.venv` 的 `uv sync --locked`、全新临时 venv 的 `uv sync --locked --no-dev` 均通过。新环境从项目目录外导入应用适配器及 SDK monitor，验证 editable 导入路径为 `D:/agent-core`，实际安装 workswarm 0.2.9、openjiuwen 0.1.21、openjiuwen-agent-gateway 0.1.0 和 opentelemetry-sdk 1.41.1。此前 develop 组合的锁定限制仅适用于旧基线。
+
+在锁定依赖的应用开发环境复验上述 18 个后端测试文件，**521 项通过**。前端 `test:runtime-monitor` 4 项、`test:jev-settings` 78 项、`test:subagent-history` 52 项，共 **134 项通过**。SDK 本轮相关回归 **203 项通过**。本轮验证范围为发布基线上的安装、装配、配置、消息、历史和监控行为，真实模型判断质量仍待原测试计划后续测量。

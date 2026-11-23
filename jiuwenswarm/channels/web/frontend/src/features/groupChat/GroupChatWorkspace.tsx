@@ -5,6 +5,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { webClient, webRequest, type WsEvent } from '../../services/webClient';
 import { attachTeamSession } from '../../services/teamAttach';
+import { formatTimestamp } from '../../utils';
 import ChatModelSelector from '../../components/ChatPanel/ChatModelSelector';
 import { TeamMemberAvatar } from '../../components/TeamMemberAvatar';
 import { useSessionStore } from '../../stores/sessionStore';
@@ -24,7 +25,7 @@ import { ExecutionCard } from './ExecutionCard';
 import { GroupFilePreviewPanel, GroupFileRow, groupFileTarget, type GroupFile } from './GroupFileRow';
 import { InteractionPrompt } from '../../components/InteractionSlot/InteractionPrompt';
 import '../../components/InteractionSlot/InteractionSlot.css';
-import { FINISHED_EXECUTIONS, filterGroupMembers, groupModelLocked, groupSessionSentIds, executionResult, groupTimeline, matchesMemberQuery, mentionExecutionPhase, pendingMentionReplies, type PendingMentionReply, renameAttachment, updateAttachments, isBackgroundRefreshTimeout, mergeExecutions, mergeMessages, selectedMentions } from './state';
+import { FINISHED_EXECUTIONS, groupModelLocked, groupSessionSentIds, executionResult, groupTimeline, mentionExecutionPhase, pendingMentionReplies, type PendingMentionReply, renameAttachment, updateAttachments, isBackgroundRefreshTimeout, mergeExecutions, mergeMessages, selectedMentions } from './state';
 import './groupChat.css';
 
 function Attachment({ file, onPreview }: { file: GroupFile; onPreview: (file: GroupFile) => void }) {
@@ -38,6 +39,12 @@ function Attachment({ file, onPreview }: { file: GroupFile; onPreview: (file: Gr
       download_token: typeof file.download_token === 'string' ? file.download_token : '',
     }]} onPreview={() => onPreview(file)} />
   </div>;
+}
+
+/** 任务模式同款消息时间（YYYY-MM-DD HH:MM），常显。 */
+function GroupMessageTime({ at }: { at: number }) {
+  const iso = new Date(at).toISOString();
+  return <time dateTime={iso} data-testid="group-chat-message-time">{formatTimestamp(iso)}</time>;
 }
 
 /** One open group conversation with its member and file panels; the group list lives in the chat sidebar. */
@@ -286,11 +293,13 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
         if (typeof payload.execution_id === 'string' && typeof payload.revision === 'number') {
           setExecutions((current) => mergeExecutions(current, [payload as unknown as GroupExecution]));
         }
+      } else if (payload.event_type === 'group.route.updated' || event.event === 'group.route.updated') {
+        void refresh();
       } else if (payload.event_type === 'group.member.added' || event.event === 'group.member.added') {
         void refresh();
       }
     };
-    const stops = ['group.message', 'group.execution.created', 'group.execution.updated',
+    const stops = ['group.route.updated', 'group.message', 'group.execution.created', 'group.execution.updated',
       'chat.ask_user_question', 'chat.ask_user_answer', 'group.member.added', 'team.runtime_ready', 'team.group_message.accepted', 'chat.final', 'chat.error', 'team.error', 'team.interact.failed'].map((name) => webClient.on(name, onEvent));
     const stopState = webClient.onStateChange((state) => {
       setConnected(state === 'ready');
@@ -476,8 +485,9 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
   }
   const timeline = groupTimeline(messages, executions);
 
-  const visibleMembers = filterGroupMembers(group?.members ?? [], memberQuery);
-  const showSelf = matchesMemberQuery(t('groupChat.you'), memberQuery);
+  const visibleMembers = group?.members.filter((member) => (member.display_name ?? '')
+    .toLocaleLowerCase().includes(memberQuery.trim().toLocaleLowerCase())) ?? [];
+  const showSelf = !memberQuery.trim() || t('groupChat.you').includes(memberQuery.trim());
   const memberAvatar = (member: string) => <TeamMemberAvatar member={member} className="group-chat-assignee-avatar" alt="" />;
   const agentCount = group?.members.length ?? 0;
 
@@ -487,7 +497,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
   // 刷新后据服务端执行恢复；乐观 pending 阶段不弹。
   const modelLocked = groupModelLocked(messages, executions, olderOffset > 0);
   const pendingMentionsByMessage = group
-    ? pendingMentionReplies(messages, executions, group.members, sessionSentIds)
+    ? pendingMentionReplies(messages, executions, group.members, sessionSentIds, group.organization_routes)
     : new Map<string, PendingMentionReply[]>();
 
   return <section className="group-chat-workspace has-conversation" data-testid="group-chat-workspace">
@@ -540,20 +550,32 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
             <Fragment key={item.id}>
               <article id={`group-chat-message-${item.id}`} className={`group-chat-message${item.message.sender === 'user' ? ' is-user' : ''}`}
                 data-testid="group-chat-message" data-variant={item.id}>
-                {item.message.sender !== 'user' && <header data-testid="group-chat-message-header">
-                  <TeamMemberAvatar member={item.message.sender} className="group-chat-message-avatar" alt="" />
-                  <strong>{item.message.sender_name || item.message.sender}</strong>
-                  <time dateTime={new Date(item.at).toISOString()}>{new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
-                </header>}
-                <GroupMessageContent message={item.message} animate={animatedMessages.current.has(item.id)} members={group.members} />
-                {item.message.pending && <small className="group-chat-muted" data-testid="group-chat-message-pending">
-                  {t('groupChat.sending')}
-                </small>}
-                {(item.message.attachments ?? []).map((file, index) => <Attachment key={index} file={file} onPreview={setPreview} />)}
+                {item.message.sender === 'user' ? (
+                  <>
+                    <div className="group-chat-message__bubble">
+                      <GroupMessageContent message={item.message} animate={animatedMessages.current.has(item.id)} members={group.members} />
+                      {item.message.pending && <small className="group-chat-muted" data-testid="group-chat-message-pending">
+                        {t('groupChat.sending')}
+                      </small>}
+                      {(item.message.attachments ?? []).map((file, index) => <Attachment key={index} file={file} onPreview={setPreview} />)}
+                    </div>
+                    <GroupMessageTime at={item.at} />
+                  </>
+                ) : (
+                  <>
+                    <header data-testid="group-chat-message-header">
+                      <TeamMemberAvatar member={item.message.sender} className="group-chat-message-avatar" alt="" />
+                      <strong>{item.message.sender_name || item.message.sender}</strong>
+                      <GroupMessageTime at={item.at} />
+                    </header>
+                    <GroupMessageContent message={item.message} animate={animatedMessages.current.has(item.id)} members={group.members} />
+                    {(item.message.attachments ?? []).map((file, index) => <Attachment key={index} file={file} onPreview={setPreview} />)}
+                  </>
+                )}
               </article>
-              {(pendingMentionsByMessage.get(item.id) ?? []).map(({ memberName, execution }) => {
+              {(pendingMentionsByMessage.get(item.id) ?? []).map(({ memberName, execution, organization, route }) => {
                 const member = group.members.find((item2) => item2.member_name === memberName);
-                const phase = mentionExecutionPhase(execution);
+                const phase = mentionExecutionPhase(execution, organization, route);
                 const phaseLabel = phase.key === 'executing' && phase.total
                   ? t('groupChat.mentionPhase.executingProgress', { completed: phase.completed ?? 0, total: phase.total })
                   : t(`groupChat.mentionPhase.${phase.key}`);
@@ -565,7 +587,7 @@ export function GroupChatWorkspace({ groupId, directory, onBack }: {
                     <strong>{member?.display_name || memberName}</strong>
                   </header>
                   <div className="group-chat-mention-pending__bubble">
-                    <span className="group-chat-mention-pending__dots" aria-hidden="true"><i /><i /><i /></span>
+                    {route?.status !== 'failed' && <span className="group-chat-mention-pending__dots" aria-hidden="true"><i /><i /><i /></span>}
                     <span className="group-chat-mention-pending__stack">
                       <span>{phaseLabel}</span>
                     </span>

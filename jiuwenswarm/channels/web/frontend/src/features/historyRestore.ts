@@ -6,6 +6,7 @@ import { webClient } from '../services/webClient';
 import { normalizeFinalContent } from '../utils/finalContent';
 import { describeChatError } from './free-models/chatError';
 import { mergeFileDownloadItems } from '../utils/fileDownloadDedup';
+import { canMessageHostFileItems } from './chatFileAttachment';
 import { parseTimestampToMs, timestampMsToIso } from '../utils/timestamp';
 import { extractAutomation } from '../utils/heartbeatAutomation';
 import {
@@ -22,7 +23,6 @@ import {
   isGoalCompletedContent,
 } from '../components/GoalBar/goalCompletedMessage';
 import { HistoryRecordReassembler } from './historyRecordReassembler';
-import { stripMentionAppendix } from './designer/designerMentions';
 import { expertTeamId } from './teamOrganization/conversation';
 import { isTeamOrganizationUiEnabled } from './teamOrganization/featureConfig';
 import { readAgentTemplateName } from './agentIdentity';
@@ -511,6 +511,9 @@ interface BeginHistoryRestoreOptions {
   subagentId?: string;
   /** Continue initial restore past batches with no restorable content. */
   requestNextBatch: (cursor: string) => Promise<unknown>;
+  /** Validate recovery against the live turn before publishing any history data. */
+  shouldApply?: () => boolean;
+  onDiscard?: () => void;
   onReady: (messages: Message[], cursor: HistoryCursorMeta) => void;
   /** 与消息同一时间线顺序，用于恢复 ToolGroupDisplay */
   onToolReplay?: (items: HistoryToolReplayItem[]) => void;
@@ -1140,8 +1143,7 @@ function parseSessionHistoryTimelineEntry(
         id,
         role: 'user',
         outputOrder: readOutputOrder(record) ?? readOutputOrder(eventPayload),
-        // A design "@" mention carries a leader-only appendix; show the user's own text.
-        content: stripMentionAppendix(content),
+        content,
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
         ...(mediaItems.length > 0 ? { mediaItems } : {}),
@@ -1579,29 +1581,23 @@ function parseSessionHistoryTimelineEntry(
   return null;
 }
 
-function isAssistantLikeHistoryMessage(message: Message): boolean {
-  return (
-    message.role === 'assistant' ||
-    (message.role === 'system' && Boolean(message.id?.startsWith('team-leader-')))
-  );
-}
-
 /**
- * 与实时 `addFileItems` 对齐：chat.file 挂到「已经出现的」最近一条助手消息。
- * 旧逻辑挂到下一条 final，会导致刷新后文件从总结上方跑到总结气泡内部下方。
+ * 与实时 `addFileItems` 对齐：chat.file 只挂到「文件到达时已经存在的最后一条消息」。
+ * 最后一条能承载文件卡片就挂上去；否则由调用方新建独立文件消息。
+ *
+ * 不能向前扫描：向前扫描会越过本轮 user 消息，把文件挂到上一轮（Issue #6159）。
+ * 也不能挂到文件之后才出现的总结消息上——它当时还不存在。
  */
-function attachFilesToPreviousAssistant(messages: Message[], files: FileDownloadItem[]): boolean {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (!isAssistantLikeHistoryMessage(messages[i])) {
-      continue;
-    }
-    messages[i] = {
-      ...messages[i],
-      fileItems: mergeFileDownloadItems(messages[i].fileItems, files),
-    };
-    return true;
+function attachFilesToLastMessage(messages: Message[], files: FileDownloadItem[]): boolean {
+  const last = messages[messages.length - 1];
+  if (!last || !canMessageHostFileItems(last)) {
+    return false;
   }
-  return false;
+  messages[messages.length - 1] = {
+    ...last,
+    fileItems: mergeFileDownloadItems(last.fileItems, files),
+  };
+  return true;
 }
 
 function createFileOnlyAssistantMessage(at: string, files: FileDownloadItem[]): Message {
@@ -1802,6 +1798,7 @@ function buildUnansweredQaSummaryMessage(
     role: 'assistant',
     content: buildQaSummaryContent({ title: i18n.t('qaSummary.title'), items }),
     timestamp: at,
+    unansweredQuestion: { requestId: pending.request_id, source: pending.source },
   };
 }
 
@@ -1938,7 +1935,7 @@ function materializeHistoryTimeline(
       continue;
     }
     if (e.kind === 'file_items') {
-      if (!attachFilesToPreviousAssistant(messages, e.files)) {
+      if (!attachFilesToLastMessage(messages, e.files)) {
         messages.push(createFileOnlyAssistantMessage(e.at, e.files));
       }
       continue;
@@ -2542,6 +2539,10 @@ export function beginHistoryRestore(options: BeginHistoryRestoreOptions): Histor
     stopListening();
 
     try {
+      if (options.shouldApply && !options.shouldApply()) {
+        options.onDiscard?.();
+        return;
+      }
       if (tokenUsageSnapshot) {
         options.onSessionTokenUsage?.(tokenUsageSnapshot);
       }

@@ -112,7 +112,6 @@ export async function toggleSessionPin(session: Session, translate: Translate): 
     toast.open({
       content: `${translate('multiSession.project.pinFailed')}: ${error instanceof Error ? error.message : String(error)}`,
       variant: 'error',
-      wide: true,
     });
   } finally {
     refreshExpandedCronSessions();
@@ -124,7 +123,6 @@ function openArchiveFailureToast(content: string) {
     content,
     variant: 'error',
     duration: 5,
-    wide: true,
   });
 }
 
@@ -158,7 +156,6 @@ function openArchiveSuccessToast(
     content: options.content,
     icon: createElement(Archive, { 'aria-hidden': true, size: 16, strokeWidth: 1.8 }),
     duration: 5,
-    wide: true,
     actions: [
       {
         label: translate('multiSession.project.archiveView'),
@@ -333,6 +330,10 @@ export function useSidebarMenu(options: SidebarMenuOptions): {
     archiveInFlightRef.current.add(opKey);
     try {
       await archiveSession(session.session_id);
+      // Archive stops a live turn in the backend without terminal wire frames.
+      // Settle the local turn before the Session leaves the workspace so an
+      // undo/restore cannot resurrect it as still running (GitCode #6533).
+      useChatStore.getState().settleLifecycleStoppedSession(session.session_id);
       flushSync(() => {
         removeSessionLocally(session.session_id);
         openArchiveSuccessToast(t, {

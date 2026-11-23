@@ -26,7 +26,6 @@ import openjiuwen.symphony as core_symphony  # type: ignore[import-untyped]
 from openjiuwen.symphony import FINGERPRINT_ARTIFACT_FILENAME
 
 from jiuwenswarm.common.config import get_config
-from jiuwenswarm.common.model_error_messages import user_facing_model_error
 from jiuwenswarm.server.runtime.skill import load_execution_disabled_skills
 from jiuwenswarm.server.runtime.skill.skillpack import (
     load_skillpack,
@@ -642,13 +641,11 @@ class SwarmSymphonyService:
                     await probe_model_connection(llm_config)
                     build_logger.record("model.probe.done", model=model_name)
                 except Exception as exc:  # noqa: BLE001
-                    # 日志/诊断保留原始异常，用户可见的 detail 与 error 走友好提示。
-                    raw_error = str(exc).strip() or type(exc).__name__
-                    error = user_facing_model_error(exc, fallback=raw_error)
+                    error = str(exc).strip() or type(exc).__name__
                     detail = f"主模型连接测试未通过：{error}"
                     build_logger.record(
                         "update.failed",
-                        error=raw_error,
+                        error=error,
                         detail=detail,
                         failure_stage="model.probe",
                     )
@@ -1040,8 +1037,7 @@ class SwarmSymphonyService:
                 type(exc).__name__,
             )
 
-    @staticmethod
-    def list_experience_candidates() -> dict[str, Any]:
+    def list_experience_candidates(self) -> dict[str, Any]:
         """Return installable Recipe versions retained by the Core Flow store."""
 
         config = load_symphony_config()
@@ -1117,16 +1113,14 @@ class SwarmSymphonyService:
             installed_count = sum(tuple(sorted(item.structure)) in installed_structures for item in candidates)
             if installed_count:
                 logger.info("SkillPack automatic discovery suppressed %s installed combinations", installed_count)
-            pending_candidates = []
-            for item in candidates:
-                if tuple(sorted(item.structure)) in installed_structures:
-                    continue
-                if flow.store.is_candidate_acknowledged(item.recipe_id, item.version):
-                    continue
-                request_id = candidate_request_id(item.recipe_id, item.version, session_id, identity.key)
-                if (item.recipe_id, item.version, request_id) not in self._notified_candidates:
-                    pending_candidates.append(item)
-            candidates = tuple(pending_candidates)
+            candidates = tuple(
+                item for item in candidates
+                if tuple(sorted(item.structure)) not in installed_structures
+                and not flow.store.is_candidate_acknowledged(item.recipe_id, item.version)
+                and (item.recipe_id, item.version, candidate_request_id(
+                    item.recipe_id, item.version, session_id, identity.key,
+                )) not in self._notified_candidates
+            )
         # One preview batch must not rescan all evidence for every candidate.
         # Confirmation and installation still read fresh ownership/evidence.
         evidence_ids: set[str] = set()
@@ -1462,6 +1456,8 @@ class SwarmSymphonyService:
                             "Symphony Skill install failed (%s)",
                             type(exc).__name__,
                         )
+                        if getattr(exc, "code", "") == "SKILL_ALREADY_EXISTS":
+                            return {"installed": False, "reason": "skill_already_exists"}
                         if getattr(exc, "code", "") in {
                             "SKILL_INVALID_METADATA",
                             "SKILL_INVALID_PACKAGE",

@@ -191,6 +191,7 @@ def build_permission_rail(
     browser_runtime_security_profile: Any = None,
     trusted_search_urls: Any = None,
     channel_id: str = "",
+    session_artifact_paths: Any = None,
 ) -> Any | None:
     """Build openjiuwen PermissionInterruptRail for tool permission checks.
 
@@ -240,6 +241,7 @@ def build_permission_rail(
 
     from jiuwenswarm.agents.harness.common.a4p.preflight import unregister_preflight_rail
 
+    bound_channel_id = str(channel_id or "").strip()
     if session_id:
         unregister_preflight_rail(str(session_id).strip())
     inline_permissions = config.get("permissions", {})
@@ -384,8 +386,8 @@ def build_permission_rail(
             execution_context = AUTHORIZATION_EXECUTION_CONTEXTS.get(session_id)
             channel = (
                 execution_context.channel_id
-                if execution_context is not None
-                else (TOOL_PERMISSION_CHANNEL_ID.get() or "web")
+                if execution_context is not None and execution_context.channel_id
+                else (TOOL_PERMISSION_CHANNEL_ID.get() or bound_channel_id or "web")
             )
 
             tool_call = req.tool_call
@@ -934,6 +936,7 @@ def build_permission_rail(
                 browser_runtime_security_profile=browser_runtime_security_profile,
                 trusted_search_urls=trusted_search_urls,
                 written_permissions=_get_written_permissions,
+                session_artifact_paths=session_artifact_paths,
             )
             permission_rail.set_trusted_dirs(None)
 
@@ -1595,13 +1598,10 @@ def _reviewer_ui_metadata_from_interaction(
                 projected[key] = items
             continue
         if isinstance(value, str) and value.strip():
-            if key in {"evidence_summary", "manual_reason_summary", "user_review_hint"}:
-                projected[key] = value
-            else:
-                projected[key] = redact_secret_values(
-                    value,
-                    max_length=_AUTO_REVIEWER_UI_MAX_TEXT_LENGTH,
-                )
+            projected[key] = redact_secret_values(
+                value,
+                max_length=_AUTO_REVIEWER_UI_MAX_TEXT_LENGTH,
+            )
     return projected
 
 

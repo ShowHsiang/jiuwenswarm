@@ -109,10 +109,8 @@ echo ""
 echo -e "${GREEN}Running tests...${NC}"
 echo ""
 
-# set -e 会在此处直接退出脚本，导致下方失败横幅分支不可达；
-# 先置零再用 || 捕获，保证 EXIT_CODE 拿到 pytest 退出码。
-EXIT_CODE=0
-eval $PYTEST_CMD || EXIT_CODE=$?
+eval $PYTEST_CMD
+EXIT_CODE=$?
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then

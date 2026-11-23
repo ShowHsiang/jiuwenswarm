@@ -19,7 +19,6 @@ from openjiuwen.core.foundation.tool import McpServerConfig
 
 from jiuwenswarm.common.config import get_mcp_server_config
 from jiuwenswarm.common.external_providers import provider
-from jiuwenswarm.common.mcp_dynamic_token_patch import SSL_VERIFY_ENTRY_KEY
 
 _HTTP_MCP_TRANSPORTS = frozenset({"sse", "http", "streamable-http", "streamable_http"})
 
@@ -218,15 +217,6 @@ def build_mcp_server_config(
         timeout_s = entry.get("timeout_s")
         if isinstance(timeout_s, (int, float)) and int(timeout_s) > 0:
             params["timeout_s"] = int(timeout_s)
-        # 条目级 ssl_verify 与 dynamic_token_url 绑定生效：仅动态 token 网关
-        # 显式配置 false 时，取动态 token 的请求跳过证书校验。绑定在唯一落点
-        # 收敛——注册时随 mark 登记（见 interface_deep._register_mcp_server），
-        # 探活 / 运行时取 token 均按 params / 注册表现读。
-        if (
-            entry.get(SSL_VERIFY_ENTRY_KEY) is False
-            and str(entry.get("dynamic_token_url") or "").strip()
-        ):
-            params[SSL_VERIFY_ENTRY_KEY] = False
         if params:
             payload["params"] = params
 
@@ -311,11 +301,6 @@ async def preflight_mcp_server_reachable(
         read_t = 10.0
     # Short connect (unreachable host fails fast); read catches no-response.
     http_timeout = httpx.Timeout(connect=min(read_t, 5.0), read=read_t, write=5.0, pool=5.0)
-    # 条目级 ssl_verify（params 携带，仅动态 token 网关生效）：显式 false 时
-    # 取 token 的请求跳过证书校验；MCP 服务本身的探活仍按默认校验。
-    ssl_verify = (
-        (getattr(cfg, "params", None) or {}).get(SSL_VERIFY_ENTRY_KEY) is not False
-    )
 
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     # Caller headers live in params.headers and/or auth_headers. 
@@ -386,7 +371,6 @@ async def preflight_mcp_server_reachable(
                     token_url=dynamic_token_url,
                     creds=creds,
                     timeout_s=min(TOKEN_TIMEOUT_S, read_t),
-                    ssl_verify=ssl_verify,
                 )
             except Exception:  # noqa: BLE001 - 探活不因 token 服务失败而失败
                 headers[TOKEN_HEADER_NAME] = ""
@@ -669,39 +653,82 @@ async def probe_mcp_live_connection(name: str) -> tuple[bool, str]:
     return True, ""
 
 
-async def prewarm_connected_mcps(*, report_status: bool = False) -> bool | None:
+async def discard_probed_mcp(name: str) -> None:
+    """Drop the instance a successful probe cached for a cancelled connect.
+
+    ``probe_mcp_live_connection`` keeps it in the process-level
+    ``Runner.resource_mgr``; after a cancel the record is rolled back, so the
+    cached connection (and its stdio child) must not outlive it.
+    """
+    from openjiuwen.core.runner import Runner
+
+    # Fresh task: closing an SSE client's anyio scope in the caller's task
+    # raises "exit cancel scope in a different task".
+    task = asyncio.create_task(
+        Runner.resource_mgr.remove_mcp_server(server_name=name, ignore_exception=True)
+    )
+    try:
+        await asyncio.wait_for(task, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+        logger.warning("[mcp-config] discard probed MCP '%s' failed: %s", name, exc)
+
+
+async def prewarm_connected_mcps(
+    *, report_status: bool = False, settle_connecting: bool = False
+) -> bool | None:
     """Prewarm ``Runner.resource_mgr`` for every ``state==connected`` MCP.
 
     Probes each so a later ``chat.send`` reconcile hits the existing-entry
-    branch (no re-spawn). Failure-isolated per MCP and never downgrades state.
-    Safe to call at startup and again from the root adapter (idempotent).
+    branch (no re-spawn). Connected records are never downgraded.
 
-    ``report_status`` returns whether every probe succeeded for capability
-    readiness. The default retains the existing best-effort ``None`` result.
+    ``settle_connecting`` additionally probes leftover ``connecting`` records
+    and settles them to connected or a retryable state, so a connect interrupted
+    by a crash cannot strand the UI on "connecting".
 
-    Background fire-and-forget — the service never awaits this task, so a
-    slow/cold MCP probe (npx first-install ~30s, HTTP connect) is allowed to
-    take as long as it needs; only a genuine deadlock (stuck well beyond what
-    probe's internal preflight/connect would take) is bounded by a generous
-    stall timeout.  A semaphore caps concurrency so N simultaneous spawns
-    don't overwhelm the host during startup.
+    ``report_status`` returns whether every connected probe succeeded for
+    capability readiness; connecting records never affect readiness.
+
+    Best-effort background task: slow/cold probes may take as long as they need
+    (only a genuine stall hits the timeout), and a semaphore caps concurrency.
     """
     try:
-        names = [
+        state = provider("mcp_state")
+        connected_names = [
             str(r.get("name", "")).strip()
-            for r in provider("mcp_state").list_truly_connected_mcps()
+            for r in state.list_truly_connected_mcps()
             if r.get("name")
         ]
+        connecting_names: list[str] = []
+        if settle_connecting:
+            connecting_names = [
+                str(r.get("name", "")).strip()
+                for r in state.list_connecting_mcps()
+                if r.get("name")
+            ]
+        names = [*connected_names, *connecting_names]
         if not names:
             return True if report_status else None
         logger.info(
-            "[mcp-prewarm] prewarming %d connected MCP(s): %s",
-            len(names), names,
+            "[mcp-prewarm] prewarming %d connected MCP(s), settling %d connecting: %s",
+            len(connected_names), len(connecting_names), names,
         )
+        connected_set = set(connected_names)
+        connecting_set = set(connecting_names)
+        mcp_registry = None
+        if connecting_set:
+            try:
+                mcp_registry = provider("mcp_registry")
+            except Exception as exc:  # noqa: BLE001 - settling is best-effort
+                logger.warning(
+                    "[mcp-prewarm] mcp_registry provider unavailable; "
+                    "connecting MCPs will not be settled: %s", exc,
+                )
 
         sem = asyncio.Semaphore(_PREWARM_MAX_CONCURRENCY)
 
         async def _probe_one(name: str) -> bool:
+            ok = False
+            reason = ""
             async with sem:
                 try:
                     # Only a genuine stall (>> probe's expected worst case)
@@ -710,31 +737,30 @@ async def prewarm_connected_mcps(*, report_status: bool = False) -> bool | None:
                         probe_mcp_live_connection(name),
                         timeout=_PREWARM_STALL_TIMEOUT_S,
                     )
-                    if ok:
-                        logger.info("[mcp-prewarm] '%s' prewarmed", name)
-                    else:
-                        logger.warning(
-                            "[mcp-prewarm] '%s' prewarm failed: %s "
-                            "(will lazy-connect on first chat)", name, reason,
-                        )
-                    return bool(ok)
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "[mcp-prewarm] '%s' prewarm stalled >%.0fs "
-                        "and was skipped (will lazy-connect on first chat)",
-                        name, _PREWARM_STALL_TIMEOUT_S,
-                    )
+                    reason = f"stalled >{_PREWARM_STALL_TIMEOUT_S:.0f}s"
                 except Exception as exc:  # noqa: BLE001
+                    reason = f"{type(exc).__name__}: {exc}"
+                if ok:
+                    logger.info("[mcp-prewarm] '%s' prewarmed", name)
+                else:
                     logger.warning(
-                        "[mcp-prewarm] '%s' prewarm error: %s", name, exc,
+                        "[mcp-prewarm] '%s' prewarm failed: %s "
+                        "(will lazy-connect on first chat)", name, reason,
                     )
-                return False
+                if mcp_registry is not None and name in connecting_set:
+                    await asyncio.to_thread(
+                        mcp_registry.settle_connecting_mcp, name, probe_ok=ok
+                    )
+                return ok
 
         # Concurrent probes bounded by semaphore — all MCPs start in parallel
         # but at most N execute add_mcp_server at any moment.  Total wall time
         # ≈ the slowest probe alone (not N×), with stall protection only.
         results = await asyncio.gather(*[_probe_one(name) for name in names])
-        return all(results) if report_status else None
+        if not report_status:
+            return None
+        return all(ok for name, ok in zip(names, results) if name in connected_set)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[mcp-prewarm] background prewarm failed: %s", exc)
         return False if report_status else None

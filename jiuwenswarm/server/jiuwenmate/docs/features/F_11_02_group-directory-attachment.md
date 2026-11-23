@@ -134,10 +134,11 @@ English summary: DingTalk's first-message visibility floor uses the host receipt
 
 本轮定向回归 120 项全部通过（70.75 秒），覆盖钉钉入站／投递、消息登记和旧消息不得复活、后台历史轮询。日志 `C:/Users/zs/.codex/backups/dingtalk-trigger-clock-skew-tests.txt`。未提交、推送或重启服务。
 
-### Develop backport validation (2026-11-06)
 
-Backports `e9c8ca0ba` and `46542a843` onto `60c2c6b74`. Conflict resolution retains the target's public `sessions`, `now()` and `verified_snapshot()` APIs, platform access checks and shared Gateway architecture. Newly imported Gateway tests use `agent_gateway`; obsolete in-repository Gateway implementations are not restored.
+### Release 0.2.9 backport validation (2026-11-06)
 
-Validation: 264 focused backend tests passed, including real Core directory attachment integration; 12 workspace frontend tests passed. Backend checks used target-pinned Core `f3f8f576`, Protocol `cbbadde9`, runtime foundation `d4a8761` and Gateway `cff3b1b9` sources. A local test runner tolerates Windows sandbox log-handle cleanup contention; repository conftest and dependency declarations are unchanged. The raw-message identity regressions verify safe rejection after removing exception chaining to an expired `exc` variable. Cross-package dispositions are checked by their wire value.
+Backports `e9c8ca0ba` and `46542a843` onto `f140874df`. Conflict resolution retains the target's public `sessions`, `now()` and `verified_snapshot()` APIs, WeLink access checks, shared Gateway architecture and latest message timestamps. Newly imported Gateway tests use `agent_gateway`; obsolete in-repository Gateway implementations are not restored.
+
+Validation after rebasing onto the latest release: 264 focused backend tests passed, including real Core directory attachment integration; 13 workspace frontend tests passed, including message timestamps and channel refresh. Backend checks used target-pinned Core `f3f8f576`, Protocol `cbbadde9`, runtime foundation `d4a8761` and updated Gateway `1f757568` sources. A local test runner tolerates Windows sandbox log-handle cleanup contention; repository conftest and dependency declarations are unchanged. Raw-message identity regressions verify safe rejection after removing exception chaining to an expired `exc` variable; cross-package dispositions are checked by their wire value.
 
 Integration dependency remains open: the pinned external Gateway lacks the source commit's Feishu dissolution/ACK and DingTalk lifecycle subscription changes. This Swarm candidate alone does not complete the platform event path; a Gateway companion change and dependency update are required before merging. No real IM service was restarted or user credentials changed.

@@ -49,7 +49,6 @@ export type FilePreviewContentProps = {
   errorText?: string | null;
   labels: FilePreviewContentLabels;
   testId?: string;
-  onLinkClick?: (href: string) => boolean | void;
 };
 
 /**
@@ -65,7 +64,6 @@ export function FilePreviewContent({
   errorText,
   labels,
   testId = 'file-preview-content',
-  onLinkClick,
 }: FilePreviewContentProps) {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const isMarkdown = file ? isMarkdownFilePath(file.path) : false;
@@ -173,7 +171,6 @@ export function FilePreviewContent({
                 <MarkdownRenderer
                   content={markdownParts.body || ' '}
                   className="prose prose-sm max-w-none file-preview-markdown__body"
-                  onLinkClick={onLinkClick}
                 />
               </article>
             ) : null}

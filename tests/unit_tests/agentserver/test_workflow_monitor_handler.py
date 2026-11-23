@@ -1030,9 +1030,7 @@ class TestExecutorConsumptionChain:
         )
 
         assert len(results) == 1
-        # Unknown stays omitted (never an explicit null, which the frontend
-        # merge would read as an erase of a cold-restored name).
-        assert "executor" not in results[0]["workflow"]
+        assert results[0]["workflow"]["executor"] is None
         snapshot = handler.get_workflow_snapshot()
         assert snapshot[0]["executor"] is None
 

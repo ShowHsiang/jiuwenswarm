@@ -1,4 +1,3 @@
-import { isEnterprise } from '../../edition';
 import { openAssetPublish } from '../../features/assetPublishEvents';
 import { canShowAssetPublish } from '../../features/assetPublishState';
 
@@ -150,7 +149,7 @@ export function DefinitionDetailPage({
                发布/卸载/删除为文字链接态，连接/使用为 28px 药丸（detail-action--use），安装为实底
                药丸（detail-action--install）。原 .agent-management-detail__actions 一套私有类已删除。 */
             <div className="detail-actions">
-              {canShowAssetPublish(detail.installed) && !isEnterprise() && (
+              {canShowAssetPublish(detail.installed) && (
                 <button
                   type="button"
                   className="detail-action"

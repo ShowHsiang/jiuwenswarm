@@ -336,9 +336,9 @@ class StructuredAskUserRail(AskUserRail):
         tool_call = getattr(ctx.inputs, "tool_call", None)
         call_id = str(getattr(tool_call, "id", "") or "")
         skipped = ctx.extra.get("_skip_tool_calls")
-        if call_id and isinstance(skipped, Mapping):
-            if skipped.get(call_id) is True and getattr(ctx.inputs, "tool_msg", None) is not None:
-                return
+        if (call_id and isinstance(skipped, Mapping) and skipped.get(call_id) is True
+                and getattr(ctx.inputs, "tool_msg", None) is not None):
+            return
         await super().before_tool_call(ctx)
 
     async def resolve_interrupt(
