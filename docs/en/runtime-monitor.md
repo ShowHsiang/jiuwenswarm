@@ -2,6 +2,22 @@
 
 The native main Agent uses the SDK RuntimeMonitor for evidence, progress windows, intervention advice and outcome tracking. The application owns configuration, client lifecycle, bounded chat notices and history. Cost prediction is excluded. Recovery will be integrated separately.
 
+## Registering adjudicating records
+
+Under `execution_guard.runtime_monitor`, register the absolute path returned by native `read_file`, the expected output digest and the versioned facts covered by that file. Give copies the same subject, property, optional scope and version. Mark the independently checked original with `adjudicates: true`. A file may cover several facts.
+
+```yaml
+execution_guard:
+  runtime_monitor:
+    evidence_files:
+      "/srv/warehouse/aisle-record.txt":
+        result_sha256: "84c30be6ede535eecebb130d0a1f2ec7fdfc7dff7e640bd8d776d553dfdc45f2"
+        facts:
+          - {subject: A7, property: aisle, version: R4, adjudicates: true}
+```
+
+The example pins the UTF-8 digest of `"     1\tRack A7: aisle 4."`, including the native line number and tab. Compute the expected digest from the full, reviewed result. Partial reads, failed reads and digest mismatches produce generic observations. Updating registrations starts a fresh scoring generation. The SDK retains the source pairs after a verified original settles their dispute. Business acceptance uses a separate `Verification`.
+
 ## Shared decision model
 
 Configure JEV in **Settings → Models → Decision model**. BAI and the browser Agent share `browser.decision` (provider, api_base, model, api_key_env) and the existing credential store:

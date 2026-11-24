@@ -1,5 +1,6 @@
 """Application assembly, live SDK feedback and user-visible notice/history contracts."""
 import asyncio
+import hashlib
 import importlib
 import json
 import uuid
@@ -12,6 +13,7 @@ from openjiuwen.core.context_engine import ContextWindow
 from openjiuwen.core.foundation.llm import AssistantMessage, AssistantMessageChunk, ToolCall, ToolMessage
 from openjiuwen.core.foundation.llm.system_one import ChoiceAnswer, NoulAnswer, SystemOneResponse, SystemOneUsage
 from openjiuwen.core.foundation.tool import ToolInfo
+from openjiuwen.core.foundation.tool.schema import ToolOutput
 from openjiuwen.core.session.agent import Session
 from openjiuwen.core.single_agent import AgentCard
 from openjiuwen.harness import create_deep_agent
@@ -144,6 +146,61 @@ async def test_real_adapter_factory_installs_monitor_and_cleanup_closes_client(c
     await cold.adapter.cleanup()
     assert binding.client.close_count == 1
     assert cold.adapter._instance.react_agent._runtime_monitor is None
+
+
+@pytest.mark.asyncio
+async def test_registered_file_proof_requires_full_native_read_and_exact_digest(fake_jev, tmp_path):
+    agent = SimpleNamespace(set_runtime_monitor=MagicMock())
+    settings = config()
+    path = tmp_path / "original.txt"
+    content = "     1\tA signed record for this version."
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    fact = {"subject": "shipment", "property": "gate", "version": "v1", "adjudicates": True}
+    manifest = {str(path): {"result_sha256": digest, "facts": [fact, {**fact, "property": "seal"}]}}
+    settings["execution_guard"]["runtime_monitor"]["evidence_files"] = manifest
+    binding = await configure_runtime_monitor(agent, settings)
+    monitor = binding.monitor
+    session = Session(session_id="test-file-proof")
+    monitor.start_task(session, "find signed record")
+    run = monitor.bind(session, "find signed record")
+
+    def read(result, name="read_file", args=None):
+        call = ToolCall(id="read-1", type="function", name=name,
+                        arguments=json.dumps(args if args is not None else {"file_path": str(path)}))
+        message = ToolMessage(content=content, tool_call_id=call.id)
+        run.begin_step(AssistantMessage(content="", tool_calls=[call]))
+        run.tool_results([call], [(result, message)], set())
+        return run.memory.steps[-1].observations
+
+    def output(file=path, text=content, success=True):
+        return ToolOutput(success=success, data={"file_path": str(file), "content": text})
+
+    try:
+        observations = read(output())
+        assert [(o.subject, o.property, o.version) for o in observations] == [
+            ("shipment", "gate", "v1"), ("shipment", "seal", "v1")]
+        assert all(o.resolution_ref == f"sha256:{digest}" for o in observations)
+        assert not run.memory.steps[-1].verifications
+        for result, name, args in [
+                (output(text=content + " modified"), "read_file", None),
+                (output(file=tmp_path / "copies" / path.name), "read_file", None),
+                (output(success=False), "read_file", None), (content, "read_file", None),
+                (output(), "other_tool", None), (output(), "read_file", {"limit": 1}),
+                (output(), "read_file", {"offset": 1}), (output(), "read_file", {"pages": "1"}),
+        ]:
+            observation, = read(result, name, args)
+            assert observation.text == content and observation.subject is None and observation.resolution_ref is None
+        # Removing adjudication changes the meaning of retained evidence across a hot reload.
+        prior_generation = run.memory.generation
+        manifest[str(path)]["facts"][0]["adjudicates"] = False
+        replacement = await configure_runtime_monitor(agent, settings, current=binding)
+        try:
+            assert replacement.monitor.bind(session, "same", resume=True).memory.generation != prior_generation
+            assert binding.closed
+        finally:
+            await replacement.aclose()
+    finally:
+        await binding.aclose()
 
 
 class MainModel:

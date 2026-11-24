@@ -10,6 +10,7 @@ modules:
   - jiuwenswarm/channels/web/frontend
 files:
   - jiuwenswarm/server/runtime/agent_adapter/runtime_monitor.py
+  - jiuwenswarm/server/runtime/agent_adapter/runtime_file_evidence.py
   - jiuwenswarm/common/browser_settings.py
   - jiuwenswarm/resources/config.yaml
   - tests/unit_tests/agentserver/test_runtime_monitor_config.py
@@ -22,6 +23,14 @@ designs:
 ---
 
 # Runtime BAI 共用决策模型配置与官方基线同步
+
+## 2026-11-24 原件适配与真实模型对照
+
+测试工作区按已核对的工具结果摘要登记五份合成材料。对象、属性和版本用于关联副本，签署原件登记两项裁决权，清单内没有预置门位或封签答案。原生工具调用、失败回退和配置重载均由适配回归覆盖。两条既有会话回放及一次实时共享 JEV 试验在五步读取上均得到 `0,1,1,2,0`。SDK 修复记录为 `B_20261124_1538_runtime-evidence-disputes`。
+
+通过测试网页的真实会话复验，串行读取时监控分别报告 0、1、1、2、0。四份副本并行读取再查阅原件时两轮分别报告 2、0，两项矛盾由同一批 JEV 识别。两种方式都触发 EVIDENCE_CONFLICT、送达 VERIFY 并记录 improved。真实共享 JEV 另以宿主签发的合成入库验收做探索基准，三份不同的低收益响应在第五轮只触发 LOW_GAIN_STREAK，收到签收单后连续计数归零。
+
+WREN 轮询对照固定原用户问题、前四次工具响应及当时的五个 JEV 响应。从第五步起使用相同的真实主模型和只读工具，三组交替运行 observe/active。除干预消息外首次自由请求的消息摘要完全一致。observe 三次均在第七步取得签收单。active 分别在第七、第五、第五步取得，三次都实际送达建议。两组各三次均答对签收人和时间。此处结果限于这一任务和模型配置。
 
 ## 依据与决策关系
 

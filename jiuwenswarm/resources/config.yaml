@@ -1057,6 +1057,7 @@ execution_guard:
     mode: observe
     backend: jev                     # jev（默认）或 llm（复用当前主模型接口）
     # 共用“设置 → 模型 → 决策模型”的 browser.decision 连接与供应商密钥。
+    evidence_files: {}               # 可选，按绝对路径登记原生读取结果摘要及版本化事实
     parameters:
       window_size: 5
       warmup_steps: 2

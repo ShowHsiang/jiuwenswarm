@@ -11,6 +11,7 @@ modules:
   - jiuwenswarm/channels/web/frontend
 files:
   - jiuwenswarm/server/runtime/agent_adapter/runtime_monitor.py
+  - jiuwenswarm/server/runtime/agent_adapter/runtime_file_evidence.py
   - jiuwenswarm/server/runtime/agent_adapter/interface_deep.py
   - jiuwenswarm/common/browser_settings.py
   - jiuwenswarm/resources/config.yaml
@@ -27,9 +28,13 @@ SDK 的 ReAct/RuntimeMonitor 负责步骤、证据、收益窗口、触发、建
 
 ## 单一 JEV 配置来源
 
-`execution_guard.runtime_monitor` 仅包含 enabled、mode、backend、parameters；额外字段严格拒绝。JEV 连接必须来自现有“设置 → 模型 → 决策模型”的 `browser.decision`，通过 common.browser_settings.resolve_jev_connection 解析；旧 runtime_monitor.jev 和 JEV_API_KEY 不再消费。
+`execution_guard.runtime_monitor` 接收 enabled、mode、backend、parameters 和可选 evidence_files。其余字段严格拒绝。JEV 连接必须来自现有“设置 → 模型 → 决策模型”的 `browser.decision`，通过 common.browser_settings.resolve_jev_connection 解析；旧 runtime_monitor.jev 和 JEV_API_KEY 不再消费。
 
 共享 provider/model/api_base/api_key_env，不共享浏览器模式、超时、重试和决策次数。TypeSafe/custom 使用 /systemone，OpenRouter 使用 /decisions；密钥由原配置服务保存，运行时按既有 crypto provider 解密。BAI 使用自身 A/B 超时、零客户端重试。LLM 后端借用当前主模型，不解析 JEV 连接、不关闭共享模型。
+
+## 版本化文件证据
+
+`evidence_files` 以原生 read_file 返回的绝对文件路径为键。每项声明 `result_sha256` 和 `facts`，事实含 subject、property、version，可选 scope 和 adjudicates。应用校验成功 ToolOutput 的完整预期渲染文本摘要，通过 SDK EvidenceAdapter 提交事实。指定读取范围、摘要不符、工具失败或普通工具文本时，产生通用观测。未配置时沿用 SDK 默认提取器。只有显式标记 adjudicates 的事实携带 resolution_ref。文件裁决本身不会产生业务 Verification。登记表参与评分版本与装配签名。用户界面只收到原有白名单字段。
 
 ## 重载与资源
 

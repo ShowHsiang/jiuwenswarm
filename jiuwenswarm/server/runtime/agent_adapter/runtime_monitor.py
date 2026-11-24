@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from jiuwenswarm.common.browser_settings import MissingJevCredentialError, resolve_jev_connection
+from jiuwenswarm.server.runtime.agent_adapter.runtime_file_evidence import EvidenceFile, FileEvidenceAdapter
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_EVENT = "chat.runtime_monitor"
@@ -28,6 +29,7 @@ class RuntimeMonitorSettings(BaseModel):
     mode: Literal["observe", "active"] = "observe"
     backend: Literal["jev", "llm"] = "jev"
     parameters: dict[str, Any] = Field(default_factory=dict)
+    evidence_files: dict[str, EvidenceFile] = Field(default_factory=dict)
 
 
 def _digest(value: Any) -> str:
@@ -202,6 +204,13 @@ async def configure_runtime_monitor(agent, config: dict, *, current=None, chat_m
     monitor_config = monitor_config.model_copy(update={
         "rubric_version": f"{monitor_config.rubric_version}:{settings.backend}:{settings.mode}",
     })
+    evidence_adapter = None
+    if settings.evidence_files:
+        evidence_adapter = FileEvidenceAdapter(settings.evidence_files)
+        evidence_version = _digest({path: entry.model_dump() for path, entry in settings.evidence_files.items()})[:16]
+        monitor_config = monitor_config.model_copy(update={
+            "rubric_version": f"{monitor_config.rubric_version}:{evidence_version}",
+        })
     connection = None
     if settings.backend == "jev":
         from jiuwenswarm.common.config import get_crypto_provider, resolve_env_vars
@@ -256,6 +265,7 @@ async def configure_runtime_monitor(agent, config: dict, *, current=None, chat_m
         binding.monitor = RuntimeMonitor(
             jev_client=client, evaluator=evaluator, config=monitor_config,
             scope_id="jiuwenswarm:main:runtime-monitor", on_update=binding.publish,
+            evidence_adapter=evidence_adapter,
         )
         agent.set_runtime_monitor(binding.monitor)
     except BaseException:

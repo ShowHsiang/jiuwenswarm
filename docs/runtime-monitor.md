@@ -70,7 +70,23 @@ flowchart LR
 
 正常评估步最多一次 JEV A；触发后增加一次 B，不增加独立后台执行循环。异常/超时降级，未知不记为零。建议是 CONTINUE / VERIFY / REPLAN；有可信 anchor 时才会出现 BACKTRACK，含义仅为重审推理。主模型可以不采纳，是否送达、是否响应、是否观察到改善分别记录。最终答复不额外启动一轮监督。
 
-本阶段只使用 SDK 的通用工具观察提取：没有业务 `criterion/version/proof_ref` 的结果，**已验证进展保持 0**。TODO 完成、模型自述、工具返回 success 均不能直接算作验收。后续按业务工具补 EvidenceAdapter；不在应用复制收益算法。
+### 登记可以裁决分歧的文件
+
+默认按通用工具结果监控。对于来源已知的业务材料，可在工作区的 `execution_guard.runtime_monitor` 下登记原生 `read_file` 返回的绝对路径、预期内容摘要，以及材料涉及的对象、属性和版本。副本登记同一组事实键，签署原件另设 `adjudicates: true`。一份文件可以覆盖多个事实。
+
+```yaml
+execution_guard:
+  runtime_monitor:
+    evidence_files:
+      "/srv/warehouse/aisle-record.txt":
+        result_sha256: "84c30be6ede535eecebb130d0a1f2ec7fdfc7dff7e640bd8d776d553dfdc45f2"
+        facts:
+          - {subject: A7, property: aisle, version: R4, adjudicates: true}
+```
+
+示例摘要对应一个单行结果，可用 `hashlib.sha256("     1\tRack A7: aisle 4.".encode("utf-8")).hexdigest()` 复算。应根据已核对的完整预期文本计算摘要，包含原生工具返回的行号与制表符。运行时使用实际 `ToolOutput.data["content"]` 核对摘要。文件内容改变、读取指定页/行范围、工具失败时，按通用证据处理。调整登记表会开启新的监控代次。
+
+同一版本的矛盾副本按独立分歧计数。已登记原件关闭分歧后仍可追查每个证据对。业务验收计数只消费可信的 `Verification`，单凭原件裁决或工具成功不会增加该计数。
 
 ## 事件与历史契约
 
